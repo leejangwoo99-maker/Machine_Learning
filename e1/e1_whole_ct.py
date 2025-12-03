@@ -1,14 +1,19 @@
 from sqlalchemy import create_engine, text
 import pandas as pd
 import numpy as np
-from datetime import timedelta, time
+from datetime import timedelta, time, datetime
+import time as time_mod
+from concurrent.futures import ProcessPoolExecutor
+import os
+import webbrowser
 
 import plotly.express as px
+import plotly.io as pio
 
 
-# ============================================
-# DB 접속 정보
-# ============================================
+# ===========================
+# 전역 설정
+# ===========================
 DB_CONFIG = {
     "host": "100.105.75.47",
     "port": 5432,
@@ -17,9 +22,33 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
+# 부트스트랩 반복 횟수
+N_BOOTSTRAP = 10
 
+# 신뢰구간 (%). 95.0 → 95% CI, 99.0 → 99% CI
+CI_LEVEL = 99.0  # ★ 여기만 바꾸면 전체 CI 변경
+
+# 부트스트랩 멀티프로세싱 워커 수
+N_BOOTSTRAP_WORKERS = 2
+
+# 그래프 HTML 저장 폴더 / 파일
+PLOT_DIR = "./plots"
+PLOT_FILE = "vision_dashboard.html"
+
+# 루프 주기 (초)
+LOOP_INTERVAL_SEC = 1.0
+
+# 이전 결과 캐시: {month: {remark: ct}}
+LAST_RESULT = {}
+
+# 브라우저 최초 오픈 여부
+FIRST_OPEN = True
+
+
+# ===========================
+# 공통 유틸
+# ===========================
 def get_engine():
-    """SQLAlchemy 엔진 생성."""
     url = (
         f"postgresql+psycopg2://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
         f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
@@ -27,17 +56,15 @@ def get_engine():
     return create_engine(url)
 
 
-# ============================================
+def ensure_plot_dir():
+    if not os.path.exists(PLOT_DIR):
+        os.makedirs(PLOT_DIR, exist_ok=True)
+
+
+# ===========================
 # 1. VIEW에서 데이터 로드
-# ============================================
+# ===========================
 def load_data(engine: create_engine) -> pd.DataFrame:
-    """
-    v_vision_pass_ct VIEW에서 Vision1/2, PD/Non-PD CT 데이터 조회.
-    VIEW 예시:
-        SELECT id, station, remark, barcode_information, end_day, end_time, ct
-        FROM a2_fct_vision_testlog_json_processing.v_vision_pass_ct
-        ORDER BY station, end_day, end_time;
-    """
     query = """
         SELECT id, station, remark, barcode_information, end_day, end_time, ct
         FROM a2_fct_vision_testlog_json_processing.v_vision_pass_ct
@@ -49,19 +76,12 @@ def load_data(engine: create_engine) -> pd.DataFrame:
     return df
 
 
-# ============================================
-# 2. 주/야간 및 shift_date 계산
-# ============================================
+# ===========================
+# 2. 주/야간 + shift_date 계산
+# ===========================
 def add_shift_info(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    end_day + end_time 기준으로 주/야간과 기준 날짜(shift_date)를 계산.
-    - 주간: 08:30:00 ~ 20:29:59  → shift='Day',   shift_date=당일
-    - 야간: 20:30:00 ~ 23:59:59  → shift='Night', shift_date=당일
-    - 야간: 00:00:00 ~ 08:29:59  → shift='Night', shift_date=전날
-    """
     df2 = df.copy()
 
-    # end_day, end_time을 하나의 datetime으로 변환
     df2["end_day"] = df2["end_day"].astype(str).str.strip()
     df2["end_time"] = df2["end_time"].astype(str).str.strip()
     df2["end_dt"] = pd.to_datetime(
@@ -69,11 +89,9 @@ def add_shift_info(df: pd.DataFrame) -> pd.DataFrame:
         format="%Y-%m-%d %H:%M:%S"
     )
 
-    # 기본값
     df2["shift"] = "Day"
     df2["shift_date"] = df2["end_dt"].dt.date
 
-    # 시간만 추출
     t = df2["end_dt"].dt.time
 
     t_day_start = time(8, 30, 0)
@@ -91,7 +109,7 @@ def add_shift_info(df: pd.DataFrame) -> pd.DataFrame:
     df2.loc[cond_night_evening, "shift"] = "Night"
     df2.loc[cond_night_evening, "shift_date"] = df2.loc[cond_night_evening, "end_dt"].dt.date
 
-    # 야간 (새벽) - 전날 야간으로 귀속
+    # 야간 (새벽) → 전날 야간
     cond_night_morning = (t <= t_night_morning_end)
     df2.loc[cond_night_morning, "shift"] = "Night"
     df2.loc[cond_night_morning, "shift_date"] = (
@@ -101,18 +119,13 @@ def add_shift_info(df: pd.DataFrame) -> pd.DataFrame:
     print("\n[STEP 2] SHIFT INFO (앞 10행)")
     print(df2[["id", "station", "remark", "end_day", "end_time", "shift", "shift_date"]]
           .head(10).to_string(index=False))
-
     return df2
 
 
-# ============================================
-# 3. IQR 이상치 탐지 및 제거
-# ============================================
+# ===========================
+# 3. IQR 이상치 제거
+# ===========================
 def detect_outliers_iqr(series: pd.Series):
-    """
-    IQR(Boxplot) 기준으로 이상치 여부 mask 반환.
-    Q1 - 1.5*IQR 보다 작거나, Q3 + 1.5*IQR 보다 큰 값들을 이상치로 간주.
-    """
     q1 = series.quantile(0.25)
     q3 = series.quantile(0.75)
     iqr = q3 - q1
@@ -123,12 +136,6 @@ def detect_outliers_iqr(series: pd.Series):
 
 
 def remove_outliers(df: pd.DataFrame):
-    """
-    station, remark별 IQR 이상치 제거.
-    반환:
-        df_clean   : 이상치 제거된 데이터
-        df_outliers: 이상치만 모아둔 데이터
-    """
     df_ct = df.dropna(subset=["ct"]).copy()
 
     outlier_rows = []
@@ -169,21 +176,12 @@ def remove_outliers(df: pd.DataFrame):
     return df_clean, df_outliers
 
 
-# ============================================
-# 4. Bootstrap 설정 + 함수
-# ============================================
-# 부트스트랩 반복 횟수 (필요 시 여기 숫자만 변경)
-# 예: 500, 1000, 2000 ...
-N_BOOTSTRAP = 1000  # ★ 여기 값만 바꾸면 반복 횟수 변경됨
-
-
-def bootstrap_ci_mean(series: pd.Series, n_boot: int = N_BOOTSTRAP, ci: float = 95.0):
-    """
-    복원추출 bootstrap으로 평균의 신뢰구간(CI)을 구함.
-    - series : CT 값 시리즈
-    - n_boot : 부트스트랩 반복 횟수 (기본값 N_BOOTSTRAP 사용)
-    - ci     : 신뢰수준 (예: 95.0)
-    """
+# ===========================
+# 4. Bootstrap (멀티프로세싱)
+# ===========================
+def bootstrap_ci_mean(series: pd.Series,
+                      n_boot: int = N_BOOTSTRAP,
+                      ci: float = CI_LEVEL):
     series = series.dropna()
     if len(series) == 0:
         return np.nan, np.nan, np.nan
@@ -201,41 +199,54 @@ def bootstrap_ci_mean(series: pd.Series, n_boot: int = N_BOOTSTRAP, ci: float = 
     return float(series.mean()), float(lower), float(upper)
 
 
+def _bootstrap_one_group(args):
+    station, remark, values = args
+    s = pd.Series(values)
+    mean_ct, ci_low, ci_high = bootstrap_ci_mean(s)
+    return {
+        "station": station,
+        "remark": remark,
+        "ct": round(mean_ct, 2),
+        "ci_low": round(ci_low, 2),
+        "ci_high": round(ci_high, 2),
+    }
+
+
 def compute_bootstrap_ci(df_clean: pd.DataFrame) -> pd.DataFrame:
-    """
-    station / remark별로 CT 평균과 bootstrap 95% CI 계산.
-    결과 DataFrame (station, remark, ct, ci_low, ci_high)을 반환하고 콘솔에 출력.
-    """
-    rows = []
-
+    tasks = []
     for (station, remark), grp in df_clean.groupby(["station", "remark"]):
-        mean_ct, ci_low, ci_high = bootstrap_ci_mean(grp["ct"])
-        rows.append({
-            "station": station,
-            "remark": remark,
-            "ct": round(mean_ct, 2),
-            "ci_low": round(ci_low, 2),
-            "ci_high": round(ci_high, 2),
-        })
+        tasks.append((station, remark, grp["ct"].values))
 
-    df_ci = pd.DataFrame(rows)
+    if not tasks:
+        return pd.DataFrame(columns=["station", "remark", "ct", "ci_low", "ci_high"])
 
-    print(f"\n[STEP 4-1] station/remark별 CT 평균 + Bootstrap {N_BOOTSTRAP}회, 95% CI")
+    with ProcessPoolExecutor(max_workers=N_BOOTSTRAP_WORKERS) as ex:
+        results = list(ex.map(_bootstrap_one_group, tasks))
+
+    df_ci = pd.DataFrame(results)
+
+    print(f"\n[STEP 4-1] station/remark별 CT 평균 + Bootstrap {N_BOOTSTRAP}회, {CI_LEVEL}% CI")
     print(df_ci.to_string(index=False))
 
     return df_ci
 
 
-# ============================================
-# 5. Plotly 그래프들
-# ============================================
-def plot_ci_bar(df_ci: pd.DataFrame):
-    """station/remark별 평균 CT + CI 막대 그래프."""
+# ===========================
+# 5. Plotly 대시보드 (한 HTML에 4개 그래프)
+# ===========================
+def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: str):
+    """바 그래프 + Boxplot 3개를 하나의 HTML로 저장."""
+    if df_clean.empty or df_ci.empty:
+        return
+
+    ensure_plot_dir()
+
+    # 1) CI 막대 그래프
     df_ci_plot = df_ci.copy()
     df_ci_plot["err_plus"] = df_ci_plot["ci_high"] - df_ci_plot["ct"]
     df_ci_plot["err_minus"] = df_ci_plot["ct"] - df_ci_plot["ci_low"]
 
-    fig = px.bar(
+    fig_bar = px.bar(
         df_ci_plot,
         x="station",
         y="ct",
@@ -243,65 +254,84 @@ def plot_ci_bar(df_ci: pd.DataFrame):
         barmode="group",
         error_y="err_plus",
         error_y_minus="err_minus",
-        title=f"Vision1 / Vision2, PD/Non-PD별 CT 평균 (Bootstrap {N_BOOTSTRAP}회, 95% CI)"
+        title=f"[{month_str}] Vision1 / Vision2, PD/Non-PD별 CT 평균 (Bootstrap {N_BOOTSTRAP}회, {CI_LEVEL}% CI)"
     )
-    fig.show()
 
-
-def plot_boxplots(df_clean: pd.DataFrame):
-    """PD / Non-PD Boxplot + station/remark 4조합 Boxplot."""
-    # PD / Non-PD 분리
+    # 2) PD Boxplot
     df_pd = df_clean[df_clean["remark"] == "PD"].copy()
-    df_nonpd = df_clean[df_clean["remark"] == "Non-PD"].copy()
-
-    # PD Boxplot
+    fig_pd = None
     if not df_pd.empty:
         fig_pd = px.box(
             df_pd,
             x="station",
             y="ct",
             points="outliers",
-            title="PD 제품 - Vision1 / Vision2 CT 분포 (Boxplot, 이상치 포함)"
+            title=f"[{month_str}] PD 제품 - Vision1 / Vision2 CT 분포 (Boxplot, 이상치 포함)"
         )
-        fig_pd.show()
 
-    # Non-PD Boxplot
+    # 3) Non-PD Boxplot
+    df_nonpd = df_clean[df_clean["remark"] == "Non-PD"].copy()
+    fig_nonpd = None
     if not df_nonpd.empty:
         fig_nonpd = px.box(
             df_nonpd,
             x="station",
             y="ct",
             points="outliers",
-            title="Non-PD 제품 - Vision1 / Vision2 CT 분포 (Boxplot, 이상치 포함)"
+            title=f"[{month_str}] Non-PD 제품 - Vision1 / Vision2 CT 분포 (Boxplot, 이상치 포함)"
         )
-        fig_nonpd.show()
 
-    # station + remark 4조합 Boxplot
+    # 4) station + remark 4조합 Boxplot
     df_box = df_clean.copy()
     df_box["station_remark"] = df_box["station"] + " / " + df_box["remark"]
-
     fig_combined = px.box(
         df_box,
         x="station_remark",
         y="ct",
         points="outliers",
-        title="Vision1 / Vision2 × PD / Non-PD CT 분포 (Boxplot, 이상치 포함)"
+        title=f"[{month_str}] Vision1 / Vision2 × PD / Non-PD CT 분포 (Boxplot, 이상치 포함)"
     )
     fig_combined.update_layout(
         xaxis_title="Station / Remark",
         yaxis_title="CT"
     )
-    fig_combined.show()
+
+    # ---- HTML 하나로 합치기 ----
+    figs = [fig_bar]
+    if fig_pd is not None:
+        figs.append(fig_pd)
+    if fig_nonpd is not None:
+        figs.append(fig_nonpd)
+    figs.append(fig_combined)
+
+    html_parts = []
+    for i, fig in enumerate(figs):
+        html = pio.to_html(
+            fig,
+            include_plotlyjs="cdn" if i == 0 else False,
+            full_html=False
+        )
+        html_parts.append(html)
+
+    full_html = "<html><head><meta charset='utf-8'></head><body>" + "\n".join(html_parts) + "</body></html>"
+
+    out_path = os.path.join(PLOT_DIR, PLOT_FILE)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(full_html)
+
+    global FIRST_OPEN
+    if FIRST_OPEN:
+        FIRST_OPEN = False
+        webbrowser.open("file://" + os.path.abspath(out_path))
+        print(f"[INFO] 그래프 대시보드 브라우저 오픈: {out_path}")
+    else:
+        print(f"[INFO] 그래프 대시보드 업데이트: {out_path} (브라우저 새로고침)")
 
 
-# ============================================
-# 6. remark별 최종 CT 계산 (평균 CT / 2)
-# ============================================
+# ===========================
+# 6. remark별 최종 CT (/2)
+# ===========================
 def compute_final_ct(df_clean: pd.DataFrame) -> pd.DataFrame:
-    """
-    remark(PD / Non-PD)별 평균 CT를 구한 뒤 2로 나누고,
-    id, remark, ct 형태 DataFrame 반환.
-    """
     df_remark_mean = (
         df_clean
         .groupby("remark")["ct"]
@@ -319,23 +349,20 @@ def compute_final_ct(df_clean: pd.DataFrame) -> pd.DataFrame:
     return df_final
 
 
-# ============================================
-# 7. Month 계산 (shift_date 기준) + DB 저장
-# ============================================
+# ===========================
+# 7. Month 계산 + upsert (동일 데이터면 pass)
+# ===========================
 def add_month_and_save(engine: create_engine,
                        df_clean: pd.DataFrame,
                        df_final: pd.DataFrame):
-    """
-    shift_date 기준으로 Month(YYYY-MM)를 계산하고
-    e1_whole_ct.whole_ct에 (month, remark, ct) 저장.
-    """
+    global LAST_RESULT
+
     if df_clean.empty:
         print("\n[WARN] df_clean이 비어있어 Month를 계산할 수 없습니다.")
-        return
+        return None, False
 
-    # shift_date → datetime으로 변환 후 Month 문자열 생성
     shift_dt = pd.to_datetime(df_clean["shift_date"])
-    month_ym = shift_dt.max().strftime("%Y-%m")  # 예: '2025-11'
+    month_ym = shift_dt.max().strftime("%Y-%m")
 
     df_final_with_month = df_final.copy()
     df_final_with_month["Month"] = month_ym
@@ -343,61 +370,96 @@ def add_month_and_save(engine: create_engine,
     print("\n[STEP 6] Month 적용 최종 결과")
     print(df_final_with_month.to_string(index=False))
 
-    # 스키마/테이블 생성 후 INSERT
-    with engine.begin() as conn:
-        conn.execute(text("CREATE SCHEMA IF NOT EXISTS e1_whole_ct;"))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS e1_whole_ct.whole_ct (
-                month   varchar(7),   -- 예: '2025-11'
-                remark  varchar(20),  -- 'PD' / 'Non-PD'
-                ct      numeric       -- 최종 CT (/2)
-            );
-        """))
+    # 동일 데이터 여부 체크
+    current = {row["remark"]: float(row["ct"])
+               for _, row in df_final_with_month.iterrows()}
+    prev = LAST_RESULT.get(month_ym)
+
+    if prev == current:
+        print(f"\n[INFO] {month_ym} 결과가 이전과 동일 → DB/그래프 스킵")
+        return month_ym, False
+
+    # 캐시 갱신
+    LAST_RESULT[month_ym] = current
 
     df_to_save = df_final_with_month[["Month", "remark", "ct"]].rename(columns={
         "Month": "month"
     })
 
-    df_to_save.to_sql(
-        name="whole_ct",
-        schema="e1_whole_ct",
-        con=engine,
-        if_exists="append",
-        index=False
-    )
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS e1_whole_ct;"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS e1_whole_ct.whole_ct (
+                month   varchar(7),
+                remark  varchar(20),
+                ct      numeric
+            );
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS whole_ct_month_remark_idx
+            ON e1_whole_ct.whole_ct (month, remark);
+        """))
 
-    print("\n[STEP 7] e1_whole_ct.whole_ct 테이블에 저장 완료")
+        upsert_sql = text("""
+            INSERT INTO e1_whole_ct.whole_ct (month, remark, ct)
+            VALUES (:month, :remark, :ct)
+            ON CONFLICT (month, remark)
+            DO UPDATE SET ct = EXCLUDED.ct;
+        """)
+
+        for _, row in df_to_save.iterrows():
+            conn.execute(upsert_sql, {
+                "month": row["month"],
+                "remark": row["remark"],
+                "ct": float(row["ct"]),
+            })
+
+    print("\n[STEP 7] e1_whole_ct.whole_ct 테이블 upsert 완료")
     print(df_to_save.to_string(index=False))
 
+    return month_ym, True
 
-# ============================================
-# main
-# ============================================
-def main():
-    engine = get_engine()
 
-    # 1) VIEW 데이터 로드
+# ===========================
+# 한 사이클 실행
+# ===========================
+def run_one_cycle(engine):
+    print("\n==============================")
+    print("[CYCLE START]", datetime.now())
+    print("==============================")
+
     df_raw = load_data(engine)
+    if df_raw.empty:
+        print("[INFO] RAW DATA 없음")
+        return
 
-    # 2) 주/야간 및 shift_date 계산
     df_shift = add_shift_info(df_raw)
-
-    # 3) IQR 이상치 제거
     df_clean, df_outliers = remove_outliers(df_shift)
 
-    # 4) station/remark별 bootstrap CI 계산
     df_ci = compute_bootstrap_ci(df_clean)
-
-    # 5) Plotly 그래프들
-    plot_ci_bar(df_ci)
-    plot_boxplots(df_clean)
-
-    # 6) remark별 최종 CT (/2) 계산
     df_final = compute_final_ct(df_clean)
+    month_ym, updated = add_month_and_save(engine, df_clean, df_final)
 
-    # 7) Month 계산 후 DB 저장
-    add_month_and_save(engine, df_clean, df_final)
+    # month 계산 실패 or 동일 데이터면 그래프 스킵
+    if (month_ym is None) or (not updated):
+        return
+
+    # 데이터 변경이 있을 때만 대시보드 HTML 업데이트
+    save_dashboard_html(df_ci, df_clean, month_ym)
+
+
+# ===========================
+# main: 1초마다 무한 루프
+# ===========================
+def main_loop():
+    engine = get_engine()
+    while True:
+        try:
+            run_one_cycle(engine)
+        except Exception as e:
+            print("\n[ERROR] 사이클 실행 중 예외 발생:", repr(e))
+        time_mod.sleep(LOOP_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-    main()
+    main_loop()
