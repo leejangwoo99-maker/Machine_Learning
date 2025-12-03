@@ -36,7 +36,7 @@ PLOT_DIR = "./plots"
 PLOT_FILE = "vision_dashboard.html"
 
 # 루프 주기 (초)
-LOOP_INTERVAL_SEC = 7.0
+LOOP_INTERVAL_SEC = 1.0
 
 # 이전 결과 캐시: {month: {remark: ct}}
 LAST_RESULT = {}
