@@ -36,7 +36,7 @@ PLOT_DIR = "./plots"
 PLOT_FILE = "vision_dashboard.html"
 
 # 루프 주기 (초)
-LOOP_INTERVAL_SEC = 1.0
+LOOP_INTERVAL_SEC = 7.0
 
 # 이전 결과 캐시: {month: {remark: ct}}
 LAST_RESULT = {}
@@ -230,21 +230,79 @@ def compute_bootstrap_ci(df_clean: pd.DataFrame) -> pd.DataFrame:
 
     return df_ci
 
+def add_box_stats_annotations(fig: 'go.Figure',
+                              df: pd.DataFrame,
+                              x_col: str,
+                              y_col: str,
+                              label_prefix: str = ""):
+    """
+    df 기준으로 x_col 카테고리별 boxplot 통계 (min, q1, median, q3, max)를 계산해서
+    fig에 annotation으로 항상 표시해 준다.
+    label_prefix: 'Vision2 / PD' 같은 앞부분 문자열 넣을 때 사용 (선택)
+    """
+    if df.empty:
+        return
+
+    # describe로 기본 통계 계산
+    stats = (
+        df.groupby(x_col)[y_col]
+          .describe(percentiles=[0.25, 0.5, 0.75])
+          .reset_index()
+    )
+    stats = stats.rename(columns={
+        "min": "min",
+        "25%": "q1",
+        "50%": "median",
+        "75%": "q3",
+        "max": "max",
+    })
+
+    for _, row in stats.iterrows():
+        x_val = row[x_col]
+        # 표시할 지표들 (원하면 줄이거나 순서 바꿔도 됨)
+        entries = [
+            ("min", row["min"]),
+            ("q1", row["q1"]),
+            ("median", row["median"]),
+            ("q3", row["q3"]),
+            ("max", row["max"]),
+        ]
+
+        # 글자가 겹치지 않게 y 방향으로 살짝씩 밀어줌
+        y_shift_step = 10  # 필요하면 조정
+        for i, (name, y_val) in enumerate(entries):
+            text = f"{label_prefix}{name}: {y_val:.2f}"
+            fig.add_annotation(
+                x=x_val,
+                y=y_val,
+                text=text,
+                showarrow=False,
+                xanchor="left",
+                yanchor="bottom",
+                font=dict(size=10),
+                yshift=i * y_shift_step,
+            )
 
 # ===========================
 # 5. Plotly 대시보드 (한 HTML에 4개 그래프)
 # ===========================
 def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: str):
-    """바 그래프 + Boxplot 3개를 하나의 HTML로 저장."""
+    """부트스트랩 bar + 종합 Boxplot을 한 HTML에 좌우로 배치."""
     if df_clean.empty or df_ci.empty:
         return
 
     ensure_plot_dir()
 
-    # 1) CI 막대 그래프
+    # ---------- (1) CI 막대 그래프 + 텍스트 라벨 ----------
     df_ci_plot = df_ci.copy()
     df_ci_plot["err_plus"] = df_ci_plot["ci_high"] - df_ci_plot["ct"]
     df_ci_plot["err_minus"] = df_ci_plot["ct"] - df_ci_plot["ci_low"]
+
+    # 바 위에 항상 보일 라벨
+    df_ci_plot["label"] = df_ci_plot.apply(
+        lambda r: f"ct={r['ct']:.2f} (+{r['err_plus']:.2f} / -{r['err_minus']:.2f})",
+        axis=1
+    )
 
     fig_bar = px.bar(
         df_ci_plot,
@@ -254,66 +312,93 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
         barmode="group",
         error_y="err_plus",
         error_y_minus="err_minus",
-        title=f"[{month_str}] Vision1 / Vision2, PD/Non-PD별 CT 평균 (Bootstrap {N_BOOTSTRAP}회, {CI_LEVEL}% CI)"
+        text="label",
+        title=(
+            f"[{month_str}] Vision1 / Vision2, PD/Non-PD별 CT 평균 "
+            f"(Bootstrap {N_BOOTSTRAP}회, {CI_LEVEL}% CI)"
+        )
+    )
+    fig_bar.update_traces(
+        textposition="outside",
+        cliponaxis=False
     )
 
-    # 2) PD Boxplot
-    df_pd = df_clean[df_clean["remark"] == "PD"].copy()
-    fig_pd = None
-    if not df_pd.empty:
-        fig_pd = px.box(
-            df_pd,
-            x="station",
-            y="ct",
-            points="outliers",
-            title=f"[{month_str}] PD 제품 - Vision1 / Vision2 CT 분포 (Boxplot, 이상치 포함)"
-        )
-
-    # 3) Non-PD Boxplot
-    df_nonpd = df_clean[df_clean["remark"] == "Non-PD"].copy()
-    fig_nonpd = None
-    if not df_nonpd.empty:
-        fig_nonpd = px.box(
-            df_nonpd,
-            x="station",
-            y="ct",
-            points="outliers",
-            title=f"[{month_str}] Non-PD 제품 - Vision1 / Vision2 CT 분포 (Boxplot, 이상치 포함)"
-        )
-
-    # 4) station + remark 4조합 Boxplot
+    # ---------- (2) 종합 Boxplot (Vision×Remark 4조합) ----------
     df_box = df_clean.copy()
     df_box["station_remark"] = df_box["station"] + " / " + df_box["remark"]
+
     fig_combined = px.box(
         df_box,
         x="station_remark",
         y="ct",
         points="outliers",
-        title=f"[{month_str}] Vision1 / Vision2 × PD / Non-PD CT 분포 (Boxplot, 이상치 포함)"
+        title=f"[{month_str}] Vision1 / Vision2 × PD / Non-PD CT 분포 (Boxplot, 지표 표시)"
     )
     fig_combined.update_layout(
         xaxis_title="Station / Remark",
         yaxis_title="CT"
     )
 
-    # ---- HTML 하나로 합치기 ----
-    figs = [fig_bar]
-    if fig_pd is not None:
-        figs.append(fig_pd)
-    if fig_nonpd is not None:
-        figs.append(fig_nonpd)
-    figs.append(fig_combined)
+    # Boxplot min/q1/median/q3/max 항상 보이게
+    add_box_stats_annotations(
+        fig_combined,
+        df_box,
+        x_col="station_remark",
+        y_col="ct"
+    )
 
-    html_parts = []
+    # ---------- (3) HTML 한 파일에 좌우 2단 배치 ----------
+    figs = [fig_bar, fig_combined]
+
+    fig_htmls = []
     for i, fig in enumerate(figs):
         html = pio.to_html(
             fig,
-            include_plotlyjs="cdn" if i == 0 else False,
-            full_html=False
+            include_plotlyjs="cdn" if i == 0 else False,  # 처음 그래프만 plotly.js 포함
+            full_html=False,
+            default_width="100%",
+            default_height="100%"
         )
-        html_parts.append(html)
+        fig_htmls.append(html)
 
-    full_html = "<html><head><meta charset='utf-8'></head><body>" + "\n".join(html_parts) + "</body></html>"
+    # 좌우 레이아웃용 CSS + HTML 구조
+    full_html = """
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body {
+            margin: 0;
+            padding: 10px;
+            font-family: Arial, sans-serif;
+        }
+        .grid {
+            display: flex;
+            flex-direction: row;     /* 좌우 배치 */
+            width: 100vw;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+        .chart-half {
+            width: 50%;
+            height: 100%;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+    </style>
+</head>
+<body>
+    <div class="grid">
+"""
+    # 왼쪽 / 오른쪽에 그래프 넣기
+    for html in fig_htmls:
+        full_html += f'<div class="chart-half">{html}</div>\n'
+
+    full_html += """
+    </div>
+</body>
+</html>
+"""
 
     out_path = os.path.join(PLOT_DIR, PLOT_FILE)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -326,7 +411,6 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
         print(f"[INFO] 그래프 대시보드 브라우저 오픈: {out_path}")
     else:
         print(f"[INFO] 그래프 대시보드 업데이트: {out_path} (브라우저 새로고침)")
-
 
 # ===========================
 # 6. remark별 최종 CT (/2)
