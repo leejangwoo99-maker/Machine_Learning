@@ -66,7 +66,15 @@ def ensure_plot_dir():
 # ===========================
 def load_data(engine: create_engine) -> pd.DataFrame:
     query = """
-        SELECT id, station, remark, barcode_information, end_day, end_time, ct
+        SELECT
+            id,
+            station,
+            remark,
+            barcode_information,
+            end_day,
+            end_time,
+            ct,
+            file_path
         FROM a2_fct_vision_testlog_json_processing.v_vision_pass_ct
         ORDER BY station, end_day, end_time;
     """
@@ -74,7 +82,6 @@ def load_data(engine: create_engine) -> pd.DataFrame:
     print("\n[STEP 1] RAW DATA (앞 5행)")
     print(df.head().to_string(index=False))
     return df
-
 
 # ===========================
 # 2. 주/야간 + shift_date 계산
@@ -136,7 +143,17 @@ def detect_outliers_iqr(series: pd.Series):
 
 
 def remove_outliers(df: pd.DataFrame):
+    # 1) ct가 NULL인 행 제거
     df_ct = df.dropna(subset=["ct"]).copy()
+
+    # 2) file_path 기준 중복 제거
+    #    같은 file_path, station, remark 조합이 여러 번 있을 경우 → 마지막 행만 사용
+    if "file_path" in df_ct.columns:
+        df_ct = (
+            df_ct
+            .sort_values(["station", "remark", "end_day", "end_time"])
+            .drop_duplicates(subset=["station", "remark", "file_path"], keep="last")
+        )
 
     outlier_rows = []
     clean_rows = []
@@ -150,7 +167,7 @@ def remove_outliers(df: pd.DataFrame):
             outlier_rows.append(
                 grp_out[[
                     "id", "station", "remark", "barcode_information", "ct",
-                    "Outliers", "end_day", "end_time", "shift", "shift_date"
+                    "Outliers", "end_day", "end_time", "shift", "shift_date", "file_path"
                 ]]
             )
 
@@ -162,7 +179,7 @@ def remove_outliers(df: pd.DataFrame):
         if outlier_rows
         else pd.DataFrame(columns=[
             "id", "station", "remark", "barcode_information", "ct",
-            "Outliers", "end_day", "end_time", "shift", "shift_date"
+            "Outliers", "end_day", "end_time", "shift", "shift_date", "file_path"
         ])
     )
     df_clean = pd.concat(clean_rows, ignore_index=True)
@@ -174,7 +191,6 @@ def remove_outliers(df: pd.DataFrame):
     print(df_clean.head(10).to_string(index=False))
 
     return df_clean, df_outliers
-
 
 # ===========================
 # 4. Bootstrap (멀티프로세싱)
@@ -286,7 +302,8 @@ def add_box_stats_annotations(fig: 'go.Figure',
 # ===========================
 # 5. Plotly 대시보드 (한 HTML에 4개 그래프)
 # ===========================
-def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: str):
+def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: str) -> str:
+    ...
     """부트스트랩 bar + 종합 Boxplot을 한 HTML에 좌우로 배치."""
     if df_clean.empty or df_ci.empty:
         return
@@ -412,6 +429,9 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
     else:
         print(f"[INFO] 그래프 대시보드 업데이트: {out_path} (브라우저 새로고침)")
 
+    # ★ DB 저장용으로 HTML 문자열 반환
+    return full_html
+
 # ===========================
 # 6. remark별 최종 CT (/2)
 # ===========================
@@ -524,13 +544,61 @@ def run_one_cycle(engine):
     df_final = compute_final_ct(df_clean)
     month_ym, updated = add_month_and_save(engine, df_clean, df_final)
 
-    # month 계산 실패 or 동일 데이터면 그래프 스킵
+    # month 계산 실패 or 동일 데이터면 그래프/DB 스킵
     if (month_ym is None) or (not updated):
         return
 
-    # 데이터 변경이 있을 때만 대시보드 HTML 업데이트
-    save_dashboard_html(df_ci, df_clean, month_ym)
+    # 데이터 변경이 있을 때만 대시보드 HTML 업데이트 + DB 저장
+    html = save_dashboard_html(df_ci, df_clean, month_ym)
+    save_ct_graph_html(engine, month_ym, df_final, html)
 
+#=============
+def save_ct_graph_html(engine: create_engine,
+                       month_ym: str,
+                       df_final: pd.DataFrame,
+                       html: str):
+    """
+    e1_whole_ct.ct_graph_html 에 Plotly 대시보드 HTML 저장.
+    - 키: (month, remark)
+    - 같은 month+remark에 대해서는 html을 업데이트 (중복 없음)
+    """
+    if not html:
+        print("\n[INFO] HTML 내용이 비어 있어 ct_graph_html 저장 스킵")
+        return
+
+    if df_final.empty:
+        print("\n[INFO] df_final이 비어 있어 ct_graph_html 저장 스킵")
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS e1_whole_ct;"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS e1_whole_ct.ct_graph_html (
+                month   varchar(7),
+                remark  varchar(20),
+                html    text
+            );
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ct_graph_html_month_remark_idx
+            ON e1_whole_ct.ct_graph_html (month, remark);
+        """))
+
+        upsert_sql = text("""
+            INSERT INTO e1_whole_ct.ct_graph_html (month, remark, html)
+            VALUES (:month, :remark, :html)
+            ON CONFLICT (month, remark)
+            DO UPDATE SET html = EXCLUDED.html;
+        """)
+
+        for _, row in df_final.iterrows():
+            conn.execute(upsert_sql, {
+                "month": month_ym,
+                "remark": row["remark"],
+                "html": html,
+            })
+
+    print(f"\n[STEP 8] e1_whole_ct.ct_graph_html 저장 완료 (month={month_ym})")
 
 # ===========================
 # main: 1초마다 무한 루프
