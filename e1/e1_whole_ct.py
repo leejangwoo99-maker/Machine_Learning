@@ -513,17 +513,17 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
     print(f"[INFO] 그래프 HTML 생성 완료: {abs_path}")
     print(f"[DEBUG] FIRST_OPEN = {FIRST_OPEN}")
 
-    if FIRST_OPEN:
-        try:
-            FIRST_OPEN = False
-            url = "file://" + abs_path
-            print(f"[DEBUG] 브라우저 오픈 시도: {url}")
-            webbrowser.open_new_tab(url)
-            print("[INFO] 브라우저 오픈 성공")
-        except Exception as e:
-            print("[ERROR] webbrowser.open 실패:", repr(e))
-    else:
-        print("[INFO] 기존 브라우저는 자동 새로고침만 동작")
+    # if FIRST_OPEN:
+    #     try:
+    #         FIRST_OPEN = False
+    #         url = "file://" + abs_path
+    #         print(f"[DEBUG] 브라우저 오픈 시도: {url}")
+    #         webbrowser.open_new_tab(url)
+    #         print("[INFO] 브라우저 오픈 성공")
+    #     except Exception as e:
+    #         print("[ERROR] webbrowser.open 실패:", repr(e))
+    # else:
+    #     print("[INFO] 기존 브라우저는 자동 새로고침만 동작")
 
     return full_html
 
