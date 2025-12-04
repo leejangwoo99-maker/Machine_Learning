@@ -26,7 +26,7 @@ FCT_MAP = {
     "TC9": "FCT4",
 }
 
-# PostgreSQL 접속 정보
+PostgreSQL 접속 정보
 DB_CONFIG = {
     "host": "192.168.108.162",
     "port": 5432,
@@ -50,37 +50,35 @@ BATCH_SIZE = 10000
 # ============================================
 # 날짜 유틸: 오늘 기준 6개월 전 계산
 # ============================================
-def six_months_ago(d: date) -> date:
-    """
-    표준 라이브러리에 relativedelta가 없어서,
-    년/월을 직접 조정해서 6개월 전 날짜를 계산.
-    """
+def one_month_ago(d: date) -> date:
     year = d.year
-    month = d.month - 6
+    month = d.month - 1
     if month <= 0:
         year -= 1
         month += 12
 
-    # 해당 월의 마지막 날보다 현재 일(day)이 크면 마지막 날로 맞춰줌
     last_day = calendar.monthrange(year, month)[1]
     day = min(d.day, last_day)
     return date(year, month, day)
 
-
 def get_window_dates():
     """
-    - today: 오늘
-    - window_start_date: max(고정 시작일, today-6개월)
-    - window_end_date: today
-
-    => 실제로 파싱/쿼리에서 사용하는 날짜 범위
+    오늘 날짜 기준으로 '해당 월 전체'만 스캔/처리하도록 범위를 반환.
+    예) 오늘 = 2025-12-04 → 2025-12-01 ~ 2025-12-31
     """
     today = date.today()
-    six_before = six_months_ago(today)
-    window_start_date = max(FIXED_START_DATE, six_before)
-    window_end_date = today
-    return window_start_date, window_end_date
 
+    # 해당 월의 1일
+    window_start_date = today.replace(day=1)
+
+    # 해당 월의 마지막 날
+    last_day = calendar.monthrange(today.year, today.month)[1]
+    window_end_date = today.replace(day=last_day)
+
+    # FIXED_START_DATE 보다 작으면 FIXED_START_DATE로 보정 (옵션)
+    window_start_date = max(window_start_date, FIXED_START_DATE)
+
+    return window_start_date, window_end_date
 
 # ============================================
 # 1. DB 유틸
@@ -123,6 +121,11 @@ def init_db(conn):
     )
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{tbl}_full_path ON {sch}.{tbl}(full_path);"
+    )
+
+    # 🔥 여기 추가
+    cur.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{tbl}_full_path ON {sch}.{tbl}(full_path);"
     )
 
     # ---------- result ----------
@@ -259,6 +262,7 @@ def insert_history_rows(conn, rows):
         INSERT INTO {sch}.{tbl}
             (full_path, equipment, date_folder, good_bad, filename, processed_at)
         VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (full_path) DO NOTHING
         """,
         [
             (
@@ -274,9 +278,9 @@ def insert_history_rows(conn, rows):
         page_size=1000,
     )
     conn.commit()
+    inserted = cur.rowcount  # 실제 들어간 행 수
     cur.close()
-    return len(rows)
-
+    return inserted
 
 def insert_result_rows(conn, rows):
     if not rows:
@@ -485,7 +489,7 @@ def process_one_file(args):
 # ============================================
 # 4. 배치 처리
 # ============================================
-def process_batch(pool, file_infos, conn, processed_full_paths, equip_counts, run_started_at):
+def process_batch(pool, file_infos, conn, equip_counts, run_started_at):
     """
     file_infos: [(full_path_str, mid, folder_date_str, gb), ...]
     """
@@ -501,7 +505,6 @@ def process_batch(pool, file_infos, conn, processed_full_paths, equip_counts, ru
     for item in results:
         h = item["history_row"]
         history_rows.append(h)
-        processed_full_paths.add(h["full_path"])
 
         eq = item["equipment"]
         equip_counts[eq] = equip_counts.get(eq, 0) + 1
@@ -542,10 +545,6 @@ def run_once():
 
         # 6개월 이전 DB 데이터 정리
         cleanup_old_data(conn, window_start_date)
-
-        # 이미 처리된 full_path 로드 (윈도우 범위 안의 것만)
-        processed_full_paths = load_processed_paths(conn, window_start_date, window_end_date)
-        print(f"[이력] 이미 처리된 full_path 수 : {len(processed_full_paths)}")
 
         total_scanned = 0
         total_new = 0
@@ -596,10 +595,6 @@ def run_once():
                             total_scanned += 1
                             full_path_str = str(f)
 
-                            # 이미 처리된 full_path면 패스
-                            if full_path_str in processed_full_paths:
-                                continue
-
                             batch.append((full_path_str, mid, folder_date_str, gb))
                             total_new += 1
 
@@ -609,10 +604,10 @@ def run_once():
                                     pool,
                                     batch,
                                     conn,
-                                    processed_full_paths,
                                     equip_counts,
                                     run_started_at,
                                 )
+
                                 total_hist_inserted += n_hist
                                 total_det_inserted += n_det
                                 print(

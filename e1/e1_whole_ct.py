@@ -22,6 +22,15 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
+# # PostgreSQL 접속 정보
+# DB_CONFIG = {
+#     "host": "192.168.108.162",
+#     "port": 5432,
+#     "dbname": "postgres",
+#     "user": "postgres",
+#     "password": "leejangwoo1!",
+# }
+
 # 부트스트랩 반복 횟수
 N_BOOTSTRAP = 10
 
