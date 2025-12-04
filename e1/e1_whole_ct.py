@@ -76,13 +76,13 @@ def load_data(engine: create_engine) -> pd.DataFrame:
             ct,
             file_path
         FROM a2_fct_vision_testlog_json_processing.v_vision_pass_ct
+        WHERE end_day = CURRENT_DATE          -- ★ 오늘 날짜(예: 2025-12-04)만
         ORDER BY station, end_day, end_time;
     """
     df = pd.read_sql_query(query, engine)
     print("\n[STEP 1] RAW DATA (앞 5행)")
     print(df.head().to_string(index=False))
     return df
-
 
 # ===========================
 # 1-1. 기존 clean 데이터 로드 (★ 이번 달 end_day만)
