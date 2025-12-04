@@ -30,15 +30,6 @@ host = "100.105.75.47"
 port = 5432
 dbname = "postgres"
 
-# # PostgreSQL 접속 정보
-# DB_CONFIG = {
-#     "host": "192.168.108.162",
-#     "port": 5432,
-#     "dbname": "postgres",
-#     "user": "postgres",
-#     "password": "leejangwoo1!",
-# }
-
 # 비밀번호 URL 인코딩
 password = urllib.parse.quote_plus(password_raw)
 
