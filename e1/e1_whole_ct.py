@@ -38,7 +38,7 @@ PLOT_FILE = "vision_dashboard.html"
 # 루프 주기 (초)
 LOOP_INTERVAL_SEC = 1.0
 
-# 이전 결과 캐시: {month: {remark: ct}}
+# 이전 결과 캐시: 전체 스냅샷 { (month, remark): ct }
 LAST_RESULT = {}
 
 # 브라우저 최초 오픈 여부
@@ -85,13 +85,19 @@ def load_data(engine: create_engine) -> pd.DataFrame:
 
 
 # ===========================
-# 1-1. 기존 clean 데이터 로드 / 신규 clean 저장 (processing 테이블)
+# 1-1. 기존 clean 데이터 로드 (★ 이번 달 end_day만)
+#      & 신규 clean 저장용 테이블 생성
 # ===========================
 def load_processed_clean(engine: create_engine) -> pd.DataFrame:
-    """
-    e1_whole_ct.processing 에 저장된 '이미 처리된 clean 데이터'를 읽어온다.
-    없으면 빈 DataFrame 반환.
-    """
+    today = datetime.now().date()
+    start_month = today.replace(day=1)
+
+    # 다음 달 1일 계산
+    if start_month.month == 12:
+        next_month_first = start_month.replace(year=start_month.year + 1, month=1, day=1)
+    else:
+        next_month_first = start_month.replace(month=start_month.month + 1, day=1)
+
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS e1_whole_ct;"))
         conn.execute(text("""
@@ -109,28 +115,36 @@ def load_processed_clean(engine: create_engine) -> pd.DataFrame:
                 PRIMARY KEY (station, remark, file_path)
             );
         """))
+
         df_old = pd.read_sql_query(
             """
             SELECT
                 id, station, remark, barcode_information, ct,
                 end_day, end_time, shift, shift_date, file_path
             FROM e1_whole_ct.processing
+            WHERE end_day >= %(start_month)s
+              AND end_day <  %(next_month_first)s
             """,
             conn,
+            params={
+                "start_month": start_month,
+                "next_month_first": next_month_first,
+            },
         )
+
     return df_old
 
-
-def save_new_clean(engine, df):
+def save_new_clean(engine, df: pd.DataFrame):
     print("[DEBUG] save_new_clean() 호출됨 — row 수:", len(df))
 
     if df.empty:
         print("[DEBUG] df 비어있음 — INSERT 스킵")
         return
 
-    # INSERT에 필요한 컬럼만 선택
-    required_cols = ["station", "remark", "barcode_information", "ct",
-                     "end_day", "end_time", "shift", "shift_date", "file_path"]
+    required_cols = [
+        "station", "remark", "barcode_information", "ct",
+        "end_day", "end_time", "shift", "shift_date", "file_path"
+    ]
 
     missing = [c for c in required_cols if c not in df.columns]
     print("[DEBUG] 누락된 컬럼:", missing)
@@ -139,7 +153,6 @@ def save_new_clean(engine, df):
         print("[ERROR] INSERT 실패 — 컬럼이 부족함")
         return
 
-    # 🔥 TEST INSERT (실제 commit 포함)
     try:
         with engine.begin() as conn:
             df[required_cols].to_sql(
@@ -153,6 +166,7 @@ def save_new_clean(engine, df):
         print("[DEBUG] INSERT 성공!")
     except Exception as e:
         print("[ERROR] INSERT 중 오류:", e)
+
 
 # ===========================
 # 2. 주/야간 + shift_date 계산
@@ -201,7 +215,7 @@ def add_shift_info(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================
-# 3. IQR 이상치 제거 (★ 기존 + processed_keys 적용 버전)
+# 3. IQR 이상치 제거
 # ===========================
 def detect_outliers_iqr(series: pd.Series):
     q1 = series.quantile(0.25)
@@ -213,28 +227,21 @@ def detect_outliers_iqr(series: pd.Series):
     return mask, lower, upper
 
 
-def remove_outliers(df: pd.DataFrame, processed_keys=None):
+def remove_outliers(df: pd.DataFrame):
     """
-    processed_keys: {(station, remark, file_path), ...}
-    에 포함된 조합은 이번 이상치 계산 대상에서 제외 (이미 처리된 데이터).
+    IQR 기반 이상치 제거.
+    (이미 처리된 file_path 필터링은 run_one_cycle에서 처리하므로
+     여기서는 온전히 들어온 df에 대해서만 이상치 계산)
     """
-    # 1) ct가 NULL인 행 제거
     df_ct = df.dropna(subset=["ct"]).copy()
 
-    # 2) file_path 기준 중복 제거
-    #    같은 file_path, station, remark 조합이 여러 번 있을 경우 → 마지막 행만 사용
+    # file_path 기준 중복 제거 (station, remark, file_path 조합별 마지막 행만)
     if "file_path" in df_ct.columns:
         df_ct = (
             df_ct
             .sort_values(["station", "remark", "end_day", "end_time"])
             .drop_duplicates(subset=["station", "remark", "file_path"], keep="last")
         )
-
-    # === 이미 처리된 데이터 제거 ===
-    if processed_keys:
-        key_series = list(zip(df_ct["station"], df_ct["remark"], df_ct["file_path"]))
-        mask_new = [k not in processed_keys for k in key_series]
-        df_ct = df_ct[mask_new]
 
     outlier_rows = []
     clean_rows = []
@@ -343,13 +350,11 @@ def add_box_stats_annotations(fig: 'go.Figure',
                               label_prefix: str = ""):
     """
     df 기준으로 x_col 카테고리별 boxplot 통계 (min, q1, median, q3, max)를 계산해서
-    fig에 annotation으로 항상 표시해 준다.
-    label_prefix: 'Vision2 / PD' 같은 앞부분 문자열 넣을 때 사용 (선택)
+    fig에 annotation으로 항상 표시.
     """
     if df.empty:
         return
 
-    # describe로 기본 통계 계산
     stats = (
         df.groupby(x_col)[y_col]
           .describe(percentiles=[0.25, 0.5, 0.75])
@@ -365,7 +370,6 @@ def add_box_stats_annotations(fig: 'go.Figure',
 
     for _, row in stats.iterrows():
         x_val = row[x_col]
-        # 표시할 지표들
         entries = [
             ("min", row["min"]),
             ("q1", row["q1"]),
@@ -374,7 +378,6 @@ def add_box_stats_annotations(fig: 'go.Figure',
             ("max", row["max"]),
         ]
 
-        # 글자가 겹치지 않게 y 방향으로 살짝씩 밀어줌
         y_shift_step = 10
         for i, (name, y_val) in enumerate(entries):
             text = f"{label_prefix}{name}: {y_val:.2f}"
@@ -397,15 +400,15 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
     """
     부트스트랩 bar + 종합 Boxplot을 한 HTML에 좌우로 배치.
     """
-    global FIRST_OPEN   # ← 반드시 함수 맨 위에서 선언해야 오류가 안남!
+    global FIRST_OPEN
 
     if df_clean.empty or df_ci.empty:
         print("[INFO] df_clean 또는 df_ci가 비어 있어서 대시보드 생성 스킵")
-        return
+        return ""
 
     ensure_plot_dir()
 
-    # ---------- (1) CI 막대 그래프 + 텍스트 라벨 ----------
+    # (1) CI 막대 그래프
     df_ci_plot = df_ci.copy()
     df_ci_plot["err_plus"] = df_ci_plot["ci_high"] - df_ci_plot["ct"]
     df_ci_plot["err_minus"] = df_ci_plot["ct"] - df_ci_plot["ci_low"]
@@ -431,7 +434,7 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
     )
     fig_bar.update_traces(textposition="outside", cliponaxis=False)
 
-    # ---------- (2) Boxplot ----------
+    # (2) Boxplot
     df_box = df_clean.copy()
     df_box["station_remark"] = df_box["station"] + " / " + df_box["remark"]
 
@@ -446,7 +449,7 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
 
     add_box_stats_annotations(fig_combined, df_box, "station_remark", "ct")
 
-    # ---------- (3) 두 그래프 HTML 변환 ----------
+    # (3) 두 그래프 HTML 변환
     figs = [fig_bar, fig_combined]
     fig_htmls = []
     for i, fig in enumerate(figs):
@@ -457,7 +460,6 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
         )
         fig_htmls.append(html)
 
-    # ★ 7초 자동 새로고침 스크립트
     auto_refresh = """
     <script>
         setTimeout(function() {
@@ -466,7 +468,6 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
     </script>
     """
 
-    # ---------- (4) 최종 HTML ----------
     full_html = f"""
 <html>
 <head>
@@ -504,7 +505,6 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
 </html>
 """
 
-    # ---------- (5) 파일 저장 ----------
     out_path = os.path.join(PLOT_DIR, PLOT_FILE)
     abs_path = os.path.abspath(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -513,7 +513,6 @@ def save_dashboard_html(df_ci: pd.DataFrame, df_clean: pd.DataFrame, month_str: 
     print(f"[INFO] 그래프 HTML 생성 완료: {abs_path}")
     print(f"[DEBUG] FIRST_OPEN = {FIRST_OPEN}")
 
-    # ---------- (6) 최초 1회 브라우저 오픈 ----------
     if FIRST_OPEN:
         try:
             FIRST_OPEN = False
@@ -551,41 +550,53 @@ def compute_final_ct(df_clean: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================
-# 7. Month 계산 + upsert (동일 데이터면 pass)
+# 7. Month 계산 + upsert (전체 월 스냅샷 기준)
 # ===========================
 def add_month_and_save(engine: create_engine,
                        df_clean: pd.DataFrame,
-                       df_final: pd.DataFrame):
+                       df_final_dummy: pd.DataFrame):
+    """
+    df_clean 전체를 기준으로 month(YYYY-MM) × remark별 CT 평균(/2)을 계산해서
+    e1_whole_ct.whole_ct에 모두 upsert.
+
+    - 예: df_clean에 2025-10, 2025-12 섞여 있으면 두 달 모두 저장.
+    - 현재는 VIEW와 processing 로딩이 '이번 달'로 제한되어 있어서
+      실질적으로는 한 달만 나오지만, 구조는 멀티월에도 대응.
+    """
     global LAST_RESULT
 
     if df_clean.empty:
         print("\n[WARN] df_clean이 비어있어 Month를 계산할 수 없습니다.")
         return None, False
 
-    shift_dt = pd.to_datetime(df_clean["shift_date"])
-    month_ym = shift_dt.max().strftime("%Y-%m")
+    df_tmp = df_clean.copy()
+    df_tmp["month"] = pd.to_datetime(df_tmp["shift_date"]).dt.to_period("M").astype(str)
 
-    df_final_with_month = df_final.copy()
-    df_final_with_month["Month"] = month_ym
+    df_month = (
+        df_tmp
+        .groupby(["month", "remark"])["ct"]
+        .mean()
+        .reset_index()
+    )
+    df_month["ct"] = (df_month["ct"] / 2).round(2)
 
-    print("\n[STEP 6] Month 적용 최종 결과")
-    print(df_final_with_month.to_string(index=False))
+    print("\n[STEP 6] 월별 × remark별 최종 CT (/2) 결과")
+    print(df_month.to_string(index=False))
 
-    # 동일 데이터 여부 체크
-    current = {row["remark"]: float(row["ct"])
-               for _, row in df_final_with_month.iterrows()}
-    prev = LAST_RESULT.get(month_ym)
+    current_snapshot = {
+        (row["month"], row["remark"]): float(row["ct"])
+        for _, row in df_month.iterrows()
+    }
 
-    if prev == current:
-        print(f"\n[INFO] {month_ym} 결과가 이전과 동일 → DB/그래프 스킵")
+    if LAST_RESULT and LAST_RESULT == current_snapshot:
+        months = sorted(df_month["month"].unique())
+        month_ym = months[-1]
+        print(f"\n[INFO] 모든 월별 결과가 이전과 동일 → DB/그래프 스킵 (latest month={month_ym})")
         return month_ym, False
 
-    # 캐시 갱신
-    LAST_RESULT[month_ym] = current
+    LAST_RESULT = current_snapshot
 
-    df_to_save = df_final_with_month[["Month", "remark", "ct"]].rename(columns={
-        "Month": "month"
-    })
+    df_to_save = df_month.copy()
 
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS e1_whole_ct;"))
@@ -618,94 +629,10 @@ def add_month_and_save(engine: create_engine,
     print("\n[STEP 7] e1_whole_ct.whole_ct 테이블 upsert 완료")
     print(df_to_save.to_string(index=False))
 
+    months = sorted(df_month["month"].unique())
+    month_ym = months[-1]
+
     return month_ym, True
-
-
-# ===========================
-# 한 사이클 실행 (★ 기존 clean + 신규 clean 합치기)
-# ===========================
-def run_one_cycle(engine):
-    print("\n==============================")
-    print("[CYCLE START]", datetime.now())
-    print("==============================")
-
-    # 1) VIEW에서 RAW 로드
-    df_raw = load_data(engine)
-    if df_raw.empty:
-        print("[INFO] RAW DATA 없음")
-        return
-
-    # 2) 이미 처리된 clean 데이터 로드
-    df_old_clean = load_processed_clean(engine)
-    print(f"[INFO] 이미 처리된 clean 데이터 수: {len(df_old_clean)}")
-
-    # 3) RAW 전체에 shift 정보 부여
-    df_shift = add_shift_info(df_raw)
-
-    # 4) 이미 처리된 (station, remark, file_path) 조합 만들기
-    if not df_old_clean.empty:
-        processed_keys = set(
-            zip(df_old_clean["station"], df_old_clean["remark"], df_old_clean["file_path"])
-        )
-    else:
-        processed_keys = set()
-
-    # 5) 신규 데이터만 IQR 이상치 계산
-    df_new_clean, df_outliers = remove_outliers(df_shift, processed_keys=processed_keys)
-    print(f"[DEBUG] 이번 사이클 신규 clean 데이터 수: {len(df_new_clean)}")
-
-    if df_new_clean.empty and not df_old_clean.empty:
-        print("[INFO] 신규 clean 데이터 없음 → 이번 사이클 계산 스킵 (기존 결과 유지)")
-        return
-    elif df_new_clean.empty and df_old_clean.empty:
-        print("[INFO] 처리할 clean 데이터가 전혀 없음")
-        return
-
-    # 4) 이미 처리된 (station, remark, file_path) 조합 만들기
-    if not df_old_clean.empty:
-        processed_keys = set(
-            zip(df_old_clean["station"], df_old_clean["remark"], df_old_clean["file_path"])
-        )
-    else:
-        processed_keys = set()
-
-    # 5) 신규 데이터만 IQR 이상치 계산
-    df_new_clean, df_outliers = remove_outliers(df_shift, processed_keys=processed_keys)
-
-    if df_new_clean.empty and not df_old_clean.empty:
-        print("[INFO] 신규 clean 데이터 없음 → 이번 사이클 계산 스킵 (기존 결과 유지)")
-        return
-    elif df_new_clean.empty and df_old_clean.empty:
-        print("[INFO] 처리할 clean 데이터가 전혀 없음")
-        return
-
-    # 6) 기존 + 신규 clean 데이터 합치기
-    if not df_old_clean.empty:
-        df_clean = pd.concat([df_old_clean, df_new_clean], ignore_index=True)
-    else:
-        df_clean = df_new_clean
-
-    print(f"[INFO] 합쳐진 clean 데이터 수: {len(df_clean)}")
-
-    # 7) 부트스트랩 CI, remark별 최종 CT 계산
-    df_ci = compute_bootstrap_ci(df_clean)
-    df_final = compute_final_ct(df_clean)
-    month_ym, updated = add_month_and_save(engine, df_clean, df_final)
-
-    # month 계산 실패 or 동일 데이터면 그래프/DB 스킵
-    if (month_ym is None) or (not updated):
-        # 그래도 신규 clean이 있다면 processing 에는 저장
-        if not df_new_clean.empty:
-            save_new_clean(engine, df_new_clean)
-        return
-
-    # 8) 데이터 변경이 있을 때만 대시보드 HTML 업데이트 + DB 저장
-    html = save_dashboard_html(df_ci, df_clean, month_ym)
-    save_ct_graph_html(engine, month_ym, df_final, html)
-
-    # 9) 마지막으로 신규 clean 데이터만 processing 테이블에 적재
-    if not df_new_clean.empty:
-        save_new_clean(engine, df_new_clean)
 
 
 # ===========================
@@ -757,6 +684,90 @@ def save_ct_graph_html(engine: create_engine,
             })
 
     print(f"\n[STEP 8] e1_whole_ct.ct_graph_html 저장 완료 (month={month_ym})")
+
+
+# ===========================
+# 한 사이클 실행
+#  - processing에서 이번 달 file_path 로드
+#  - VIEW RAW와 비교해서 신규 file_path만 처리
+# ===========================
+def run_one_cycle(engine):
+    print("\n==============================")
+    print("[CYCLE START]", datetime.now())
+    print("==============================")
+
+    # 1) VIEW에서 RAW 로드 (이미 SQL에서 '이번 달'로 제한된 상태라고 가정)
+    df_raw = load_data(engine)
+    if df_raw.empty:
+        print("[INFO] RAW DATA 없음")
+        return
+
+    df_raw["file_path"] = df_raw["file_path"].astype(str)
+
+    # 2) 이미 처리된 clean 데이터 (이번 달 end_day 조건) 로드
+    df_old_clean = load_processed_clean(engine)
+    if df_old_clean.empty:
+        processed_paths = set()
+    else:
+        df_old_clean["file_path"] = df_old_clean["file_path"].astype(str)
+        processed_paths = set(df_old_clean["file_path"])
+
+    print(f"[INFO] 이미 처리된 clean 데이터 수: {len(df_old_clean)}")
+    print(f"[INFO] 이미 처리된 file_path 수: {len(processed_paths)}")
+
+    # 3) RAW 중에서 아직 처리 안 된 file_path만 남기기
+    df_new_raw = df_raw[~df_raw["file_path"].isin(processed_paths)].copy()
+    print(f"[INFO] 이번 사이클 신규 RAW 데이터 수: {len(df_new_raw)}")
+
+    if df_new_raw.empty:
+        print("[INFO] 신규 RAW 데이터 없음 → 이번 사이클 스킵")
+        return
+
+    # 4) 신규 RAW에 주/야간 + shift_date 부여
+    df_shift_new = add_shift_info(df_new_raw)
+
+    # 5) 신규 RAW에 대해 IQR 이상치 제거
+    df_new_clean, df_outliers = remove_outliers(df_shift_new)
+    print(f"[INFO] 신규 clean 데이터 수: {len(df_new_clean)}")
+
+    if df_new_clean.empty:
+        print("[INFO] 신규 clean 데이터 없음 → 이번 사이클 스킵")
+        return
+
+    # 6) 기존 clean + 신규 clean 합치기 (이번 달 기준)
+    if not df_old_clean.empty:
+        df_clean = pd.concat([df_old_clean, df_new_clean], ignore_index=True)
+    else:
+        df_clean = df_new_clean
+
+    print(f"[INFO] 합쳐진 clean 데이터 수: {len(df_clean)}")
+
+    # 7) 월별 whole_ct 테이블 업데이트 (df_clean 전체 기준)
+    df_final_all = compute_final_ct(df_clean)
+    month_ym, updated = add_month_and_save(engine, df_clean, df_final_all)
+
+    if (month_ym is None) or (not updated):
+        # 그래도 신규 clean은 processing 에 기록
+        save_new_clean(engine, df_new_clean)
+        return
+
+    # 8) 최신 month_ym에 해당하는 데이터만 골라 그래프용으로 사용
+    df_clean["month"] = pd.to_datetime(df_clean["shift_date"]).dt.to_period("M").astype(str)
+    df_month = df_clean[df_clean["month"] == month_ym].copy()
+
+    if df_month.empty:
+        print("[WARN] 최신 월(month_ym) 데이터 없음 → 그래프/HTML 스킵")
+        save_new_clean(engine, df_new_clean)
+        return
+
+    df_ci_month = compute_bootstrap_ci(df_month)
+    df_final_month = compute_final_ct(df_month)
+
+    html = save_dashboard_html(df_ci_month, df_month, month_ym)
+    save_ct_graph_html(engine, month_ym, df_final_month, html)
+
+    # 9) 마지막으로 신규 clean만 processing 테이블에 적재
+    save_new_clean(engine, df_new_clean)
 
 
 # ===========================
