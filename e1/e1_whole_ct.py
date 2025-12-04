@@ -23,10 +23,10 @@ DB_CONFIG = {
 }
 
 # 부트스트랩 반복 횟수
-N_BOOTSTRAP = 10
+N_BOOTSTRAP = 1
 
 # 신뢰구간 (%). 95.0 → 95% CI, 99.0 → 99% CI
-CI_LEVEL = 95.0  # ★ 여기만 바꾸면 전체 CI 변경
+CI_LEVEL = 99.0  # ★ 여기만 바꾸면 전체 CI 변경
 
 # 부트스트랩 멀티프로세싱 워커 수
 N_BOOTSTRAP_WORKERS = 2
