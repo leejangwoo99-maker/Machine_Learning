@@ -22,6 +22,9 @@ FIXED_START_DATE = date(2025, 10, 1)   # yyyymmdd에 해당
 # 배치 처리 시 한 번에 DB에 넣을 최대 row 수 (메모리 최적화용)
 BATCH_SIZE_ROWS = 50000
 
+# 실시간 전용: 최근 N초 이내에 수정된 파일만 대상
+REALTIME_LOOKBACK_SECONDS = 120  # 예: 최근 2분
+
 # ==========================
 # PostgreSQL 접속 정보
 # ==========================
@@ -44,7 +47,7 @@ TABLE_HIST = "vision_json_table_processing_history"
 # ==========================
 def six_months_ago(d: date) -> date:
     """
-    오늘 기준 6개월 전 날짜 계산 (relativedelta 없이 직접 구현).
+    오늘 기준 6개월 전 날짜 계산 (현재는 사용하지 않지만 참고용으로 남겨둠).
     """
     year = d.year
     month = d.month - 6
@@ -59,18 +62,23 @@ def six_months_ago(d: date) -> date:
 
 def get_window_dates():
     """
-    - today: 오늘
-    - window_start_date: max(FIXED_START_DATE, today-6개월)
-    - window_end_date: today
-
+    오늘 기준으로 '이번 달 1일 ~ 오늘' 범위를 반환.
     예)
-      처음엔 2025-10-01 ~ 오늘
-      시간이 지나서 today-6개월이 2025-12-01이 되면 → 2025-12-01 ~ 오늘
+      - today = 2025-12-04 → 2025-12-01 ~ 2025-12-04
+      - today = 2025-12-31 → 2025-12-01 ~ 2025-12-31
+      - today = 2026-01-01 → 2026-01-01 ~ 2026-01-01
+
+    FIXED_START_DATE 이전은 무조건 제외.
     """
     today = date.today()
-    six_before = six_months_ago(today)
-    window_start_date = max(FIXED_START_DATE, six_before)
+
+    # 이번 달 1일
+    month_start = today.replace(day=1)
+
+    # 고정 시작일 이후만
+    window_start_date = max(month_start, FIXED_START_DATE)
     window_end_date = today
+
     return window_start_date, window_end_date
 
 
@@ -118,8 +126,9 @@ def ensure_schema_and_tables(conn):
 
 def cleanup_old_data(conn, window_start_date: date):
     """
-    현재 날짜 기준 6개월 이상된 데이터 삭제 (DELETE).
-    여기서는 processed_at 기준으로 6개월 이전 데이터 정리.
+    (옵션) 현재 날짜 기준 6개월 이상된 데이터 삭제 (DELETE).
+    지금은 Python 코드에서 호출하지 않고,
+    필요 시 직접 SQL로 관리하는 것을 권장.
 
     - 메인 테이블 : processed_at < window_start_date 00:00:00
     - 히스토리    : processed_at < window_start_date 00:00:00
@@ -159,6 +168,11 @@ def cleanup_old_data(conn, window_start_date: date):
 
 
 def load_processed_file_paths(conn):
+    """
+    이미 처리된 file_path 목록 로딩.
+    (현재는 전체 히스토리에서 가져오며,
+     오래된 데이터는 DB에서 주기적으로 직접 정리하는 것을 추천.)
+    """
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -245,7 +259,7 @@ def parse_program_line(line: str) -> str:
 def parse_data_lines(lines):
     """
     각 step 라인을 파싱해서 list[dict] 반환.
-    pandas 없이 바로 dict 리스트로 만들도록 변경 (메모리 절약).
+    pandas 없이 바로 dict 리스트로 만들도록 구성 (메모리 절약).
     """
     rows = []
 
@@ -324,12 +338,20 @@ def run_once():
     started_at = datetime.now()
     print(f"\n================ run_once 시작: {started_at} ================", flush=True)
 
-    # 날짜 윈도우 계산 (최근 6개월 + 고정 시작일 적용)
+    # 날짜 윈도우 계산 (이번 달 1일 ~ 오늘, FIXED_START_DATE 적용)
     window_start_date, window_end_date = get_window_dates()
     window_start_str = window_start_date.strftime("%Y%m%d")
     window_end_str = window_end_date.strftime("%Y%m%d")
 
     print(f"[윈도우] 파싱 기간: {window_start_date} ~ {window_end_date}", flush=True)
+
+    # 실시간 기준 시각 (최근 N초 이내 수정된 파일만 대상)
+    now_ts = time.time()
+    cutoff_ts = now_ts - REALTIME_LOOKBACK_SECONDS
+    print(
+        f"[실시간] 최근 {REALTIME_LOOKBACK_SECONDS}초 이내 수정된 파일만 처리 (cutoff_ts={cutoff_ts})",
+        flush=True,
+    )
 
     vision_root = BASE_LOG_DIR / VISION_FOLDER_NAME
     print(f"[DEBUG] vision_root: {vision_root}", flush=True)
@@ -342,14 +364,14 @@ def run_once():
     try:
         ensure_schema_and_tables(conn)
 
-        # 6개월 이전 DB 데이터 정리
-        cleanup_old_data(conn, window_start_date)
+        # ✅ 데이터 삭제는 DB 쪽에서 직접 SQL로 관리하는 것을 추천
+        # cleanup_old_data(conn, window_start_date)  # 필요하면 주석 해제해서 사용
 
-        # 정리 후, 현재 윈도우 내 데이터 기준으로 file_path 로드
+        # 정리 후, 현재 테이블 기준으로 file_path 로드
         processed_set = load_processed_file_paths(conn)
-        print(f"[INFO] 히스토리 file_path 수(윈도우 내): {len(processed_set)}개", flush=True)
+        print(f"[INFO] 히스토리 file_path 수: {len(processed_set)}개", flush=True)
 
-        # -------- 파일 스캔 (폴더 윈도우 적용) --------
+        # -------- 파일 스캔 (폴더 윈도우 + mtime 필터) --------
         file_list = []
         total_scanned = 0
 
@@ -379,15 +401,24 @@ def run_once():
                     if not f.is_file():
                         continue
 
+                    # 🔥 실시간 mtime 필터: 최근 REALTIME_LOOKBACK_SECONDS 이내 수정된 파일만 대상
+                    try:
+                        if f.stat().st_mtime < cutoff_ts:
+                            continue
+                    except FileNotFoundError:
+                        # 사이에 삭제된 경우 등은 무시
+                        continue
+
                     total_scanned += 1
                     fp_str = str(f)
 
+                    # 이미 처리한 파일이면 스킵
                     if fp_str in processed_set:
                         continue
 
                     file_list.append(fp_str)
 
-        print(f"[INFO] 전체 스캔 파일 수: {total_scanned}개", flush=True)
+        print(f"[INFO] 전체 스캔 파일 수(윈도우+mtime 통과): {total_scanned}개", flush=True)
         print(f"[INFO] 이번 실행에서 새로 처리할 파일 수: {len(file_list)}개", flush=True)
 
         if not file_list:
@@ -395,8 +426,8 @@ def run_once():
             return
 
         # -------- 멀티프로세싱 + 배치 처리 --------
-        # 🔥 CPU 코어 수와 상관없이 항상 2개 프로세스만 사용
-        cpu_cnt = 2
+        # CPU 코어 수와 상관없이 항상 4개 프로세스만 사용 (원하면 4로 조절 가능)
+        cpu_cnt = 4
         print(f"[INFO] 멀티프로세스 사용 프로세스 수: {cpu_cnt}", flush=True)
 
         batch_rows = []
@@ -465,6 +496,7 @@ def run_once():
 # ==========================
 if __name__ == "__main__":
     try:
+        print("[START] a3_vision_json_table - 무한 루프 시작", flush=True)
         while True:
             try:
                 run_once()

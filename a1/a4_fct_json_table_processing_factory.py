@@ -37,6 +37,9 @@ FIXED_START_DATE = date(2025, 10, 1)
 # 한 번에 DB에 넣을 최대 row 수 (메모리 최적화용)
 BATCH_SIZE_ROWS = 50000
 
+# 실시간용: 최근 N초 이내 수정된 파일만 처리
+REALTIME_LOOKBACK_SECONDS = 120  # 예: 최근 2분
+
 
 # ============================================
 # 날짜 윈도우 계산
@@ -44,7 +47,7 @@ BATCH_SIZE_ROWS = 50000
 
 def six_months_ago(d: date) -> date:
     """
-    오늘 기준 6개월 전 날짜 계산 (relativedelta 없이 직접 구현).
+    오늘 기준 6개월 전 날짜 계산 (현재는 사용하지 않지만 참고용으로 남겨둠).
     """
     year = d.year
     month = d.month - 6
@@ -59,17 +62,21 @@ def six_months_ago(d: date) -> date:
 
 def get_window_dates():
     """
-    - today: 오늘
-    - window_start_date: max(FIXED_START_DATE, today-6개월)
-    - window_end_date: today
-
+    오늘 날짜 기준으로 '이번 달 1일 ~ 오늘' 범위를 반환.
     예)
-      처음엔 2025-10-01 ~ 오늘
-      시간이 지나서 today-6개월이 2026-02-02라면 → 2026-02-02 ~ today
+      - 오늘 = 2025-12-04 → 2025-12-01 ~ 2025-12-04
+      - 오늘 = 2025-12-31 → 2025-12-01 ~ 2025-12-31
+      - 오늘 = 2026-01-01 → 2026-01-01 ~ 2026-01-01
+
+    FIXED_START_DATE 이전은 무조건 제외.
     """
     today = date.today()
-    six_before = six_months_ago(today)
-    window_start_date = max(FIXED_START_DATE, six_before)
+
+    # 이번 달 1일
+    month_start = today.replace(day=1)
+
+    # 고정 시작일 이후만
+    window_start_date = max(month_start, FIXED_START_DATE)
     window_end_date = today
     return window_start_date, window_end_date
 
@@ -113,8 +120,11 @@ def init_db(conn):
 
 def cleanup_old_data(conn, window_start_date: date):
     """
-    현재 날짜 기준 6개월 이상된 DB 데이터 삭제 (DELETE).
+    window_start_date 이전 DB 데이터 삭제 (DELETE).
     created_at < window_start_date 00:00:00 기준으로 삭제.
+
+    ※ 현재 process_once에서는 호출하지 않음.
+       필요 시 psql 또는 별도 관리 스크립트에서 실행하는 것을 권장.
     """
     cutoff_dt = datetime.combine(window_start_date, datetime.min.time())
 
@@ -127,17 +137,28 @@ def cleanup_old_data(conn, window_start_date: date):
         cur.execute(delete_sql, (cutoff_dt,))
         deleted = cur.rowcount
 
-    print(f"[정리] 6개월 이전 DB 데이터 삭제 완료 (rows={deleted})")
+    print(f"[정리] window_start 이전 DB 데이터 삭제 완료 (rows={deleted})")
 
 
-def get_processed_file_paths(conn) -> set:
-    """이미 DB에 적재된 file_path 목록(set) 조회."""
-    query = sql.SQL("SELECT DISTINCT file_path FROM {}.{}").format(
+def get_processed_file_paths(conn, window_start_date: date) -> set:
+    """
+    이미 DB에 적재된 file_path 목록(set) 조회.
+    - created_at >= window_start_date 기준으로만 조회해서
+      오래된 데이터는 자동으로 제외 (윈도우 내 중복만 방지).
+    """
+    cutoff_dt = datetime.combine(window_start_date, datetime.min.time())
+
+    query = sql.SQL("""
+        SELECT DISTINCT file_path
+        FROM {}.{}
+        WHERE created_at >= %s
+    """).format(
         sql.Identifier(SCHEMA_NAME),
         sql.Identifier(TABLE_NAME),
     )
+
     with conn.cursor() as cur:
-        cur.execute(query)
+        cur.execute(query, (cutoff_dt,))
         rows = cur.fetchall()
     return {r[0] for r in rows}
 
@@ -277,13 +298,19 @@ def parse_fct_file(file_path: Path) -> list[dict]:
 
 
 # ============================================
-# 3) 파일 수집 (날짜 윈도우 적용)
+# 3) 파일 수집 (날짜 윈도우 + mtime 필터)
 # ============================================
 
-def collect_fct_files(base_dir: Path, window_start_str: str, window_end_str: str) -> list[Path]:
+def collect_fct_files(
+    base_dir: Path,
+    window_start_str: str,
+    window_end_str: str,
+    cutoff_ts: float,
+) -> list[Path]:
     """
     TC6~9 / yyyymmdd / GoodFile/BadFile 아래의 모든 *.txt 수집.
-    날짜 폴더는 window_start_str ~ window_end_str 범위만 처리.
+    - 날짜 폴더는 window_start_str ~ window_end_str 범위만 처리.
+    - 파일 mtime이 cutoff_ts (최근 REALTIME_LOOKBACK_SECONDS초) 이후인 경우만 대상.
     """
     file_list: list[Path] = []
 
@@ -313,6 +340,13 @@ def collect_fct_files(base_dir: Path, window_start_str: str, window_end_str: str
 
                 # .txt 수집
                 for f in target_dir.glob("*.txt"):
+                    try:
+                        if f.stat().st_mtime < cutoff_ts:
+                            # 실시간 윈도우 밖이면 건너뜀
+                            continue
+                    except FileNotFoundError:
+                        continue
+
                     file_list.append(f)
 
     return file_list
@@ -323,33 +357,45 @@ def collect_fct_files(base_dir: Path, window_start_str: str, window_end_str: str
 # ============================================
 
 def process_once():
-    """한 번 사이클: 날짜 윈도우 적용 → DB 정리 → 중복 file_path 확인 → 새 파일 파싱 → 배치 DB 적재."""
+    """
+    한 번 사이클:
+      - 날짜 윈도우(이번 달 1일 ~ 오늘) 적용
+      - 실시간 mtime 윈도우 적용 (최근 N초)
+      - 이미 처리된 file_path(윈도우 내 created_at 기준) 조회
+      - 새 파일만 파싱 → 배치 단위로 DB 적재
+    """
+    cycle_start = time.time()
     window_start_date, window_end_date = get_window_dates()
     window_start_str = window_start_date.strftime("%Y%m%d")
     window_end_str = window_end_date.strftime("%Y%m%d")
 
+    now_ts = time.time()
+    cutoff_ts = now_ts - REALTIME_LOOKBACK_SECONDS
+
     print("\n==============================================")
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] process_once 시작")
     print(f"[윈도우] 폴더/데이터 유효 기간: {window_start_date} ~ {window_end_date}")
+    print(f"[실시간] 최근 {REALTIME_LOOKBACK_SECONDS}초 이내 수정된 파일만 처리 (cutoff_ts={cutoff_ts})")
 
     conn = get_connection()
     try:
         init_db(conn)
 
-        # 6개월 이전 DB 데이터 정리
-        cleanup_old_data(conn, window_start_date)
+        # ✅ 삭제는 DB 측에서 별도 SQL로 관리하는 것을 권장
+        # cleanup_old_data(conn, window_start_date)
 
-        # 정리 후, 이미 처리된 file_path 목록
-        processed_files = get_processed_file_paths(conn)
+        # 윈도우 이후(created_at >= window_start_date) 기준으로,
+        # 이미 처리된 file_path 목록
+        processed_files = get_processed_file_paths(conn, window_start_date)
 
-        # 전체 파일 스캔 (날짜 윈도우 적용)
-        all_files = collect_fct_files(BASE_LOG_DIR, window_start_str, window_end_str)
+        # 전체 파일 스캔 (날짜 윈도우 + mtime 윈도우 적용)
+        all_files = collect_fct_files(BASE_LOG_DIR, window_start_str, window_end_str, cutoff_ts)
         all_files_str = [str(p) for p in all_files]
 
         new_files = [Path(p) for p in all_files_str if p not in processed_files]
 
-        print(f"  총 파일 수(윈도우 내): {len(all_files)}개")
-        print(f"  이미 처리된 파일 수(DB): {len(processed_files)}개")
+        print(f"  총 파일 수(폴더+mtime 윈도우 내): {len(all_files)}개")
+        print(f"  이미 처리된 파일 수(DB, created_at>=윈도우): {len(processed_files)}개")
         print(f"  이번에 새로 처리할 파일 수: {len(new_files)}개")
 
         if not new_files:
@@ -360,8 +406,8 @@ def process_once():
         batch_records: list[dict] = []
 
         if USE_MULTIPROCESSING:
-            # 🔥 멀티프로세싱 워커 수를 항상 2개로 고정
-            n_proc = 2
+            # 🔥 멀티프로세싱 워커 수를 항상 4개로 고정
+            n_proc = 4
             print(f"  멀티프로세싱 사용: 프로세스 {n_proc}개")
 
             with Pool(processes=n_proc) as pool:
@@ -411,8 +457,9 @@ def process_once():
                 f"  마지막 배치 INSERT (rows={inserted}, 누적 rows={total_inserted_rows})"
             )
 
+        cycle_end = time.time()
         print(f"  총 INSERT된 레코드 수: {total_inserted_rows}개")
-        print("  DB 적재 완료.")
+        print(f"  DB 적재 완료. (사이클 소요 시간: {cycle_end - cycle_start:.1f}초)")
 
     finally:
         conn.close()

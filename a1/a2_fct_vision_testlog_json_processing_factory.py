@@ -48,6 +48,9 @@ FIXED_START_DATE = date(2025, 10, 1)
 # 한 번에 파싱 + INSERT 할 최대 파일 수 (메모리 최적화용)
 BATCH_SIZE = 10000
 
+# 최근 N초 이내에 수정된 파일만 "실시간 대상"으로 처리
+REALTIME_LOOKBACK_SECONDS = 120  # 예: 최근 120초(2분) 안에 변경된 파일만 파싱
+
 # ==============================
 # 날짜 윈도우 계산
 # ==============================
@@ -55,6 +58,7 @@ BATCH_SIZE = 10000
 def six_months_ago(d: date) -> date:
     """
     오늘 기준 6개월 전 날짜 계산 (relativedelta 없이 직접 구현).
+    (현재 로직에서는 사용하지 않지만, 필요시 참고용으로 남겨둠.)
     """
     year = d.year
     month = d.month - 6
@@ -69,17 +73,25 @@ def six_months_ago(d: date) -> date:
 
 def get_window_dates():
     """
-    - today: 오늘
-    - window_start_date: max(FIXED_START_DATE, today-6개월)
-    - window_end_date: today
-
-    => 이 범위에 들어오는 yyyymmdd 폴더만 파싱 + DB 유지
+    오늘 기준으로 '이번 달 1일 ~ 오늘' 범위를 반환.
+    예)
+      - today = 2025-12-04 → 2025-12-01 ~ 2025-12-04
+      - today = 2025-12-31 → 2025-12-01 ~ 2025-12-31
+      - today = 2026-01-01 → 2026-01-01 ~ 2026-01-01
     """
     today = date.today()
-    six_before = six_months_ago(today)
-    window_start_date = max(FIXED_START_DATE, six_before)
+
+    # 이번 달 1일
+    month_start = today.replace(day=1)
+
+    # 최소 시작일(FIXED_START_DATE) 적용
+    window_start_date = max(month_start, FIXED_START_DATE)
+
+    # 윈도우 끝 = 오늘
     window_end_date = today
+
     return window_start_date, window_end_date
+
 
 # ==============================
 # 공통 유틸 함수
@@ -282,37 +294,6 @@ def ensure_schema_and_table(conn):
     conn.commit()
 
 
-def cleanup_old_data(conn, window_start_date: date):
-    """
-    현재 날짜 기준 6개월 이상된 데이터 완전 삭제 (DELETE).
-    → end_day < window_start_date 기준으로 삭제.
-    """
-    cutoff_str = window_start_date.strftime("%Y%m%d")
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            DELETE FROM {SCHEMA_NAME}.{TABLE_NAME}
-            WHERE end_day < %s
-            """,
-            (cutoff_str,),
-        )
-        deleted = cur.rowcount
-    conn.commit()
-    print(f"[정리] 6개월 이전 데이터 삭제 완료 (rows={deleted})")
-
-
-def load_existing_file_paths(conn):
-    """
-    이미 DB에 올라간 file_path 목록 읽어오기.
-    cleanup_old_data 이후 호출되므로,
-    실제로는 최근 6개월(+고정 시작일) 데이터만 들어있게 됨.
-    """
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT file_path FROM {SCHEMA_NAME}.{TABLE_NAME};")
-        rows = cur.fetchall()
-    return set(r[0] for r in rows)
-
-
 def insert_records(conn, json_objects, records):
     if not json_objects or not records:
         return 0
@@ -371,12 +352,7 @@ def parse_one_wrapper(args):
 # 배치 처리 (메모리 최적화)
 # ==============================
 
-def process_batch(executor, batch_targets, conn, existing_paths, batch_index):
-    """
-    batch_targets: [(path_str, mid), ...]
-    - 멀티프로세싱으로 파싱 후
-      해당 배치만 DB에 INSERT하고 메모리에서 버림.
-    """
+def process_batch(executor, batch_targets, conn, batch_index):
     if not batch_targets:
         return 0
 
@@ -398,14 +374,8 @@ def process_batch(executor, batch_targets, conn, existing_paths, batch_index):
             print(f"  → 배치 #{batch_index} 현재 {i}/{len(batch_targets)} 파싱 완료")
 
     inserted = insert_records(conn, json_list, record_list)
-
-    # 새로 들어간 파일은 existing_paths에도 추가해서 같은 런에서 중복 방지
-    for rec in record_list:
-        existing_paths.add(rec["file_path"])
-
     print(f"[배치] #{batch_index} - DB INSERT 완료 (inserted={inserted})")
 
-    # 배치 단위로만 json_list / record_list를 보유했다가 버리기 때문에 메모리 사용이 줄어듦.
     return inserted
 
 # ==============================
@@ -413,35 +383,33 @@ def process_batch(executor, batch_targets, conn, existing_paths, batch_index):
 # ==============================
 
 def run_one_cycle():
-    # 날짜 윈도우 계산
+    cycle_start = time.time()
+
+    # 날짜 윈도우 계산 (이번 달 1일 ~ 오늘)
     window_start_date, window_end_date = get_window_dates()
     window_start_str = window_start_date.strftime("%Y%m%d")
     window_end_str = window_end_date.strftime("%Y%m%d")
+
+    now_ts = time.time()
+    cutoff_ts = now_ts - REALTIME_LOOKBACK_SECONDS  # 🔥 최근 N초 이내 파일만 대상
 
     print("\n==================== CYCLE START ====================")
     print("[DEBUG] BASE_LOG_DIR         :", BASE_LOG_DIR)
     print("[DEBUG] BASE_LOG_DIR exists? :", BASE_LOG_DIR.exists())
     print(f"[윈도우] 파싱 기간: {window_start_date} ~ {window_end_date}")
+    print(f"[실시간] 최근 {REALTIME_LOOKBACK_SECONDS}초 이내 수정된 파일만 처리 (cutoff_ts={cutoff_ts})")
 
     conn = get_connection()
     try:
         ensure_schema_and_table(conn)
 
-        # 6개월 이전 DB 데이터 삭제
-        cleanup_old_data(conn, window_start_date)
-
-        # 최근 6개월(윈도우) 내의 file_path만 메모리에 유지
-        existing_paths = load_existing_file_paths(conn)
-        print(f"[INFO] DB에 이미 등록된 file_path 수(윈도우 내): {len(existing_paths)}")
-
-        total_scanned = 0
-        total_new_target = 0
-        total_inserted = 0
-        skipped = 0
+        total_scanned = 0       # 윈도우+mtime 조건을 통과한 파일 수
+        total_new_target = 0    # 이번 사이클에서 파싱 대상이 된 파일 수
+        total_inserted = 0      # INSERT 시도 건수(중복은 DB가 무시)
         batch_index = 1
 
-        # 🔥 멀티프로세싱 워커 수를 2개로 고정
-        max_workers = 2
+        # 🔥 멀티프로세싱 워커 수를 4개로 고정
+        max_workers = 4
         print(f"[멀티프로세싱] 사용 프로세스 수: {max_workers}")
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -479,13 +447,18 @@ def run_one_cycle():
                         for f in target_dir.iterdir():
                             if not f.is_file():
                                 continue
+
+                            # 🔥 실시간 mtime 필터: 최근 REALTIME_LOOKBACK_SECONDS 이내 수정된 파일만
+                            try:
+                                if f.stat().st_mtime < cutoff_ts:
+                                    continue
+                            except FileNotFoundError:
+                                # 사이에 파일이 삭제된 경우 등은 그냥 무시
+                                continue
+
                             total_scanned += 1
 
                             path_str = str(f)
-                            if path_str in existing_paths:
-                                skipped += 1
-                                continue
-
                             if len(batch_targets) < 5:
                                 print("[DEBUG] FOUND FILE (sub):", path_str)
 
@@ -498,7 +471,6 @@ def run_one_cycle():
                                     executor,
                                     batch_targets,
                                     conn,
-                                    existing_paths,
                                     batch_index,
                                 )
                                 batch_targets = []
@@ -509,13 +481,17 @@ def run_one_cycle():
                         for f in date_dir.iterdir():
                             if not f.is_file():
                                 continue
+
+                            # 🔥 실시간 mtime 필터
+                            try:
+                                if f.stat().st_mtime < cutoff_ts:
+                                    continue
+                            except FileNotFoundError:
+                                continue
+
                             total_scanned += 1
 
                             path_str = str(f)
-                            if path_str in existing_paths:
-                                skipped += 1
-                                continue
-
                             if len(batch_targets) < 5:
                                 print("[DEBUG] FOUND FILE (date_dir):", path_str)
 
@@ -527,7 +503,6 @@ def run_one_cycle():
                                     executor,
                                     batch_targets,
                                     conn,
-                                    existing_paths,
                                     batch_index,
                                 )
                                 batch_targets = []
@@ -539,14 +514,14 @@ def run_one_cycle():
                     executor,
                     batch_targets,
                     conn,
-                    existing_paths,
                     batch_index,
                 )
 
+        duration = time.time() - cycle_start
         print(f"[CYCLE] 전체 스캔 파일 수       : {total_scanned}")
         print(f"[CYCLE] 새로 대상이 된 파일 수  : {total_new_target}")
-        print(f"[CYCLE] DB기반 스킵(이미 존재) 수: {skipped}")
-        print(f"[CYCLE] 이번 사이클 INSERT 수   : {total_inserted}")
+        print(f"[CYCLE] 이번 사이클 INSERT 시도 수: {total_inserted}")
+        print(f"[CYCLE] 소요 시간: {duration:.1f}초")
         print("==================== CYCLE END ====================")
 
     finally:

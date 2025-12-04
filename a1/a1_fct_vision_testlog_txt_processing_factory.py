@@ -46,11 +46,17 @@ FIXED_START_DATE = date(2025, 10, 1)
 # 한 번에 멀티프로세스로 처리할 최대 파일 개수 (메모리 절약용)
 BATCH_SIZE = 10000
 
+# 실시간용: 최근 N초 이내에 수정된 파일만 검사
+REALTIME_LOOKBACK_SECONDS = 120  # 예: 최근 2분
+
 
 # ============================================
-# 날짜 유틸: 오늘 기준 6개월 전 계산
+# 날짜 유틸
 # ============================================
 def one_month_ago(d: date) -> date:
+    """
+    한 달 전 계산 (현재 로직에서는 사용하지 않지만 참고용으로 유지).
+    """
     year = d.year
     month = d.month - 1
     if month <= 0:
@@ -60,6 +66,7 @@ def one_month_ago(d: date) -> date:
     last_day = calendar.monthrange(year, month)[1]
     day = min(d.day, last_day)
     return date(year, month, day)
+
 
 def get_window_dates():
     """
@@ -72,7 +79,6 @@ def get_window_dates():
     today = date.today()
 
     # 이번 달 1일
-    # 이번 달 1일
     month_start = today.replace(day=1)
 
     # FIXED_START_DATE 이후부터만 보겠다는 정책 유지
@@ -82,6 +88,7 @@ def get_window_dates():
     window_end_date = today
 
     return window_start_date, window_end_date
+
 
 # ============================================
 # 1. DB 유틸
@@ -125,8 +132,7 @@ def init_db(conn):
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{tbl}_full_path ON {sch}.{tbl}(full_path);"
     )
-
-    # 🔥 여기 추가
+    # full_path 기준으로 중복 방지
     cur.execute(
         f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{tbl}_full_path ON {sch}.{tbl}(full_path);"
     )
@@ -168,91 +174,6 @@ def init_db(conn):
     cur.close()
 
 
-def cleanup_old_data(conn, window_start_date: date):
-    """
-    RDBMS에서 '현재 날짜 기준 6개월 이상 된 데이터' 완전 삭제 (DELETE 사용).
-
-    - history : date_folder < window_start_date (yyyymmdd 비교)
-    - result  : run_started_at < window_start_date 00:00:00
-    - detail  : run_started_at < window_start_date 00:00:00
-    """
-    cutoff_str = window_start_date.strftime("%Y%m%d")
-    cutoff_dt = datetime.combine(window_start_date, datetime.min.time())
-
-    cur = conn.cursor()
-
-    # history
-    sch = SCHEMA_HISTORY
-    tbl = table_name_from_schema(sch)
-    cur.execute(
-        f"""
-        DELETE FROM {sch}.{tbl}
-        WHERE date_folder < %s
-        """,
-        (cutoff_str,),
-    )
-    deleted_hist = cur.rowcount
-
-    # result
-    sch = SCHEMA_RESULT
-    tbl = table_name_from_schema(sch)
-    cur.execute(
-        f"""
-        DELETE FROM {sch}.{tbl}
-        WHERE run_started_at < %s
-        """,
-        (cutoff_dt,),
-    )
-    deleted_res = cur.rowcount
-
-    # detail
-    sch = SCHEMA_DETAIL
-    tbl = table_name_from_schema(sch)
-    cur.execute(
-        f"""
-        DELETE FROM {sch}.{tbl}
-        WHERE run_started_at < %s
-        """,
-        (cutoff_dt,),
-    )
-    deleted_det = cur.rowcount
-
-    conn.commit()
-    cur.close()
-
-    print(
-        f"[정리] 6개월 이전 데이터 삭제 완료 "
-        f"(history={deleted_hist}, result={deleted_res}, detail={deleted_det})"
-    )
-
-
-def load_processed_paths(conn, window_start_date: date, window_end_date: date):
-    """
-    이미 PostgreSQL history 테이블에 올라간 full_path를 읽어서 set으로 반환.
-    >> date_folder를 window_start_date ~ window_end_date 범위로 제한해서 메모리 절약.
-    """
-    sch = SCHEMA_HISTORY
-    tbl = table_name_from_schema(sch)
-    cur = conn.cursor()
-
-    start_str = window_start_date.strftime("%Y%m%d")
-    end_str = window_end_date.strftime("%Y%m%d")
-
-    cur.execute(
-        f"""
-        SELECT full_path
-        FROM {sch}.{tbl}
-        WHERE date_folder BETWEEN %s AND %s
-        """,
-        (start_str, end_str),
-    )
-    rows = cur.fetchall()
-    cur.close()
-
-    processed_full_paths = {fp for (fp,) in rows if fp}
-    return processed_full_paths
-
-
 def insert_history_rows(conn, rows):
     if not rows:
         return 0
@@ -280,10 +201,11 @@ def insert_history_rows(conn, rows):
         ],
         page_size=1000,
     )
-    conn.commit()
     inserted = cur.rowcount  # 실제 들어간 행 수
+    conn.commit()
     cur.close()
     return inserted
+
 
 def insert_result_rows(conn, rows):
     if not rows:
@@ -533,33 +455,38 @@ def process_batch(pool, file_infos, conn, equip_counts, run_started_at):
 # 5. 한 번 실행(run_once)
 # ============================================
 def run_once():
+    cycle_start = time.time()
     run_started_at = datetime.now()
     print("\n==================== run_once 시작 ====================")
     print(f"시각: {run_started_at}")
 
-    # 현재 기준 6개월 윈도우 계산
+    # 현재 기준 윈도우 계산 (이번 달 1일 ~ 오늘)
     window_start_date, window_end_date = get_window_dates()
     print(f"[윈도우] 스캔/보관 기간: {window_start_date} ~ {window_end_date}")
+    window_start_str = window_start_date.strftime("%Y%m%d")
+    window_end_str = window_end_date.strftime("%Y%m%d")
+
+    # 실시간용 cutoff (최근 N초 이내 수정된 파일만 대상)
+    now_ts = time.time()
+    cutoff_ts = now_ts - REALTIME_LOOKBACK_SECONDS
+    print(f"[실시간] 최근 {REALTIME_LOOKBACK_SECONDS}초 이내 수정된 파일만 처리 (cutoff_ts={cutoff_ts})")
 
     conn = get_connection()
     try:
         # 스키마 / 테이블 생성
         init_db(conn)
 
-        total_scanned = 0
-        total_new = 0
+        total_scanned = 0          # mtime 조건까지 통과한 파일 수
+        total_new = 0              # 이번 실행에서 배치 대상으로 잡은 파일 수
         total_hist_inserted = 0
         total_det_inserted = 0
         equip_counts = {}
 
-        # 🔥 CPU 코어 기반이 아니라 "고정 2개"로 강제
-        cpu_cnt = 2
+        # 🔥 CPU 코어 기반이 아니라 "고정 2개"로 강제 (원하면 4로 늘릴 수 있음)
+        cpu_cnt = 4
         print(f"[멀티프로세스] 사용 프로세스 수: {cpu_cnt}")
 
-        window_start_str = window_start_date.strftime("%Y%m%d")
-        window_end_str = window_end_date.strftime("%Y%m%d")
-
-        # 🔥 multiprocessing Pool = 2개
+        # multiprocessing Pool = 2개
         with mp.Pool(processes=cpu_cnt) as pool:
             batch = []
 
@@ -590,6 +517,14 @@ def run_once():
 
                         for f in gb_path.iterdir():
                             if not f.is_file():
+                                continue
+
+                            # 🔥 실시간 mtime 필터: 최근 REALTIME_LOOKBACK_SECONDS 이내 수정된 파일만
+                            try:
+                                if f.stat().st_mtime < cutoff_ts:
+                                    continue
+                            except FileNotFoundError:
+                                # 사이에 삭제된 경우 등은 무시
                                 continue
 
                             total_scanned += 1
@@ -623,7 +558,6 @@ def run_once():
                     pool,
                     batch,
                     conn,
-                    processed_full_paths,
                     equip_counts,
                     run_started_at,
                 )
@@ -636,10 +570,10 @@ def run_once():
 
         run_finished_at = datetime.now()
 
-        print(f"[스캔] 전체 스캔 파일 수: {total_scanned}")
-        print(f"[스캔] 이번 실행에서 새로 처리한 파일 수: {total_new}")
-        print(f"[DB] 누적 history 저장 건수 : {total_hist_inserted}")
-        print(f"[DB] 누적 detail  저장 건수 : {total_det_inserted}")
+        print(f"[스캔] 전체 스캔 파일 수          : {total_scanned}")
+        print(f"[스캔] 이번 실행에서 배치 대상 수 : {total_new}")
+        print(f"[DB] 누적 history 저장 건수      : {total_hist_inserted}")
+        print(f"[DB] 누적 detail  저장 건수      : {total_det_inserted}")
 
         # result(요약) 행들 (설비별 1행씩)
         result_rows = [
@@ -652,17 +586,22 @@ def run_once():
             for eq, cnt in equip_counts.items()
         ]
         n_res = insert_result_rows(conn, result_rows)
-        print(f"[DB] result  저장 건수 : {n_res}")
+        print(f"[DB] result  저장 건수           : {n_res}")
+
+        duration = time.time() - cycle_start
+        print(f"[CYCLE] 소요 시간: {duration:.1f}초")
 
     finally:
         conn.close()
         print("==================== run_once 종료 ====================")
+
 
 # ============================================
 # 6. 메인 루프
 # ============================================
 if __name__ == "__main__":
     try:
+        print("[START] a1_fct_vision_testlog_txt_processing_history - 무한 루프 시작")
         while True:
             try:
                 run_once()

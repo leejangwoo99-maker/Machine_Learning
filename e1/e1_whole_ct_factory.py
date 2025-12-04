@@ -5,7 +5,6 @@ from datetime import timedelta, time, datetime
 import time as time_mod
 from concurrent.futures import ProcessPoolExecutor
 import os
-import webbrowser
 
 import plotly.express as px
 import plotly.io as pio
