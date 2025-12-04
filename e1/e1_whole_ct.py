@@ -42,7 +42,7 @@ LOOP_INTERVAL_SEC = 1.0
 LAST_RESULT = {}
 
 # 브라우저 최초 오픈 여부
-FIRST_OPEN = True
+FIRST_OPEN = False
 
 
 # ===========================
