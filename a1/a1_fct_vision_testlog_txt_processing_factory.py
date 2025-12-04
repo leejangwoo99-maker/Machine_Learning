@@ -26,7 +26,7 @@ FCT_MAP = {
     "TC9": "FCT4",
 }
 
-PostgreSQL 접속 정보
+# PostgreSQL 접속 정보
 DB_CONFIG = {
     "host": "192.168.108.162",
     "port": 5432,
@@ -63,20 +63,23 @@ def one_month_ago(d: date) -> date:
 
 def get_window_dates():
     """
-    오늘 날짜 기준으로 '해당 월 전체'만 스캔/처리하도록 범위를 반환.
-    예) 오늘 = 2025-12-04 → 2025-12-01 ~ 2025-12-31
+    오늘 날짜 기준으로 '이번 달 1일 ~ 오늘' 범위를 반환.
+    예)
+      - 오늘 = 2025-12-04 → 2025-12-01 ~ 2025-12-04
+      - 오늘 = 2025-12-31 → 2025-12-01 ~ 2025-12-31
+      - 오늘 = 2026-01-01 → 2026-01-01 ~ 2026-01-01
     """
     today = date.today()
 
-    # 해당 월의 1일
-    window_start_date = today.replace(day=1)
+    # 이번 달 1일
+    # 이번 달 1일
+    month_start = today.replace(day=1)
 
-    # 해당 월의 마지막 날
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    window_end_date = today.replace(day=last_day)
+    # FIXED_START_DATE 이후부터만 보겠다는 정책 유지
+    window_start_date = max(month_start, FIXED_START_DATE)
 
-    # FIXED_START_DATE 보다 작으면 FIXED_START_DATE로 보정 (옵션)
-    window_start_date = max(window_start_date, FIXED_START_DATE)
+    # 윈도우 끝은 '오늘'
+    window_end_date = today
 
     return window_start_date, window_end_date
 
@@ -542,9 +545,6 @@ def run_once():
     try:
         # 스키마 / 테이블 생성
         init_db(conn)
-
-        # 6개월 이전 DB 데이터 정리
-        cleanup_old_data(conn, window_start_date)
 
         total_scanned = 0
         total_new = 0
