@@ -63,11 +63,6 @@ def six_months_ago(d: date) -> date:
 def get_window_dates():
     """
     오늘 날짜 기준으로 '이번 달 1일 ~ 오늘' 범위를 반환.
-    예)
-      - today = 2025-12-04 → 2025-12-01 ~ 2025-12-04
-      - today = 2025-12-31 → 2025-12-01 ~ 2025-12-31
-      - today = 2026-01-01 → 2026-01-01 ~ 2026-01-01
-
     FIXED_START_DATE 이전은 무조건 제외.
     """
     today = date.today()
@@ -226,6 +221,27 @@ def is_valid_deep_fct_path(p: Path, window_start_str: str, window_end_str: str) 
     return True
 
 
+def extract_result_from_lines(lines):
+    """
+    파일 전체 라인에서 '테스트 결과 : NG/OK' 를 찾아 PASS/FAIL 리턴.
+    - 마지막에 나오는 결과 기준.
+    - NG → 'FAIL', OK → 'PASS'
+    - 못 찾으면 None
+    """
+    for line in reversed(lines):
+        m = re.search(
+            r"\[\d{2}:\d{2}:\d{2}\.\d{2}\]\s*테스트 결과\s*:\s*(NG|OK)",
+            line,
+        )
+        if m:
+            status = m.group(1).strip().upper()
+            if status == "NG":
+                return "FAIL"
+            elif status == "OK":
+                return "PASS"
+    return None
+
+
 def process_one_file(file_path_str: str):
     """
     멀티프로세스에서 사용할 워커 함수.
@@ -239,6 +255,7 @@ def process_one_file(file_path_str: str):
     - test_item
     - test_time
     - test_item_ct
+    - result   ← NEW (PASS/FAIL, 없으면 None)
     """
     file_path = Path(file_path_str)
     try:
@@ -246,6 +263,9 @@ def process_one_file(file_path_str: str):
 
         # 파일 내용 읽기 (인코딩 자동 처리)
         lines = read_lines_with_encodings(file_path)
+
+        # 파일 전체에서 테스트 결과(PASS/FAIL) 추출
+        result_status = extract_result_from_lines(lines)
 
         events = []  # (time_str, test_item, test_time)
 
@@ -291,6 +311,7 @@ def process_one_file(file_path_str: str):
                     "test_item": test_item,
                     "test_time": test_time,
                     "test_item_ct": ct_value,
+                    "result": result_status,
                 }
             )
 
@@ -326,7 +347,7 @@ def ensure_schema_and_tables(conn):
             ).format(sql.Identifier(SCHEMA_PROCESSING), sql.Identifier(TABLE_PROCESSING))
         )
 
-        # 결과 저장 테이블
+        # 결과 저장 테이블 (result 컬럼 포함)
         cur.execute(
             sql.SQL(
                 """
@@ -339,9 +360,18 @@ def ensure_schema_and_tables(conn):
                     test_item TEXT,
                     test_time VARCHAR(12),
                     test_item_ct DOUBLE PRECISION,
+                    result VARCHAR(10),
                     processed_time TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
                 )
                 """
+            ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
+        )
+
+        # 이미 존재하는 경우를 대비해 result 컬럼 보장
+        cur.execute(
+            sql.SQL(
+                "ALTER TABLE {}.{} "
+                "ADD COLUMN IF NOT EXISTS result VARCHAR(10)"
             ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
         )
 
@@ -426,7 +456,7 @@ def insert_results_and_history(conn, file_path, rows):
         return
 
     with conn.cursor() as cur:
-        # 결과 테이블에 다중 INSERT
+        # 결과 테이블에 다중 INSERT (result 포함)
         insert_query = sql.SQL(
             """
             INSERT INTO {}.{} (
@@ -436,11 +466,12 @@ def insert_results_and_history(conn, file_path, rows):
                 barcode_information,
                 test_item,
                 test_time,
-                test_item_ct
+                test_item_ct,
+                result
             )
             VALUES (%(file_path)s, %(yyyymmdd)s, %(end_time)s,
                     %(barcode_information)s, %(test_item)s,
-                    %(test_time)s, %(test_item_ct)s)
+                    %(test_time)s, %(test_item_ct)s, %(result)s)
             """
         ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
 
@@ -481,9 +512,6 @@ def run_once():
     # 0) DB 연결 및 스키마/테이블 준비
     conn = get_connection()
     ensure_schema_and_tables(conn)
-
-    # ✅ 자동 삭제는 부담될 수 있어서 주석 처리
-    # cleanup_old_data(conn, window_start_date)
 
     # 1) 전체 TXT 파일 스캔 (윈도우 + mtime 필터)
     all_found_txt_files = list(BASE_LOG_DIR.rglob("*.txt"))

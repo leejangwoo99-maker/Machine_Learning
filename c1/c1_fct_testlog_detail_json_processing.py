@@ -1,11 +1,11 @@
 import re
 import math
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 import time
 from multiprocessing import Pool, cpu_count, freeze_support
+import calendar
 
-import pandas as pd
 import psycopg2
 from psycopg2 import sql
 
@@ -13,18 +13,13 @@ from psycopg2 import sql
 # =========================
 # 기본 경로 설정
 # =========================
-# 예시: NAS 경로 (필요 시 주석 해제해서 사용)
-# BASE_LOG_DIR = Path(r"\\192.168.108.101\HistoryLog")
-
-# 기본: 현재 c1에서 사용하던 FCT 상위 경로 (필요시 RAW_LOG 등으로 변경)
-BASE_LOG_DIR = Path(r"C:\Users\user\Desktop\machinlog\FCT")  # 필요시 RAW_LOG 등으로 변경
-
+BASE_LOG_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
 
 # =========================
 # PostgreSQL 설정
 # =========================
 DB_CONFIG = {
-    "host": "localhost",
+    "host": "192.168.108.162",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -36,6 +31,54 @@ TABLE_PROCESSING = "fct_testlog_detail_jason_processing"
 
 SCHEMA_RESULT = "c1_fct_testlog_detail_result"
 TABLE_RESULT = "fct_testlog_detail_result"
+
+# 고정 최소 시작일 (이 날짜 이전 데이터는 무시)
+FIXED_START_DATE = date(2025, 10, 1)
+
+# 한 번에 INSERT할 최대 row 수 (향후 배치 확장용)
+BATCH_SIZE_ROWS = 50000
+
+# 실시간용: 최근 N초 이내 수정된 파일만 처리
+REALTIME_LOOKBACK_SECONDS = 120  # 예: 최근 2분
+
+
+# =========================
+# 날짜 윈도우 유틸
+# =========================
+def six_months_ago(d: date) -> date:
+    """
+    오늘 기준 6개월 전 날짜 계산 (현재는 사용하지 않지만 참고용으로 남겨둠).
+    """
+    year = d.year
+    month = d.month - 6
+    if month <= 0:
+        year -= 1
+        month += 12
+
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(d.day, last_day)
+    return date(year, month, day)
+
+
+def get_window_dates():
+    """
+    오늘 날짜 기준으로 '이번 달 1일 ~ 오늘' 범위를 반환.
+    예)
+      - today = 2025-12-04 → 2025-12-01 ~ 2025-12-04
+      - today = 2025-12-31 → 2025-12-01 ~ 2025-12-31
+      - today = 2026-01-01 → 2026-01-01 ~ 2026-01-01
+
+    FIXED_START_DATE 이전은 무조건 제외.
+    """
+    today = date.today()
+
+    # 이번 달 1일
+    month_start = today.replace(day=1)
+
+    # 고정 시작일 이후만
+    window_start_date = max(month_start, FIXED_START_DATE)
+    window_end_date = today
+    return window_start_date, window_end_date
 
 
 # =========================
@@ -148,10 +191,11 @@ def get_end_time_str(last_time_str: str) -> str:
     return t.strftime("%H:%M:%S")
 
 
-def is_valid_deep_fct_path(p: Path) -> bool:
+def is_valid_deep_fct_path(p: Path, window_start_str: str, window_end_str: str) -> bool:
     """
     BASE_LOG_DIR 기준 상대경로가
-    YYYY/MM/DD/어떤폴더/파일 구조인지 확인.
+    YYYY/MM/DD/어떤폴더/파일 구조인지 확인하고,
+    그 YYYYMMDD가 window_start_str ~ window_end_str 범위에 들어가는지 확인.
     """
     try:
         rel = p.relative_to(BASE_LOG_DIR)
@@ -171,6 +215,12 @@ def is_valid_deep_fct_path(p: Path) -> bool:
     if not (month.isdigit() and len(month) == 2):
         return False
     if not (day.isdigit() and len(day) == 2):
+        return False
+
+    yyyymmdd = f"{year}{month}{day}"
+
+    # 날짜 윈도우 범위 체크
+    if not (window_start_str <= yyyymmdd <= window_end_str):
         return False
 
     return True
@@ -298,16 +348,70 @@ def ensure_schema_and_tables(conn):
     conn.commit()
 
 
-def get_processed_file_paths(conn):
+def cleanup_old_data(conn, window_start_date: date):
     """
-    이미 처리된 file_path 목록을 DB에서 가져와 set으로 반환
+    기준 날짜 이전 데이터 삭제.
+
+    - 결과 테이블 : yyyymmdd < window_start_str 인 데이터 삭제
+    - 처리 이력   : processed_time < window_start_date 00:00:00 인 데이터 삭제
+
+    ※ 현재 run_once()에서는 자동 호출하지 않음.
+       필요 시 수동으로 돌리는 것을 권장.
     """
+    window_start_str = window_start_date.strftime("%Y%m%d")
+    cutoff_dt = datetime.combine(window_start_date, datetime.min.time())
+
+    with conn.cursor() as cur:
+        # 결과 테이블 삭제 (yyyymmdd 기준)
+        cur.execute(
+            sql.SQL(
+                """
+                DELETE FROM {}.{}
+                WHERE yyyymmdd IS NOT NULL
+                  AND yyyymmdd <> ''
+                  AND yyyymmdd < %s
+                """
+            ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT)),
+            (window_start_str,),
+        )
+        deleted_result = cur.rowcount
+
+        # 처리 이력 테이블 삭제 (processed_time 기준)
+        cur.execute(
+            sql.SQL(
+                """
+                DELETE FROM {}.{}
+                WHERE processed_time < %s
+                """
+            ).format(sql.Identifier(SCHEMA_PROCESSING), sql.Identifier(TABLE_PROCESSING)),
+            (cutoff_dt,),
+        )
+        deleted_hist = cur.rowcount
+
+    conn.commit()
+    print(
+        f"[정리] 기준 이전 데이터 삭제 완료 "
+        f"(result rows={deleted_result}, history rows={deleted_hist})"
+    )
+
+
+def get_processed_file_paths(conn, window_start_date: date):
+    """
+    이미 처리된 file_path 목록을 DB에서 가져와 set으로 반환.
+    - processed_time >= window_start_date 기준으로만 조회
+      (이번 달 윈도우 내 데이터만 중복 체크)
+    """
+    cutoff_dt = datetime.combine(window_start_date, datetime.min.time())
+
     with conn.cursor() as cur:
         cur.execute(
-            sql.SQL("SELECT file_path FROM {}.{}").format(
+            sql.SQL(
+                "SELECT file_path FROM {}.{} WHERE processed_time >= %s"
+            ).format(
                 sql.Identifier(SCHEMA_PROCESSING),
                 sql.Identifier(TABLE_PROCESSING),
-            )
+            ),
+            (cutoff_dt,),
         )
         rows = cur.fetchall()
     return {r[0] for r in rows}
@@ -361,37 +465,65 @@ def insert_results_and_history(conn, file_path, rows):
 # 메인 1회 수행 로직
 # =========================
 def run_once():
+    # 날짜 윈도우 계산 (이번 달 1일 ~ 오늘)
+    window_start_date, window_end_date = get_window_dates()
+    window_start_str = window_start_date.strftime("%Y%m%d")
+    window_end_str = window_end_date.strftime("%Y%m%d")
+
+    now_ts = time.time()
+    cutoff_ts = now_ts - REALTIME_LOOKBACK_SECONDS
+
+    print("\n================ run_once 시작 ================")
+    print(f"[윈도우] 유효 날짜 범위: {window_start_date} ~ {window_end_date}")
+    print(f"[실시간] 최근 {REALTIME_LOOKBACK_SECONDS}초 이내 수정된 파일만 처리 (cutoff_ts={cutoff_ts})")
+    print(f"[DEBUG] BASE_LOG_DIR: {BASE_LOG_DIR}")
+
     # 0) DB 연결 및 스키마/테이블 준비
     conn = get_connection()
     ensure_schema_and_tables(conn)
 
-    # 1) 전체 TXT 파일 스캔 (우선 전부 찾고, 나중에 YYYY/MM/DD/폴더/파일 구조만 필터링)
+    # ✅ 자동 삭제는 부담될 수 있어서 주석 처리
+    # cleanup_old_data(conn, window_start_date)
+
+    # 1) 전체 TXT 파일 스캔 (윈도우 + mtime 필터)
     all_found_txt_files = list(BASE_LOG_DIR.rglob("*.txt"))
 
-    # YYYY/MM/DD/무슨폴더/파일 구조만 남기기
-    all_txt_files = [p for p in all_found_txt_files if is_valid_deep_fct_path(p)]
+    all_txt_files = []
+    for p in all_found_txt_files:
+        if not is_valid_deep_fct_path(p, window_start_str, window_end_str):
+            continue
+        try:
+            if p.stat().st_mtime < cutoff_ts:
+                # 실시간 윈도우 밖이면 제외
+                continue
+        except FileNotFoundError:
+            continue
+        all_txt_files.append(p)
 
-    print(f"1) TXT 파일 스캔 완료 → 총 파일 수집: {len(all_txt_files)}개")
+    print(f"1) TXT 파일 스캔 완료 → 총 파일 수집(윈도우+mtime 내): {len(all_txt_files)}개")
 
-    # 2) DB 이력 로드 (이미 처리한 파일 제외)
-    processed_file_paths = get_processed_file_paths(conn)
-    print(f"2) DB에서 불러온 이전 처리 파일 수: {len(processed_file_paths)}개")
+    # 2) DB 이력 로드 (윈도우 내 already processed)
+    processed_file_paths = get_processed_file_paths(conn, window_start_date)
+    print(f"2) DB에서 불러온 이전 처리 파일 수(윈도우 내): {len(processed_file_paths)}개")
 
     target_files = [p for p in all_txt_files if str(p) not in processed_file_paths]
     total = len(target_files)
     print(f"3) 이번에 새로 처리할 대상 파일 수: {total}개")
 
-    all_rows_for_preview = []
-
     if total == 0:
         conn.close()
         print("   → 새로 처리할 파일이 없습니다.")
+        print("=============== run_once 종료 ===============\n")
         return
 
     print("4) TXT 파일 멀티프로세스 처리 시작...")
 
-    # 멀티프로세스 풀 구성
-    num_workers = max(1, cpu_count() - 1)
+    # 멀티프로세스 풀 구성 - 항상 2개 프로세스만 사용
+    num_workers = 2
+    print(f"   → 멀티프로세싱 워커 수: {num_workers}개")
+
+    start_ts = time.time()
+
     with Pool(processes=num_workers) as pool:
         for idx, (file_path_str, rows, err) in enumerate(
             pool.imap_unordered(process_one_file, [str(p) for p in target_files]), start=1
@@ -404,49 +536,17 @@ def run_once():
                 # 유효 로그 없으면 skip
                 continue
 
-            # DB에 INSERT + 이력 기록
+            # DB에 INSERT + 이력 기록 (파일 단위, 메모리 최소화)
             insert_results_and_history(conn, file_path_str, rows)
-
-            # 미리보기용으로 일부만 메모리에 저장
-            all_rows_for_preview.extend(rows)
 
             # 진행 상황 출력
             if (idx % 1000 == 0) or (idx == total):
                 print(f"   → 현재 {idx}/{total} 파일 처리 및 DB 저장 완료")
 
-    conn.close()
-    print("4) TXT 파일 처리 및 DB 저장 완료")
+    elapsed = time.time() - start_ts
+    print(f"   → 이번 run_once 처리 시간: {elapsed:.1f}초")
+    print("=============== run_once 종료 ===============\n")
 
-    # DataFrame 생성 (미리보기용, CSV/xlsx 파일 생성 없음)
-    if all_rows_for_preview:
-        df = pd.DataFrame(
-            all_rows_for_preview,
-            columns=[
-                "yyyymmdd",
-                "end_time",
-                "barcode_information",
-                "test_item",
-                "test_time",
-                "test_item_ct",
-                "file_path",
-            ],
-        )
-        print(f"\n5) 미리보기용 총 row 수: {len(df)}개")
-    else:
-        df = pd.DataFrame(
-            columns=[
-                "yyyymmdd",
-                "end_time",
-                "barcode_information",
-                "test_item",
-                "test_time",
-                "test_item_ct",
-                "file_path",
-            ]
-        )
-        print("\n5) 생성된 row 가 없습니다. (새로 처리된 파일이 없거나 유효 로그가 없음)")
-
-    return df
 
 # =========================
 # 엔트리 포인트
