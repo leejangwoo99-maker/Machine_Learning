@@ -255,7 +255,7 @@ def process_one_file(file_path_str: str):
     - test_item
     - test_time
     - test_item_ct
-    - result   ← NEW (PASS/FAIL, 없으면 None)
+    - result   ← PASS/FAIL (없으면 None)
     """
     file_path = Path(file_path_str)
     try:
@@ -375,6 +375,17 @@ def ensure_schema_and_tables(conn):
             ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
         )
 
+        # 🔹 중복 방지용 유니크 인덱스
+        #    (yyyymmdd, end_time, barcode_information, test_item) 조합이 유일하도록
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_fct_testlog_detail_result_uniq4
+                ON {}.{} (yyyymmdd, end_time, barcode_information, test_item)
+                """
+            ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
+        )
+
     conn.commit()
 
 
@@ -451,6 +462,9 @@ def insert_results_and_history(conn, file_path, rows):
     """
     한 파일에 대한 파싱 결과(rows)를 결과 테이블에 INSERT 하고,
     처리 이력 테이블에도 file_path를 기록.
+
+    🔹 (yyyymmdd, end_time, barcode_information, test_item) 조합이
+       이미 존재하면 해당 행은 INSERT 하지 않음.
     """
     if not rows:
         return
@@ -472,6 +486,7 @@ def insert_results_and_history(conn, file_path, rows):
             VALUES (%(file_path)s, %(yyyymmdd)s, %(end_time)s,
                     %(barcode_information)s, %(test_item)s,
                     %(test_time)s, %(test_item_ct)s, %(result)s)
+            ON CONFLICT (yyyymmdd, end_time, barcode_information, test_item) DO NOTHING
             """
         ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
 
