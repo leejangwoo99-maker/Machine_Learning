@@ -1,23 +1,16 @@
 import re
-import math
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
 import time
-from multiprocessing import Pool, cpu_count, freeze_support
-import calendar
+from multiprocessing import Pool, freeze_support
 
 import psycopg2
-from psycopg2 import sql
-
 
 # =========================
-# 기본 경로 설정
+# 기본 경로 / DB 설정
 # =========================
 BASE_LOG_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
 
-# =========================
-# PostgreSQL 설정
-# =========================
 DB_CONFIG = {
     "host": "192.168.108.162",
     "port": 5432,
@@ -26,91 +19,40 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
+# a. 비전 JSON 테이블 (station, result 매핑용)
+SCHEMA_VISION = "a2_fct_vision_testlog_json_processing"
+TABLE_VISION = "fct_vision_testlog_json_processing"
+
+# 처리 이력 테이블
 SCHEMA_PROCESSING = "c1_fct_testlog_detail_jason_processing"
 TABLE_PROCESSING = "fct_testlog_detail_jason_processing"
 
+# b. 결과 테이블
 SCHEMA_RESULT = "c1_fct_testlog_detail_result"
 TABLE_RESULT = "fct_testlog_detail_result"
 
-# 고정 최소 시작일 (이 날짜 이전 데이터는 무시)
-FIXED_START_DATE = date(2025, 10, 1)
-
-# 한 번에 INSERT할 최대 row 수 (향후 배치 확장용)
-BATCH_SIZE_ROWS = 50000
-
-# 실시간용: 최근 N초 이내 수정된 파일만 처리
-REALTIME_LOOKBACK_SECONDS = 120  # 예: 최근 2분
+NUM_WORKERS = 2
 
 
-# =========================
-# 날짜 윈도우 유틸
-# =========================
-def six_months_ago(d: date) -> date:
-    """
-    오늘 기준 6개월 전 날짜 계산 (현재는 사용하지 않지만 참고용으로 남겨둠).
-    """
-    year = d.year
-    month = d.month - 6
-    if month <= 0:
-        year -= 1
-        month += 12
-
-    last_day = calendar.monthrange(year, month)[1]
-    day = min(d.day, last_day)
-    return date(year, month, day)
-
-
-def get_window_dates():
-    """
-    오늘 날짜 기준으로 '이번 달 1일 ~ 오늘' 범위를 반환.
-    FIXED_START_DATE 이전은 무조건 제외.
-    """
-    today = date.today()
-
-    # 이번 달 1일
-    month_start = today.replace(day=1)
-
-    # 고정 시작일 이후만
-    window_start_date = max(month_start, FIXED_START_DATE)
-    window_end_date = today
-    return window_start_date, window_end_date
-
-
-# =========================
-# 유틸 함수들
-# =========================
+# =====================================================================
+# 1. 로그 파싱 유틸
+# =====================================================================
 def read_lines_with_encodings(file_path: Path):
-    """
-    여러 인코딩(cp949, utf-8, utf-8-sig)을 시도해서
-    글자가 깨지지 않도록 안전하게 읽기.
-    """
     for enc in ("cp949", "utf-8", "utf-8-sig"):
         try:
             with file_path.open("r", encoding=enc) as f:
                 return f.readlines()
         except UnicodeDecodeError:
             continue
-
-    # 그래도 안 되면 마지막에만 ignore 사용
     with file_path.open("r", encoding="utf-8", errors="ignore") as f:
         return f.readlines()
 
 
 def extract_yyyymmdd_from_name(name: str) -> str:
-    """
-    파일명(stem)에서 YYYYMMDD 추출.
-    우선 정규식으로 20xxxxxx (8자리 숫자) 패턴을 찾고,
-    없으면 사용자가 말한 규칙:
-      - 첫 번째 '-' 와 그 뒤 첫 번째 '_' 사이
-    를 시도한다.
-    """
-    # 1) 정규식으로 8자리 날짜(20xxxxxx) 찾기
     candidates = re.findall(r"(20\d{6})", name)
     if candidates:
-        # 마지막 쪽이 진짜 날짜일 가능성이 큼
         return candidates[-1]
 
-    # 2) fallback: 첫 번째 '-' 와 그 뒤 첫 번째 '_' 사이
     dash_pos = name.find("-")
     if dash_pos != -1:
         underscore_pos = name.find("_", dash_pos + 1)
@@ -118,93 +60,56 @@ def extract_yyyymmdd_from_name(name: str) -> str:
             candidate = name[dash_pos + 1:underscore_pos]
             if candidate.isdigit() and len(candidate) == 8:
                 return candidate
-
-    # 3) 그래도 못 찾으면 빈 문자열
     return ""
 
 
 def parse_filename(filepath: Path):
-    """
-    파일명에서 Barcode information, YYYYMMDD 추출
-
-    규칙(복합):
-    1) 확장자(.txt) 제거
-    2) 첫 번째 '_' 앞까지 → Barcode information
-    3) YYYYMMDD:
-       - 우선 정규식(20xxxxxx 8자리)으로 찾기
-       - 없으면 '첫 번째 - 와 두 번째 _ 사이' 규칙 시도
-    """
-    name = filepath.stem  # 확장자 제거
-
-    # 2) Barcode information
+    name = filepath.stem
     if "_" in name:
         barcode = name.split("_", 1)[0]
     else:
-        barcode = name  # '_'가 없으면 전체를 바코드로
-
-    # 3) YYYYMMDD
+        barcode = name
     yyyymmdd = extract_yyyymmdd_from_name(name)
-
     return barcode, yyyymmdd
 
 
 def parse_time_line(line: str):
-    """
-    로그 한 줄에서 [hh:mm:ss.ss] 와 Test_item, Test_Time 추출
-    - [hh:mm:ss.ss] 가 없으면 (None, None, None) 반환
-    - Test_item 내부의 2개 이상 공백은 1개로 축소
-    - Test_Time 은 time_str 그대로 (hh:mm:ss.ss)
-    """
     m = re.search(r"\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s+(.*)", line)
     if not m:
         return None, None, None
-
-    time_str = m.group(1)  # "hh:mm:ss.ss"
-    test_item_raw = m.group(2)
-
-    # 내용안에 공백 1개까지 허용, 2개 이상의 공백은 1개로 축소
-    test_item = re.sub(r"\s{2,}", " ", test_item_raw).strip()
-
-    test_time = time_str  # 그대로 저장
-
-    return time_str, test_item, test_time
+    time_str = m.group(1)
+    raw = m.group(2)
+    test_item = re.sub(r"\s{2,}", " ", raw).strip()
+    return time_str, test_item, time_str
 
 
 def time_to_seconds(time_str: str) -> float:
-    """
-    "hh:mm:ss.ss" → 초(float)로 변환
-    """
     t = datetime.strptime(time_str, "%H:%M:%S.%f")
     return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1_000_000
 
 
 def get_end_time_str(last_time_str: str) -> str:
-    """
-    마지막 [hh:mm:ss.ss] 에서 hh:mm:ss 만 추출해 문자열로 반환
-    """
     t = datetime.strptime(last_time_str, "%H:%M:%S.%f")
     return t.strftime("%H:%M:%S")
 
 
-def is_valid_deep_fct_path(p: Path, window_start_str: str, window_end_str: str) -> bool:
-    """
-    BASE_LOG_DIR 기준 상대경로가
-    YYYY/MM/DD/어떤폴더/파일 구조인지 확인하고,
-    그 YYYYMMDD가 window_start_str ~ window_end_str 범위에 들어가는지 확인.
-    """
+def is_valid_fct_path(p: Path) -> bool:
+    # """
+    # BASE_LOG_DIR 기준으로
+    #   FCT\YYYY\MM\DD\...\*.txt 구조만 허용.
+    # 예) C:\...\FCT\2025\10\01\FCT1\xxxx.txt  → OK
+    #     C:\...\FCT\2025\10\20251022_FCT4... → 제외
+    # """
     try:
         rel = p.relative_to(BASE_LOG_DIR)
     except ValueError:
         return False
 
-    parts = rel.parts  # ('2025', '10', '01', '...', 'file.txt') 등
-
-    # 최소 구조: YYYY / MM / DD / (폴더) / 파일 → 4개 이상
+    parts = rel.parts  # ('2025','10','01','FCT1','file.txt') 등
     if len(parts) < 4:
         return False
 
     year, month, day = parts[0], parts[1], parts[2]
-
     if not (year.isdigit() and len(year) == 4):
         return False
     if not (month.isdigit() and len(month) == 2):
@@ -212,106 +117,62 @@ def is_valid_deep_fct_path(p: Path, window_start_str: str, window_end_str: str) 
     if not (day.isdigit() and len(day) == 2):
         return False
 
-    yyyymmdd = f"{year}{month}{day}"
-
-    # 날짜 윈도우 범위 체크
-    if not (window_start_str <= yyyymmdd <= window_end_str):
-        return False
-
     return True
-
-
-def extract_result_from_lines(lines):
-    """
-    파일 전체 라인에서 '테스트 결과 : NG/OK' 를 찾아 PASS/FAIL 리턴.
-    - 마지막에 나오는 결과 기준.
-    - NG → 'FAIL', OK → 'PASS'
-    - 못 찾으면 None
-    """
-    for line in reversed(lines):
-        m = re.search(
-            r"\[\d{2}:\d{2}:\d{2}\.\d{2}\]\s*테스트 결과\s*:\s*(NG|OK)",
-            line,
-        )
-        if m:
-            status = m.group(1).strip().upper()
-            if status == "NG":
-                return "FAIL"
-            elif status == "OK":
-                return "PASS"
-    return None
 
 
 def process_one_file(file_path_str: str):
     """
-    멀티프로세스에서 사용할 워커 함수.
-    하나의 txt 파일을 파싱해서 (file_path, rows, error) 반환.
+    한 파일 파싱 → (file_path, rows, error)
 
-    rows 의 각 원소는 아래 컬럼을 가짐:
-    - file_path
-    - yyyymmdd
-    - end_time
-    - barcode_information
-    - test_item
-    - test_time
-    - test_item_ct
-    - result   ← PASS/FAIL (없으면 None)
+    rows 컬럼:
+      - file_path
+      - end_day (YYYYMMDD)
+      - end_time (HH:MM:SS)
+      - barcode_information
+      - test_item
+      - test_time
+      - test_item_ct
     """
     file_path = Path(file_path_str)
     try:
         barcode, yyyymmdd = parse_filename(file_path)
-
-        # 파일 내용 읽기 (인코딩 자동 처리)
         lines = read_lines_with_encodings(file_path)
 
-        # 파일 전체에서 테스트 결과(PASS/FAIL) 추출
-        result_status = extract_result_from_lines(lines)
-
-        events = []  # (time_str, test_item, test_time)
-
+        events = []
         for line in lines:
             time_str, test_item, test_time = parse_time_line(line)
             if time_str is None:
-                # [hh:mm:ss.ss] 가 없는 행은 완전히 무시
                 continue
             events.append((time_str, test_item, test_time))
 
-        # 유효한 타임스탬프가 하나도 없으면 이 파일은 스킵
         if not events:
             return file_path_str, [], None
 
-        # End time: 마지막 이벤트의 시간에서 hh:mm:ss 추출
         last_time_str = events[-1][0]
         end_time = get_end_time_str(last_time_str)
 
-        # Test_item_CT 계산
         rows = []
         prev_sec = None
-
         for time_str, test_item, test_time in events:
             cur_sec = time_to_seconds(time_str)
-
             if prev_sec is None:
-                ct_value = None  # 첫 번째 Test_item은 NULL
+                ct_value = None
             else:
                 diff = cur_sec - prev_sec
-                # 만약 시간 차가 음수면(자정 넘어간 경우 등) 24시간 더해줌
                 if diff < 0:
                     diff += 24 * 3600
                 ct_value = round(diff, 2)
-
             prev_sec = cur_sec
 
             rows.append(
                 {
                     "file_path": file_path_str,
-                    "yyyymmdd": yyyymmdd,
+                    "end_day": yyyymmdd,
                     "end_time": end_time,
                     "barcode_information": barcode,
                     "test_item": test_item,
                     "test_time": test_time,
                     "test_item_ct": ct_value,
-                    "result": result_status,
                 }
             )
 
@@ -321,237 +182,434 @@ def process_one_file(file_path_str: str):
         return file_path_str, [], str(e)
 
 
-# =========================
-# PostgreSQL 관련 함수
-# =========================
+# =====================================================================
+# 2. PostgreSQL 유틸
+# =====================================================================
 def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 
 def ensure_schema_and_tables(conn):
+    """
+    - 처리 이력 스키마/테이블 생성
+    - 결과 스키마/테이블 생성 + 컬럼 구조 보정
+    """
     with conn.cursor() as cur:
-        # 스키마 생성
-        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(SCHEMA_PROCESSING)))
-        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(SCHEMA_RESULT)))
+        # 스키마
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_PROCESSING};")
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_RESULT};")
 
         # 처리 이력 테이블
         cur.execute(
-            sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {}.{} (
-                    id BIGSERIAL PRIMARY KEY,
-                    file_path TEXT UNIQUE,
-                    processed_time TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+            f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA_PROCESSING}.{TABLE_PROCESSING} (
+                id BIGSERIAL PRIMARY KEY,
+                file_path TEXT UNIQUE,
+                processed_time TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+            );
+            """
+        )
+
+        # 결과 테이블 기본 골격
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA_RESULT}.{TABLE_RESULT} (
+                id BIGSERIAL PRIMARY KEY
+            );
+            """
+        )
+
+        # 1) yyyymmdd → end_day 자동 변경 (있을 경우만)
+        cur.execute(
+            f"""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = '{SCHEMA_RESULT}'
+                      AND table_name   = '{TABLE_RESULT}'
+                      AND column_name  = 'yyyymmdd'
                 )
-                """
-            ).format(sql.Identifier(SCHEMA_PROCESSING), sql.Identifier(TABLE_PROCESSING))
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = '{SCHEMA_RESULT}'
+                      AND table_name   = '{TABLE_RESULT}'
+                      AND column_name  = 'end_day'
+                ) THEN
+                    EXECUTE 'ALTER TABLE {SCHEMA_RESULT}.{TABLE_RESULT} RENAME COLUMN yyyymmdd TO end_day';
+                END IF;
+            END
+            $$;
+            """
         )
 
-        # 결과 저장 테이블 (result 컬럼 포함)
+        # 2) 필요한 컬럼들 추가
         cur.execute(
-            sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {}.{} (
-                    id BIGSERIAL PRIMARY KEY,
-                    file_path TEXT NOT NULL,
-                    yyyymmdd VARCHAR(8),
-                    end_time VARCHAR(8),
-                    barcode_information TEXT,
-                    test_item TEXT,
-                    test_time VARCHAR(12),
-                    test_item_ct DOUBLE PRECISION,
-                    result VARCHAR(10),
-                    processed_time TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
-                )
-                """
-            ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
-        )
-
-        # 이미 존재하는 경우를 대비해 result 컬럼 보장
-        cur.execute(
-            sql.SQL(
-                "ALTER TABLE {}.{} "
-                "ADD COLUMN IF NOT EXISTS result VARCHAR(10)"
-            ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
-        )
-
-        # 🔹 중복 방지용 유니크 인덱스
-        #    (yyyymmdd, end_time, barcode_information, test_item) 조합이 유일하도록
-        cur.execute(
-            sql.SQL(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_fct_testlog_detail_result_uniq4
-                ON {}.{} (yyyymmdd, end_time, barcode_information, test_item)
-                """
-            ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
+            f"""
+            ALTER TABLE {SCHEMA_RESULT}.{TABLE_RESULT}
+                ADD COLUMN IF NOT EXISTS file_path TEXT,
+                ADD COLUMN IF NOT EXISTS end_day VARCHAR(8),
+                ADD COLUMN IF NOT EXISTS end_time VARCHAR(8),
+                ADD COLUMN IF NOT EXISTS barcode_information TEXT,
+                ADD COLUMN IF NOT EXISTS station TEXT,
+                ADD COLUMN IF NOT EXISTS remark TEXT,
+                ADD COLUMN IF NOT EXISTS result TEXT,
+                ADD COLUMN IF NOT EXISTS test_item TEXT,
+                ADD COLUMN IF NOT EXISTS test_time VARCHAR(12),
+                ADD COLUMN IF NOT EXISTS test_item_ct DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS "group" BIGINT,
+                ADD COLUMN IF NOT EXISTS problem1 TEXT,
+                ADD COLUMN IF NOT EXISTS problem2 TEXT,
+                ADD COLUMN IF NOT EXISTS problem3 TEXT,
+                ADD COLUMN IF NOT EXISTS fail_test_item TEXT,
+                ADD COLUMN IF NOT EXISTS processed_time TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();
+            """
         )
 
     conn.commit()
 
 
-def cleanup_old_data(conn, window_start_date: date):
-    """
-    기준 날짜 이전 데이터 삭제.
-
-    - 결과 테이블 : yyyymmdd < window_start_str 인 데이터 삭제
-    - 처리 이력   : processed_time < window_start_date 00:00:00 인 데이터 삭제
-
-    ※ 현재 run_once()에서는 자동 호출하지 않음.
-       필요 시 수동으로 돌리는 것을 권장.
-    """
-    window_start_str = window_start_date.strftime("%Y%m%d")
-    cutoff_dt = datetime.combine(window_start_date, datetime.min.time())
-
-    with conn.cursor() as cur:
-        # 결과 테이블 삭제 (yyyymmdd 기준)
-        cur.execute(
-            sql.SQL(
-                """
-                DELETE FROM {}.{}
-                WHERE yyyymmdd IS NOT NULL
-                  AND yyyymmdd <> ''
-                  AND yyyymmdd < %s
-                """
-            ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT)),
-            (window_start_str,),
-        )
-        deleted_result = cur.rowcount
-
-        # 처리 이력 테이블 삭제 (processed_time 기준)
-        cur.execute(
-            sql.SQL(
-                """
-                DELETE FROM {}.{}
-                WHERE processed_time < %s
-                """
-            ).format(sql.Identifier(SCHEMA_PROCESSING), sql.Identifier(TABLE_PROCESSING)),
-            (cutoff_dt,),
-        )
-        deleted_hist = cur.rowcount
-
-    conn.commit()
-    print(
-        f"[정리] 기준 이전 데이터 삭제 완료 "
-        f"(result rows={deleted_result}, history rows={deleted_hist})"
-    )
-
-
-def get_processed_file_paths(conn, window_start_date: date):
-    """
-    이미 처리된 file_path 목록을 DB에서 가져와 set으로 반환.
-    - processed_time >= window_start_date 기준으로만 조회
-      (이번 달 윈도우 내 데이터만 중복 체크)
-    """
-    cutoff_dt = datetime.combine(window_start_date, datetime.min.time())
-
+def get_processed_file_paths(conn):
     with conn.cursor() as cur:
         cur.execute(
-            sql.SQL(
-                "SELECT file_path FROM {}.{} WHERE processed_time >= %s"
-            ).format(
-                sql.Identifier(SCHEMA_PROCESSING),
-                sql.Identifier(TABLE_PROCESSING),
-            ),
-            (cutoff_dt,),
+            f"SELECT file_path FROM {SCHEMA_PROCESSING}.{TABLE_PROCESSING};"
         )
         rows = cur.fetchall()
     return {r[0] for r in rows}
 
 
 def insert_results_and_history(conn, file_path, rows):
-    """
-    한 파일에 대한 파싱 결과(rows)를 결과 테이블에 INSERT 하고,
-    처리 이력 테이블에도 file_path를 기록.
-
-    🔹 (yyyymmdd, end_time, barcode_information, test_item) 조합이
-       이미 존재하면 해당 행은 INSERT 하지 않음.
-    """
     if not rows:
         return
 
     with conn.cursor() as cur:
-        # 결과 테이블에 다중 INSERT (result 포함)
-        insert_query = sql.SQL(
-            """
-            INSERT INTO {}.{} (
+        insert_sql = f"""
+            INSERT INTO {SCHEMA_RESULT}.{TABLE_RESULT} (
                 file_path,
-                yyyymmdd,
+                end_day,
                 end_time,
                 barcode_information,
                 test_item,
                 test_time,
-                test_item_ct,
-                result
+                test_item_ct
             )
-            VALUES (%(file_path)s, %(yyyymmdd)s, %(end_time)s,
+            VALUES (%(file_path)s, %(end_day)s, %(end_time)s,
                     %(barcode_information)s, %(test_item)s,
-                    %(test_time)s, %(test_item_ct)s, %(result)s)
-            ON CONFLICT (yyyymmdd, end_time, barcode_information, test_item) DO NOTHING
-            """
-        ).format(sql.Identifier(SCHEMA_RESULT), sql.Identifier(TABLE_RESULT))
+                    %(test_time)s, %(test_item_ct)s);
+        """
+        cur.executemany(insert_sql, rows)
 
-        cur.executemany(insert_query, rows)
-
-        # 처리 이력 테이블에 file_path 기록 (중복이면 무시)
         cur.execute(
-            sql.SQL(
-                """
-                INSERT INTO {}.{} (file_path, processed_time)
-                VALUES (%s, NOW())
-                ON CONFLICT (file_path) DO NOTHING
-                """
-            ).format(sql.Identifier(SCHEMA_PROCESSING), sql.Identifier(TABLE_PROCESSING)),
+            f"""
+            INSERT INTO {SCHEMA_PROCESSING}.{TABLE_PROCESSING} (file_path, processed_time)
+            VALUES (%s, NOW())
+            ON CONFLICT (file_path) DO NOTHING;
+            """,
             (file_path,),
         )
 
     conn.commit()
 
 
-# =========================
-# 메인 1회 수행 로직
-# =========================
+# =====================================================================
+# 3. 후처리 (station/result/remark/group/problem 매핑)
+# =====================================================================
+def postprocess_result_table(conn):
+    with conn.cursor() as cur:
+        # 1) (삭제) end_day, end_time, barcode_information, test_item 기준 중복 삭제
+        #    → 파일별로 file_path 유니크하게 관리하고 있으므로 여기서는 중복 삭제를 하지 않는다.
+        # print("[POST] 중복 행 삭제 스킵")
+
+        # 2) Vision JSON에서 station, result 매핑
+        cur.execute(
+            f"""
+            UPDATE {SCHEMA_RESULT}.{TABLE_RESULT} b
+            SET station = a.station,
+                result  = a.result
+            FROM {SCHEMA_VISION}.{TABLE_VISION} a
+            WHERE a.barcode_information = b.barcode_information
+              AND b.station IS NULL;
+            """
+        )
+        print("[POST] station / result 매핑 완료")
+
+        # 3) remark = PD / Non-PD
+        cur.execute(
+            f"""
+            UPDATE {SCHEMA_RESULT}.{TABLE_RESULT}
+            SET remark =
+                CASE
+                    WHEN substring(barcode_information FROM 18 FOR 1) IN ('J','S')
+                        THEN 'PD'
+                    ELSE 'Non-PD'
+                END;
+            """
+        )
+        print("[POST] remark 채우기 완료")
+
+        # 4) group 번호 부여
+        cur.execute(
+            f"""
+            WITH group_map AS (
+                SELECT
+                    id,
+                    DENSE_RANK() OVER (
+                        ORDER BY end_day, end_time, barcode_information
+                    ) AS grp
+                FROM {SCHEMA_RESULT}.{TABLE_RESULT}
+            )
+            UPDATE {SCHEMA_RESULT}.{TABLE_RESULT} t
+            SET "group" = g.grp
+            FROM group_map g
+            WHERE t.id = g.id;
+            """
+        )
+        print("[POST] group 번호 부여 완료")
+
+        # 5) problem1/2/3, fail_test_item 전체 초기화
+        cur.execute(
+            f"""
+            UPDATE {SCHEMA_RESULT}.{TABLE_RESULT}
+            SET problem1 = NULL,
+                problem2 = NULL,
+                problem3 = NULL,
+                fail_test_item = NULL;
+            """
+        )
+        print("[POST] problem1/2/3, fail_test_item 초기화 완료")
+
+        # 6) remark = 'PD' 인 경우 매핑
+        cur.execute(
+            f"""
+            WITH candidates AS (
+                SELECT
+                    id,
+                    "group",
+                    ROW_NUMBER() OVER (
+                        PARTITION BY "group"
+                        ORDER BY test_time, id
+                    ) AS seq
+                FROM {SCHEMA_RESULT}.{TABLE_RESULT}
+                WHERE remark = 'PD'
+                  AND test_item IN ('테스트 결과 : OK', '테스트 결과 : NG')
+            ),
+            mapping AS (
+                SELECT * FROM (VALUES
+                    (1 , 'dmm'       , NULL     , '1.00_dmm_c_rng_set'),
+                    (2 , 'relay_board', NULL    , '1.00_d_sig_val_090_set'),
+                    (3 , 'load_c'    , NULL     , '1.00_load_c_cc_rng_set'),
+                    (4 , 'relay_board', NULL    , '1.00_d_sig_val_000_set'),
+                    (5 , 'dmm'       , NULL     , '1.00_dmm_dc_v_set'),
+                    (6 , 'dmm'       , NULL     , '1.00_dmm_0.6ac_set'),
+                    (7 , 'ps'        , NULL     , '1.00_ps_14.7v_3.0c_set'),
+                    (8 , 'dmm'       , NULL     , '1.00_dmm_dc_c_set'),
+                    (9 , 'ps'        , NULL     , '1.00_ps_14.7v_set'),
+                    (10, 'dmm'       , NULL     , '1.00_dmm_0.6ac_set'),
+                    (11, 'power'     , 'ps'     , '1.01_input_14.7v'),
+                    (12, 'usb_c'     , 'pm'     , '1.02_usb_c_pm1'),
+                    (13, 'usb_c'     , 'pm'     , '1.03_usb_c_pm2'),
+                    (14, 'usb_c'     , 'pm'     , '1.04_usb_c_pm3'),
+                    (15, 'usb_c'     , 'pm'     , '1.05_usb_c_pm4'),
+                    (16, 'usb_a'     , 'pm'     , '1.06_usb_a_pm1'),
+                    (17, 'usb_a'     , 'pm'     , '1.07_usb_a_pm2'),
+                    (18, 'usb_a'     , 'pm'     , '1.08_usb_a_pm3'),
+                    (19, 'usb_a'     , 'pm'     , '1.09_usb_a_pm4'),
+                    (20, 'mini_b'    , 'linux'  , '1.10_fw_ver_check'),
+                    (21, 'mini_b'    , 'linux'  , '1.11_chip_ver_check'),
+                    (22, 'mini_b'    , 'usb_c'  , '1.12_usb_c_carplay'),
+                    (23, 'mini_b'    , 'usb_a'  , '1.13_usb_a_carplay'),
+                    (24, 'mini_b'    , 'pd_board', '1.14_pd_count'),
+                    (25, 'dmm'       , NULL     , '1.14_1_dmm_c_rng_set'),
+                    (26, 'dmm'       , NULL     , '1.14_2_load_a_cc_set'),
+                    (27, 'dmm'       , NULL     , '1.14_3_load_a_rng_set'),
+                    (28, 'load_c'    , NULL     , '1.14_4_load_c_cc_set'),
+                    (29, 'load_c'    , NULL     , '1.14_5_load_c_rng_set'),
+                    (30, 'dmm'       , NULL     , '1.14_6_dmm_regi_set'),
+                    (31, 'dmm'       , NULL     , '1.14_7_dmm_regi_0.6ac_set'),
+                    (32, 'relay_board', NULL    , '1.14_8_d_sig_val_000_set'),
+                    (33, 'power'     , 'dmm'    , '1.15_pin12_short_check'),
+                    (34, 'power'     , 'dmm'    , '1.16_pin23_short_check'),
+                    (35, 'power'     , 'dmm'    , '1.17_pin34_short_check'),
+                    (36, 'dmm'       , NULL     , '1.17_1_dmm_dc_v_set'),
+                    (37, 'dmm'       , NULL     , '1.17_2_dmm_0.6ac_set'),
+                    (38, 'dmm'       , NULL     , '1.17_3_dmm_c_set'),
+                    (39, 'load_a'    , NULL     , '1.17_4_load_a_sensing_on'),
+                    (40, 'load_c'    , NULL     , '1.17_5_load_c_sensing_on'),
+                    (41, 'ps'        , NULL     , '1.17_6_ps_18v_set'),
+                    (42, 'ps'        , NULL     , '1.17_7_ps_18v_on'),
+                    (43, 'dmm'       , NULL     , '1.17_8_dmm_0.6ac_set'),
+                    (44, 'power'     , 'ps'     , '1.18_input_18v'),
+                    (45, 'power'     , 'dmm'    , '1.19_idle_check'),
+                    (46, 'usb_c'     , 'load_c' , '1.20_noload_usb_c'),
+                    (47, 'usb_c'     , 'load_a' , '1.21_noload_usb_a'),
+                    (48, 'dmm'       , NULL     , '1.21_1_dmm_3c_rng_set'),
+                    (49, 'load_a'    , NULL     , '1.21_2_load_a_5c_set'),
+                    (50, 'load_a'    , NULL     , '1.21_3_load_a_on'),
+                    (51, 'dmm'       , NULL     , '1.22_usb_a_curr_check'),
+                    (52, 'dmm'       , NULL     , '1.23_usb_a_vol_check'),
+                    (53, 'usb_c'     , 'load_c' , '1.24_usb_c_v_check'),
+                    (54, 'load_a'    , NULL     , '1.24_1_load_a_off'),
+                    (55, 'load_c'    , NULL     , '1.24_2_load_c_5c_set'),
+                    (56, 'load_c'    , NULL     , '1.24_3_load_c_on'),
+                    (57, 'dmm'       , NULL     , '1.25_usb_c_curr_check'),
+                    (58, 'dmm'       , NULL     , '1.26_usb_c_vol_check'),
+                    (59, 'usb_a'     , 'dmm'    , '1.27_usb_a_vol_check'),
+                    (60, 'load_c'    , NULL     , '1.27_1_load_c_off'),
+                    (61, 'LOAD_A'    , NULL     , '1.27_2_load_a_2.4c_set'),
+                    (62, 'load_c'    , NULL     , '1.27_3_load_c_3c_set'),
+                    (63, 'load_a'    , NULL     , '1.27_4_load_a_on'),
+                    (64, 'load_c'    , NULL     , '1.27_5_load_c_on'),
+                    (65, 'usb_c'     , 'dmm'    , '1.28_usb_c_3c_check'),
+                    (66, 'usb_c'     , 'dmm'    , '1.29_usb_c_5v_check'),
+                    (67, 'usb_a'     , 'dmm'    , '1.30_usb_a_2.4a_check'),
+                    (68, 'usb_a'     , 'dmm'    , '1.31_usb_a_5v_check'),
+                    (69, 'load_c'    , NULL     , '1.31_1_load_c_1.3c_set'),
+                    (70, 'usb_c'     , 'pd_board', '1.32_pdo4_set'),
+                    (71, 'usb_c'     , 'dmm'    , '1.33_usb_c_1.35c_check'),
+                    (72, 'usb_c'     , 'dmm'    , '1.34_usb_c_vol_check'),
+                    (73, 'usb_c'     , 'pd_board', '1.35_cc_check'),
+                    (74, 'load_c'    , NULL     , '1.35_1_load_c_off'),
+                    (75, 'dmm'       , NULL     , '1.35_2_dmm_0.6ac_set'),
+                    (76, 'dmm'       , NULL     , '1.35_3_dmm_c_rng_set'),
+                    (77, 'product'   , 'dmm'    , '1.36_dark_curr_check')
+                ) AS m(seq, problem1, problem2, fail_test_item)
+            )
+            UPDATE {SCHEMA_RESULT}.{TABLE_RESULT} t
+            SET problem1       = m.problem1,
+                problem2       = m.problem2,
+                fail_test_item = m.fail_test_item
+            FROM candidates c
+            JOIN mapping   m ON c.seq = m.seq
+            WHERE t.id = c.id;
+            """
+        )
+        print("[POST] PD 매핑 완료")
+
+        # 7) remark = 'Non-PD' 인 경우 매핑
+        cur.execute(
+            f"""
+            WITH candidates AS (
+                SELECT
+                    id,
+                    "group",
+                    ROW_NUMBER() OVER (
+                        PARTITION BY "group"
+                        ORDER BY test_time, id
+                    ) AS seq
+                FROM {SCHEMA_RESULT}.{TABLE_RESULT}
+                WHERE remark = 'Non-PD'
+                  AND test_item IN ('테스트 결과 : OK', '테스트 결과 : NG')
+            ),
+            mapping AS (
+                SELECT * FROM (VALUES
+                    (1 , 'relay_board', NULL    , '1.00_d_sig_val_090_set'),
+                    (2 , 'load_a'    , NULL     , '1.00_load_a_cc_set'),
+                    (3 , 'dmm'       , NULL     , '1.00_load_a_rng_set'),
+                    (4 , 'load_c'    , NULL     , '1.00_load_c_cc_set'),
+                    (5 , 'dmm'       , NULL     , '1.00_load_c_rng_set'),
+                    (6 , 'dmm'       , NULL     , '1.00_dmm_regi_set'),
+                    (7 , 'dmm'       , NULL     , '1.00_dmm_regi_ac_set'),
+                    (8 , 'mini_b'    , 'dmm'    , '1.00_mini_b_short_check'),
+                    (9 , 'usb_a'     , 'dmm'    , '1.01_usb_a_short_check'),
+                    (10, 'usb_c'     , 'dmm'    , '1.02_usb_c_short_check'),
+                    (11, 'relay_board', NULL    , '1.02_1_d_sig_val_000_set'),
+                    (12, 'dmm'       , NULL     , '1.02_2_dmm_regi_set'),
+                    (13, 'dmm'       , NULL     , '1.02_2_dmm_regi_ac_set'),
+                    (14, 'power'     , 'dmm'    , '1.03_pin12_short_check'),
+                    (15, 'power'     , 'dmm'    , '1.04_pin23_short_check'),
+                    (16, 'power'     , 'dmm'    , '1.05_pin34_short_check'),
+                    (17, 'dmm'       , NULL     , '1.05_1_dmm_dc_v_set'),
+                    (18, 'dmm'       , NULL     , '1.05_2_dmm_0.6ac_set'),
+                    (19, 'dmm'       , NULL     , '1.05_3_dmm_c_set'),
+                    (20, 'load_a'    , NULL     , '1.05_4_load_a_sensing_on'),
+                    (21, 'load_c'    , NULL     , '1.05_5_load_c_sensing_on'),
+                    (22, 'ps'        , NULL     , '1.05_6_ps_16.5v_3.0c_set'),
+                    (23, 'ps'        , NULL     , '1.05_7_ps_on'),
+                    (24, 'dmm'       , NULL     , '1.05_8_dmm_0.6ac_set'),
+                    (25, 'power'     , 'ps'     , '1.06_input_16.5v'),
+                    (26, 'power'     , 'dmm'    , '1.07_idle_check'),
+                    (27, 'mini_b B'  , 'linux'  , '1.08_fw_ver_check'),
+                    (28, 'mini_b B'  , 'linux'  , '1.09_chip_ver_check'),
+                    (29, 'dmm'       , NULL     , '1.09_1__dmm_3c_rng_set'),
+                    (30, 'load_a'    , NULL     , '1.09_2_load_a_5.5c_set'),
+                    (31, 'load_a'    , NULL     , '1.09_3_load_a_on'),
+                    (32, 'dmm'       , NULL     , '1.10_usb_a_vol_check'),
+                    (33, 'dmm'       , NULL     , '1.11_usb_a_curr_check'),
+                    (34, 'usb_c'     , 'dmm'    , '1.12_usb_c_vol_check'),
+                    (35, 'load_a'    , NULL     , '1.12_1_load_a_off'),
+                    (36, 'load_a'    , NULL     , '1.12_2_load_c_5.5c_set'),
+                    (37, 'load_c'    , NULL     , '1.12_3_load_c_on'),
+                    (38, 'dmm'       , NULL     , '1.13_usb_c_vol_check'),
+                    (39, 'dmm'       , NULL     , '1.14_usb_c_curr_check'),
+                    (40, 'usb_a'     , 'dmm'    , '1.15_usb_a_vol_check'),
+                    (41, 'load_c'    , NULL     , '1.15_1_load_c_off'),
+                    (42, 'ps'        , NULL     , '1.15_2_dut_reset'),
+                    (43, 'usb_c'     , 'pd_board', '1.16_cc1_check'),
+                    (44, 'usb_c'     , 'pd_board', '1.17_cc2_check'),
+                    (45, 'load_a'    , NULL     , '1.17_1_load_a_2.4c_set'),
+                    (46, 'load_c'    , NULL     , '1.17_2_load_c_3c_set'),
+                    (47, 'load_a'    , NULL     , '1.17_3_load_a_on'),
+                    (48, 'load_c'    , NULL     , '1.17_4_load_c_on'),
+                    (49, 'usb_a'     , 'dmm'    , '1.18_usb_a_vol_check'),
+                    (50, 'usb_a'     , 'dmm'    , '1.19_load_a_check'),
+                    (51, 'usb_c'     , 'dmm'    , '1.20_usb_c_vol_check'),
+                    (52, 'usb_c'     , 'dmm'    , '1.21_load_c_check'),
+                    (53, 'load_a'    , NULL     , '1.21_1_load_a_off'),
+                    (54, 'load_c'    , NULL     , '1.21_2_load_c_off'),
+                    (55, 'usb_c'     , 'linux'  , '1.22_usb_c_carplay'),
+                    (56, 'usb_a'     , 'linux'  , '1.23_usb_a_carplay'),
+                    (57, 'usb_c'     , 'pm'     , '1.24_usb_c_pm1'),
+                    (58, 'usb_c'     , 'pm'     , '1.25_usb_c_pm2'),
+                    (59, 'usb_c'     , 'pm'     , '1.26_usb_c_pm3'),
+                    (60, 'usb_c'     , 'pm'     , '1.27_usb_c_pm4'),
+                    (61, 'usb_a'     , 'pm'     , '1.28_usb_a_pm1'),
+                    (62, 'usb_a'     , 'pm'     , '1.29_usb_a_pm2'),
+                    (63, 'usb_a'     , 'pm'     , '1.30_usb_a_pm3'),
+                    (64, 'usb_a'     , 'pm'     , '1.31_usb_a_pm4'),
+                    (65, 'dmm'       , NULL     , '1.31_1_dmm_0.6ac_set'),
+                    (66, 'dmm'       , NULL     , '1.31_2_dmm_c_rng_set'),
+                    (67, 'product'   , 'dmm'    , '1.32_dark_curr_check')
+                ) AS m(seq, problem1, problem2, fail_test_item)
+            )
+            UPDATE {SCHEMA_RESULT}.{TABLE_RESULT} t
+            SET problem1       = m.problem1,
+                problem2       = m.problem2,
+                fail_test_item = m.fail_test_item
+            FROM candidates c
+            JOIN mapping   m ON c.seq = m.seq
+            WHERE t.id = c.id;
+            """
+        )
+        print("[POST] Non-PD 매핑 완료")
+
+    conn.commit()
+
+# =====================================================================
+# 4. 메인 실행
+# =====================================================================
 def run_once():
-    # 날짜 윈도우 계산 (이번 달 1일 ~ 오늘)
-    window_start_date, window_end_date = get_window_dates()
-    window_start_str = window_start_date.strftime("%Y%m%d")
-    window_end_str = window_end_date.strftime("%Y%m%d")
-
-    now_ts = time.time()
-    cutoff_ts = now_ts - REALTIME_LOOKBACK_SECONDS
-
     print("\n================ run_once 시작 ================")
-    print(f"[윈도우] 유효 날짜 범위: {window_start_date} ~ {window_end_date}")
-    print(f"[실시간] 최근 {REALTIME_LOOKBACK_SECONDS}초 이내 수정된 파일만 처리 (cutoff_ts={cutoff_ts})")
     print(f"[DEBUG] BASE_LOG_DIR: {BASE_LOG_DIR}")
 
-    # 0) DB 연결 및 스키마/테이블 준비
     conn = get_connection()
     ensure_schema_and_tables(conn)
 
-    # 1) 전체 TXT 파일 스캔 (윈도우 + mtime 필터)
+    # 1) 전체 txt 파일 스캔 후 FCT\YYYY\MM\DD 구조만 남김
     all_found_txt_files = list(BASE_LOG_DIR.rglob("*.txt"))
+    print(f"1) TXT 파일 전체 스캔 완료 → {len(all_found_txt_files)}개")
 
-    all_txt_files = []
-    for p in all_found_txt_files:
-        if not is_valid_deep_fct_path(p, window_start_str, window_end_str):
-            continue
-        try:
-            if p.stat().st_mtime < cutoff_ts:
-                # 실시간 윈도우 밖이면 제외
-                continue
-        except FileNotFoundError:
-            continue
-        all_txt_files.append(p)
+    valid_files = [p for p in all_found_txt_files if is_valid_fct_path(p)]
+    print(f"2) YYYY/MM/DD 구조 필터링 후 파일 수 → {len(valid_files)}개")
 
-    print(f"1) TXT 파일 스캔 완료 → 총 파일 수집(윈도우+mtime 내): {len(all_txt_files)}개")
+    # 2) 이미 처리한 파일 목록
+    processed = get_processed_file_paths(conn)
+    print(f"3) 이미 처리된 파일 수: {len(processed)}개")
 
-    # 2) DB 이력 로드 (윈도우 내 already processed)
-    processed_file_paths = get_processed_file_paths(conn, window_start_date)
-    print(f"2) DB에서 불러온 이전 처리 파일 수(윈도우 내): {len(processed_file_paths)}개")
-
-    target_files = [p for p in all_txt_files if str(p) not in processed_file_paths]
+    target_files = [p for p in valid_files if str(p) not in processed]
     total = len(target_files)
-    print(f"3) 이번에 새로 처리할 대상 파일 수: {total}개")
+    print(f"4) 새로 처리할 파일 수: {total}개")
 
     if total == 0:
         conn.close()
@@ -559,41 +617,37 @@ def run_once():
         print("=============== run_once 종료 ===============\n")
         return
 
-    print("4) TXT 파일 멀티프로세스 처리 시작...")
-
-    # 멀티프로세스 풀 구성 - 항상 2개 프로세스만 사용
-    num_workers = 2
-    print(f"   → 멀티프로세싱 워커 수: {num_workers}개")
+    print("5) 멀티프로세스 파싱 시작...")
+    print(f"   → 워커 수: {NUM_WORKERS}개")
 
     start_ts = time.time()
 
-    with Pool(processes=num_workers) as pool:
+    with Pool(processes=NUM_WORKERS) as pool:
         for idx, (file_path_str, rows, err) in enumerate(
-            pool.imap_unordered(process_one_file, [str(p) for p in target_files]), start=1
+            pool.imap_unordered(process_one_file, [str(p) for p in target_files]),
+            start=1,
         ):
             if err:
                 print(f"   [ERROR] {file_path_str} 처리 중 오류: {err}")
                 continue
-
             if not rows:
-                # 유효 로그 없으면 skip
                 continue
 
-            # DB에 INSERT + 이력 기록 (파일 단위, 메모리 최소화)
             insert_results_and_history(conn, file_path_str, rows)
 
-            # 진행 상황 출력
-            if (idx % 1000 == 0) or (idx == total):
-                print(f"   → 현재 {idx}/{total} 파일 처리 및 DB 저장 완료")
+            if (idx % 100 == 0) or (idx == total):
+                print(f"   → {idx}/{total} 파일 처리 및 DB 저장 완료")
 
     elapsed = time.time() - start_ts
-    print(f"   → 이번 run_once 처리 시간: {elapsed:.1f}초")
+    print(f"   → 파싱 및 저장 소요 시간: {elapsed:.1f}초")
+
+    # 파싱 후 후처리
+    postprocess_result_table(conn)
+
+    conn.close()
     print("=============== run_once 종료 ===============\n")
 
 
-# =========================
-# 엔트리 포인트
-# =========================
 def main():
     freeze_support()
     while True:
@@ -601,7 +655,6 @@ def main():
             run_once()
         except Exception as e:
             print(f"[MAIN ERROR] run_once 수행 중 오류: {e}")
-        # 1초 대기 후 다시 실행 (무한 루프)
         time.sleep(1)
 
 
