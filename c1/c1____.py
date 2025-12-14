@@ -10,10 +10,10 @@ from psycopg2.extras import execute_values
 # =========================
 # 기본 경로 / DB 설정
 # =========================
-BASE_LOG_DIR = Path(r"C:\Users\user\Desktop\machinlog\FCT")
+BASE_LOG_DIR = Path(r"\\192.168.108.101\HistoryLog")
 
 DB_CONFIG = {
-    "host": "localhost",
+    "host": "192.168.108.162",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
