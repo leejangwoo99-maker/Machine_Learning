@@ -133,8 +133,7 @@ def insert_records(conn, records: list[dict]):
         if col not in df.columns:
             df[col] = ""
 
-    rows = list(df
-
+    # ✅ 여기만 정상 1줄로 유지 (이전의 rows = list(df ... 잘못된 줄 삭제)
     rows = list(df[expected_cols].itertuples(index=False, name=None))
 
     insert_sql = sql.SQL("""
@@ -169,7 +168,7 @@ STEP_PATTERN = re.compile(
     r"^(?P<desc>.+?)\s*,\s*(?P<value>[^,]*),\s*(?P<min>[^,]*),\s*(?P<max>[^,]*),\s*(?P<result>\[[^\]]*\])"
 )
 
-# ✅ 추가: Run Time              :27.0
+# Run Time              :27.0
 RUNTIME_PATTERN = re.compile(r"Run\s*Time\s*:?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 
 
@@ -226,7 +225,7 @@ def parse_run_time_from_lines(lines: list[str]) -> str:
     없으면 전체 라인에서 보조 검색
     """
     if len(lines) >= 14:
-        m = RUNTIME_PATTERN.search(lines[13])  # 14번째 줄
+        m = RUNTIME_PATTERN.search(lines[13])
         if m:
             return m.group(1).strip()
 
@@ -254,6 +253,7 @@ def parse_fct_file(file_path: Path) -> list[dict]:
     station = None
     barcode = None
 
+    # Station (3번째 줄 우선)
     if len(lines) >= 3:
         m = STATION_PATTERN.search(lines[2])
         if m:
@@ -265,6 +265,7 @@ def parse_fct_file(file_path: Path) -> list[dict]:
                 station = m.group(1).strip()
                 break
 
+    # Barcode information (5번째 줄 우선)
     if len(lines) >= 5:
         m = BARCODE_PATTERN.search(lines[4])
         if m:
@@ -276,9 +277,7 @@ def parse_fct_file(file_path: Path) -> list[dict]:
                 barcode = m.group(1).strip()
                 break
 
-    # ✅ 추가: run_time 파싱
     run_time = parse_run_time_from_lines(lines)
-
     remark = make_remark_from_barcode(barcode if barcode else "")
 
     records = []
@@ -297,17 +296,15 @@ def parse_fct_file(file_path: Path) -> list[dict]:
             {
                 "barcode_information": barcode if barcode is not None else "",
                 "station": station if station is not None else "",
-                "run_time": run_time,          # ✅ 추가
+                "run_time": run_time,
                 "end_day": end_day,
                 "end_time": end_time,
                 "remark": remark,
-
                 "step_description": step_desc,
                 "value": value_raw,
                 "min": min_raw,
                 "max": max_raw,
                 "result": strip_brackets_result(result_raw),
-
                 "file_path": str(file_path),
             }
         )
@@ -321,8 +318,7 @@ def parse_fct_file(file_path: Path) -> list[dict]:
 
 def collect_realtime_today_files(base_dir: Path, today_yyyymmdd: str, cutoff_ts: float) -> list[Path]:
     """
-    c) 오늘 날짜 폴더만
-    d) cutoff_ts(현재-120초) 이후 수정된 파일만
+    오늘 날짜 폴더만 + cutoff_ts(현재-120초) 이후 수정된 파일만
     """
     file_list: list[Path] = []
 
@@ -372,7 +368,6 @@ def process_once_factory():
         init_db(conn)
 
         processed_files = get_processed_file_paths(conn)
-
         realtime_files = collect_realtime_today_files(BASE_LOG_DIR, today_yyyymmdd, cutoff_ts)
 
         # file_path 중복 스킵
