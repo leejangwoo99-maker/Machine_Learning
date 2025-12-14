@@ -41,14 +41,22 @@ def get_connection():
 
 
 def ensure_schema_and_table(conn):
+    """
+    - 기존 기능 동일
+    - 추가: run_time 컬럼(DOUBLE PRECISION) 포함
+    - 컬럼 순서: id, barcode_information, station, run_time, end_day, end_time, remark,
+               step_description, value, min, max, result, file_path, processed_at
+    """
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};")
 
+        # 최초 생성 시 run_time 포함
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{TABLE_NAME} (
                 id BIGSERIAL PRIMARY KEY,
                 barcode_information TEXT,
                 station             TEXT,
+                run_time            DOUBLE PRECISION,
                 end_day             TEXT,
                 end_time            TEXT,
                 remark              TEXT,
@@ -60,6 +68,12 @@ def ensure_schema_and_table(conn):
                 file_path           TEXT NOT NULL,
                 processed_at        TIMESTAMP NOT NULL DEFAULT NOW()
             );
+        """)
+
+        # 기존 테이블에 run_time 없을 수도 있으니 안전하게 추가
+        cur.execute(f"""
+            ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME}
+            ADD COLUMN IF NOT EXISTS run_time DOUBLE PRECISION;
         """)
 
         cur.execute(f"""
@@ -85,6 +99,7 @@ def insert_main_rows(conn, rows):
         (
             r["barcode_information"],
             r["station"],
+            r.get("run_time", None),
             r["end_day"],
             r["end_time"],
             r["remark"],
@@ -103,7 +118,8 @@ def insert_main_rows(conn, rows):
             cur,
             f"""
             INSERT INTO {SCHEMA_NAME}.{TABLE_NAME}
-                (barcode_information, station, end_day, end_time, remark,
+                (barcode_information, station, run_time,
+                 end_day, end_time, remark,
                  step_description, value, min, max, result, file_path)
             VALUES %s
             """,
@@ -143,6 +159,25 @@ def parse_end_time_from_full_path(file_path: Path) -> str:
         return ""
     ts = m.group(1)
     return f"{ts[8:10]}:{ts[10:12]}:{ts[12:14]}"
+
+
+def parse_run_time_line(line: str):
+    """
+    파일 14번째 줄(인덱스 13) 예:
+      Run Time              : 1.8450683s
+    -> 1.8 (float, 소수점 1자리 반올림)
+    """
+    if not line:
+        return None
+
+    m = re.search(r"Run\s*Time\s*:\s*([0-9.]+)\s*s", line)
+    if not m:
+        return None
+
+    try:
+        return round(float(m.group(1)), 1)
+    except ValueError:
+        return None
 
 
 def parse_data_lines(lines):
@@ -189,6 +224,9 @@ def _worker_process_file(file_str: str):
     station = parse_program_line(lines[5])
     remark  = classify_remark(barcode)
 
+    # ✅ 추가: 14번째 줄(인덱스 13) Run Time 파싱
+    run_time = parse_run_time_line(lines[13]) if len(lines) > 13 else None
+
     end_day  = datetime.now().strftime("%Y%m%d")
     end_time = parse_end_time_from_full_path(file_path)
 
@@ -201,6 +239,7 @@ def _worker_process_file(file_str: str):
         out.append({
             "barcode_information": barcode,
             "station": station,
+            "run_time": run_time,
             "end_day": end_day,
             "end_time": end_time,
             "remark": remark,

@@ -51,8 +51,8 @@ def get_connection():
 def init_db(conn):
     """
     스키마/테이블 생성.
-    컬럼 순서:
-    id, barcode_information, station, end_day, end_time, remark,
+    컬럼 순서(요청):
+    id, barcode_information, station, run_time, end_day, end_time, remark,
     step_description, value, min, max, result, file_path, processed_at
     """
     create_schema_sql = sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
@@ -65,6 +65,7 @@ def init_db(conn):
 
             barcode_information TEXT,
             station            TEXT,
+            run_time           TEXT,
             end_day            TEXT,
             end_time           TEXT,
             remark             TEXT,
@@ -117,6 +118,7 @@ def insert_records(conn, records: list[dict]):
     expected_cols = [
         "barcode_information",
         "station",
+        "run_time",
         "end_day",
         "end_time",
         "remark",
@@ -131,12 +133,15 @@ def insert_records(conn, records: list[dict]):
         if col not in df.columns:
             df[col] = ""
 
+    rows = list(df
+
     rows = list(df[expected_cols].itertuples(index=False, name=None))
 
     insert_sql = sql.SQL("""
         INSERT INTO {}.{} (
             barcode_information,
             station,
+            run_time,
             end_day,
             end_time,
             remark,
@@ -147,7 +152,7 @@ def insert_records(conn, records: list[dict]):
             result,
             file_path
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """).format(sql.Identifier(SCHEMA_NAME), sql.Identifier(TABLE_NAME))
 
     with conn.cursor() as cur:
@@ -163,6 +168,9 @@ BARCODE_PATTERN = re.compile(r"Barcode\s+information\s*:?\s*(.+)", re.IGNORECASE
 STEP_PATTERN = re.compile(
     r"^(?P<desc>.+?)\s*,\s*(?P<value>[^,]*),\s*(?P<min>[^,]*),\s*(?P<max>[^,]*),\s*(?P<result>\[[^\]]*\])"
 )
+
+# ✅ 추가: Run Time              :27.0
+RUNTIME_PATTERN = re.compile(r"Run\s*Time\s*:?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 
 
 def normalize_step_desc(desc: str) -> str:
@@ -211,6 +219,25 @@ def strip_brackets_result(result_raw: str) -> str:
     return s
 
 
+def parse_run_time_from_lines(lines: list[str]) -> str:
+    """
+    파일 14번째 줄(1-indexed) 우선에서 Run Time 값을 추출
+    예: Run Time              :27.0 -> "27.0"
+    없으면 전체 라인에서 보조 검색
+    """
+    if len(lines) >= 14:
+        m = RUNTIME_PATTERN.search(lines[13])  # 14번째 줄
+        if m:
+            return m.group(1).strip()
+
+    for line in lines:
+        m = RUNTIME_PATTERN.search(line)
+        if m:
+            return m.group(1).strip()
+
+    return ""
+
+
 def parse_fct_file(file_path: Path) -> list[dict]:
     try:
         with file_path.open("r", encoding="cp949", errors="ignore") as f:
@@ -249,6 +276,9 @@ def parse_fct_file(file_path: Path) -> list[dict]:
                 barcode = m.group(1).strip()
                 break
 
+    # ✅ 추가: run_time 파싱
+    run_time = parse_run_time_from_lines(lines)
+
     remark = make_remark_from_barcode(barcode if barcode else "")
 
     records = []
@@ -267,14 +297,17 @@ def parse_fct_file(file_path: Path) -> list[dict]:
             {
                 "barcode_information": barcode if barcode is not None else "",
                 "station": station if station is not None else "",
+                "run_time": run_time,          # ✅ 추가
                 "end_day": end_day,
                 "end_time": end_time,
                 "remark": remark,
+
                 "step_description": step_desc,
                 "value": value_raw,
                 "min": min_raw,
                 "max": max_raw,
                 "result": strip_brackets_result(result_raw),
+
                 "file_path": str(file_path),
             }
         )
@@ -332,7 +365,7 @@ def process_once_factory():
     """
     now_ts = time.time()
     cutoff_ts = now_ts - REALTIME_WINDOW_SEC
-    today_yyyymmdd = datetime.now().strftime("%Y%m%d")  # c. 오늘 날짜만
+    today_yyyymmdd = datetime.now().strftime("%Y%m%d")
 
     conn = get_connection()
     try:
