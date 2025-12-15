@@ -81,7 +81,7 @@ def ensure_schema_table():
         problem2 TEXT,
         problem3 TEXT,
         problem4 TEXT,
-        end_day INTEGER,
+        end_day TEXT,
         end_time TEXT,
         remark TEXT,
         file_path TEXT,
@@ -148,7 +148,7 @@ def fetch_fct_table_map(barcodes, chunk_size=5000):
 
 
 def merge_station_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """df에 station/end_day/end_time 채우기"""
+    """df에 station/end_day/end_time 채우기 (end_day는 str로 강제)"""
     if df is None or df.empty:
         return df
     if "barcode_information" not in df.columns:
@@ -157,20 +157,22 @@ def merge_station_fields(df: pd.DataFrame) -> pd.DataFrame:
     barcodes = df["barcode_information"].dropna().unique().tolist()
     mp = fetch_fct_table_map(barcodes)
 
-    # 람다 3번 대신 1번 루프 (속도 최적)
     st_list, ed_list, et_list = [], [], []
     for bc in df["barcode_information"].tolist():
         v = mp.get(bc)
         if v is None:
-            st_list.append(None); ed_list.append(None); et_list.append(None)
+            st_list.append(None)
+            ed_list.append(None)
+            et_list.append(None)
         else:
-            st_list.append(v[0]); ed_list.append(v[1]); et_list.append(v[2])
+            st_list.append(v[0])
+            ed_list.append(str(v[1]) if v[1] is not None else None)  # ✅ 핵심
+            et_list.append(v[2])
 
     df["station"]  = st_list
     df["end_day"]  = ed_list
     df["end_time"] = et_list
     return df
-
 
 def insert_df(df: pd.DataFrame, batch_size=10000):
     if df is None or df.empty:
