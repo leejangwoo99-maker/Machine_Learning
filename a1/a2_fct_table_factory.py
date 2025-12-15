@@ -133,7 +133,6 @@ def insert_records(conn, records: list[dict]):
         if col not in df.columns:
             df[col] = ""
 
-    # ✅ 여기만 정상 1줄로 유지 (이전의 rows = list(df ... 잘못된 줄 삭제)
     rows = list(df[expected_cols].itertuples(index=False, name=None))
 
     insert_sql = sql.SQL("""
@@ -159,14 +158,11 @@ def insert_records(conn, records: list[dict]):
 
 
 # ============================================
-# 2) FCT 로그 파싱용 정규식
+# 2) FCT 로그 파싱용 정규식/유틸
 # ============================================
 
 STATION_PATTERN = re.compile(r"Station\s*:?\s*(\S+)", re.IGNORECASE)
 BARCODE_PATTERN = re.compile(r"Barcode\s+information\s*:?\s*(.+)", re.IGNORECASE)
-STEP_PATTERN = re.compile(
-    r"^(?P<desc>.+?)\s*,\s*(?P<value>[^,]*),\s*(?P<min>[^,]*),\s*(?P<max>[^,]*),\s*(?P<result>\[[^\]]*\])"
-)
 
 # Run Time              :27.0
 RUNTIME_PATTERN = re.compile(r"Run\s*Time\s*:?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
@@ -210,18 +206,21 @@ def make_remark_from_barcode(barcode: str) -> str:
 
 
 def strip_brackets_result(result_raw: str) -> str:
+    """
+    "[PASS]" -> "PASS"
+    " [ FAIL ] " -> "FAIL"
+    """
     if not result_raw:
         return ""
     s = result_raw.strip()
     if s.startswith("[") and s.endswith("]") and len(s) >= 2:
-        return s[1:-1].strip()
-    return s
+        s = s[1:-1]
+    return s.strip()
 
 
 def parse_run_time_from_lines(lines: list[str]) -> str:
     """
     파일 14번째 줄(1-indexed) 우선에서 Run Time 값을 추출
-    예: Run Time              :27.0 -> "27.0"
     없으면 전체 라인에서 보조 검색
     """
     if len(lines) >= 14:
@@ -237,19 +236,7 @@ def parse_run_time_from_lines(lines: list[str]) -> str:
     return ""
 
 
-def parse_fct_file(file_path: Path) -> list[dict]:
-    try:
-        with file_path.open("r", encoding="cp949", errors="ignore") as f:
-            lines = [line.rstrip("\n") for line in f]
-    except UnicodeDecodeError:
-        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
-            lines = [line.rstrip("\n") for line in f]
-
-    if not lines:
-        return []
-
-    end_day, end_time = parse_end_day_end_time_from_path(file_path)
-
+def parse_station_barcode(lines: list[str]):
     station = None
     barcode = None
 
@@ -277,37 +264,98 @@ def parse_fct_file(file_path: Path) -> list[dict]:
                 barcode = m.group(1).strip()
                 break
 
-    run_time = parse_run_time_from_lines(lines)
-    remark = make_remark_from_barcode(barcode if barcode else "")
+    return station or "", barcode or ""
 
-    records = []
-    for line in lines:
-        m = STEP_PATTERN.match(line)
-        if not m:
+
+def parse_step_rows_from_fixed_lines(lines: list[str]) -> list[dict]:
+    """
+    ✅ 요청사항 그대로 적용:
+    - 파일 내용의 19번째 줄 ~ 54번째 줄(1-indexed)만 사용
+    - 각 라인은 CSV(콤마) 5개 컬럼 형태:
+      desc, value, min, max, [PASS|FAIL]
+    - result는 [] 제거해서 저장
+
+    반환: [{"step_description","value","min","max","result"}, ...]
+    """
+    start_idx = 18  # 19번째 줄
+    end_idx_excl = 54  # 54번째 줄까지 포함하려면 slice end를 54로(파이썬은 end exclusive)
+    if len(lines) <= start_idx:
+        return []
+
+    step_lines = lines[start_idx:end_idx_excl]
+
+    step_rows: list[dict] = []
+    for raw in step_lines:
+        if not raw:
             continue
 
-        step_desc = normalize_step_desc(m.group("desc"))
-        value_raw = str(m.group("value")).strip()
-        min_raw = str(m.group("min")).strip()
-        max_raw = str(m.group("max")).strip()
-        result_raw = str(m.group("result")).strip()
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) < 5:
+            continue
 
-        records.append(
-            {
-                "barcode_information": barcode if barcode is not None else "",
-                "station": station if station is not None else "",
-                "run_time": run_time,
-                "end_day": end_day,
-                "end_time": end_time,
-                "remark": remark,
-                "step_description": step_desc,
-                "value": value_raw,
-                "min": min_raw,
-                "max": max_raw,
-                "result": strip_brackets_result(result_raw),
-                "file_path": str(file_path),
-            }
-        )
+        step_desc = normalize_step_desc(parts[0])
+        value_raw = parts[1].strip()
+        min_raw = parts[2].strip()
+        max_raw = parts[3].strip()
+        result_raw = parts[4].strip()
+
+        if not step_desc:
+            continue
+
+        step_rows.append({
+            "step_description": step_desc,
+            "value": value_raw,
+            "min": min_raw,
+            "max": max_raw,
+            "result": strip_brackets_result(result_raw),
+        })
+
+    return step_rows
+
+
+def parse_fct_file(file_path: Path) -> list[dict]:
+    """
+    ✅ 통합 적용:
+    - 공통 헤더(Station/Barcode/Run Time/end_day/end_time/remark)는 파일에서 1회 추출
+    - 19~54줄의 step 라인을 CSV로 파싱하여 step별로 여러 행 생성
+    - 기존 기능(파일 경로, 실시간 처리, MP 등)에는 영향 없음
+    """
+    try:
+        with file_path.open("r", encoding="cp949", errors="ignore") as f:
+            lines = [line.rstrip("\n") for line in f]
+    except UnicodeDecodeError:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+            lines = [line.rstrip("\n") for line in f]
+
+    if not lines:
+        return []
+
+    end_day, end_time = parse_end_day_end_time_from_path(file_path)
+    station, barcode = parse_station_barcode(lines)
+    run_time = parse_run_time_from_lines(lines)
+    remark = make_remark_from_barcode(barcode)
+
+    # ✅ 19~54줄 step 데이터 파싱
+    step_rows = parse_step_rows_from_fixed_lines(lines)
+    if not step_rows:
+        return []
+
+    records: list[dict] = []
+    for step in step_rows:
+        records.append({
+            "barcode_information": barcode,
+            "station": station,
+            "run_time": run_time,
+            "end_day": end_day,
+            "end_time": end_time,
+            "remark": remark,
+            "step_description": step.get("step_description", ""),
+            "value": step.get("value", ""),
+            "min": step.get("min", ""),
+            "max": step.get("max", ""),
+            "result": step.get("result", ""),
+            "file_path": str(file_path),
+        })
 
     return records
 

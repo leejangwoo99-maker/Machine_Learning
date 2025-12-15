@@ -20,8 +20,8 @@ DB_CONFIG = {
 }
 
 # a. 비전 JSON 테이블 (station, result 매핑용)
-SCHEMA_VISION = "a2_fct_vision_testlog_json_processing"
-TABLE_VISION = "fct_vision_testlog_json_processing"
+SCHEMA_VISION = "a2_fct_table"
+TABLE_VISION = "fct_table"
 
 # 처리 이력 테이블
 SCHEMA_PROCESSING = "c1_fct_testlog_detail_jason_processing"

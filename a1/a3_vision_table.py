@@ -47,16 +47,19 @@ def ensure_schema_and_table(conn):
     - 메인 테이블만 사용
     - 중복 판정은 vision_table의 DISTINCT file_path로 수행 (FCT 방식)
     - 성능을 위해 file_path 인덱스는 생성
+    - 추가: run_time 컬럼 (DOUBLE PRECISION)
     """
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};")
 
+        # 1) 테이블 생성 (최초 1회)
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{TABLE_NAME} (
                 id                  BIGSERIAL PRIMARY KEY,
                 barcode_information TEXT,
                 station             TEXT,
+                run_time            DOUBLE PRECISION,
                 end_day             TEXT,
                 end_time            TEXT,
                 remark              TEXT,
@@ -71,7 +74,15 @@ def ensure_schema_and_table(conn):
             """
         )
 
-        # FCT와 동일: 중복 체크용 조회 성능을 위해 인덱스만 둠 (UNIQUE 금지)
+        # 2) 기존 테이블에 run_time이 없을 수도 있으니 안전하게 추가(있으면 무시)
+        cur.execute(
+            f"""
+            ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME}
+            ADD COLUMN IF NOT EXISTS run_time DOUBLE PRECISION;
+            """
+        )
+
+        # 3) FCT와 동일: 중복 체크용 조회 성능을 위해 인덱스만 둠 (UNIQUE 금지)
         cur.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_file_path
@@ -103,17 +114,18 @@ def insert_main_rows(conn, rows):
 
     records = [
         (
-            r["barcode_information"],
-            r["station"],
-            r["end_day"],
-            r["end_time"],
-            r["remark"],
-            r["step_description"],
-            r["value"],
-            r["min"],
-            r["max"],
-            r["result"],
-            r["file_path"],
+            r.get("barcode_information", ""),
+            r.get("station", ""),
+            r.get("run_time", None),
+            r.get("end_day", ""),
+            r.get("end_time", ""),
+            r.get("remark", ""),
+            r.get("step_description", ""),
+            r.get("value", ""),
+            r.get("min", ""),
+            r.get("max", ""),
+            r.get("result", ""),
+            r.get("file_path", ""),
         )
         for r in rows
     ]
@@ -123,7 +135,8 @@ def insert_main_rows(conn, rows):
             cur,
             f"""
             INSERT INTO {SCHEMA_NAME}.{TABLE_NAME}
-                (barcode_information, station, end_day, end_time, remark,
+                (barcode_information, station, run_time,
+                 end_day, end_time, remark,
                  step_description, value, min, max, result, file_path)
             VALUES %s
             """,
@@ -179,6 +192,26 @@ def parse_end_time_from_full_path(file_path: Path) -> str:
     return f"{hhmiss[0:2]}:{hhmiss[2:4]}:{hhmiss[4:6]}"
 
 
+def parse_run_time_line(line: str):
+    """
+    파일 14번째 줄(인덱스 13)에 존재한다고 가정:
+      Run Time              : 1.8450683s
+    -> float(1.8) 로 변환(소수점 1자리 반올림)
+    """
+    if not line:
+        return None
+
+    # 'Run Time : 1.8450683s' 형태에서 숫자만 추출
+    m = re.search(r"Run\s*Time\s*:\s*([0-9.]+)\s*s", line)
+    if not m:
+        return None
+
+    try:
+        return round(float(m.group(1)), 1)
+    except ValueError:
+        return None
+
+
 def parse_data_lines(lines):
     index_list = []
     rows = []
@@ -225,6 +258,9 @@ def _worker_process_file(file_str: str):
     station = parse_program_line(lines[5]) if len(lines) > 5 else ""
     remark = classify_remark(barcode)
 
+    # ✅ 추가: 14번째 줄(인덱스 13)에서 run_time 추출
+    run_time = parse_run_time_line(lines[13]) if len(lines) > 13 else None
+
     end_day = parse_end_day_from_path(file_path)
     end_time = parse_end_time_from_full_path(file_path)
 
@@ -238,6 +274,7 @@ def _worker_process_file(file_str: str):
             {
                 "barcode_information": barcode,
                 "station": station,
+                "run_time": run_time,
                 "end_day": end_day,
                 "end_time": end_time,
                 "remark": remark,
