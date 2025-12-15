@@ -17,7 +17,7 @@ from psycopg2.extras import execute_values
 # =========================
 # 고정 경로 (요구사항)
 # =========================
-BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
+BASE_DIR = Path(r"C:\Users\user\Desktop\machinlog\FCT")
 
 # 날짜 고정 (요구사항)
 START_DATE = date(2025, 10, 1)
@@ -31,7 +31,7 @@ MAP_NPD = Path(r"C:\data\Non-PD.csv")
 # DB 설정 (요구사항)
 # =========================
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "localhost",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
