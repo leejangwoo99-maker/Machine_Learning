@@ -48,7 +48,8 @@ SRC_TABLE  = "fct_table"
 
 # 성능/인코딩
 ANSI_LOG_ENCODING = "cp949"
-NUM_WORKERS = max(2, min(16, (cpu_count() or 4)))  # 멀티프로세스 워커 수
+# ✅ 멀티프로세스 워커 수 2개 고정
+NUM_WORKERS = 2
 
 # 결과 라인 패턴
 OK_PAT = re.compile(r"테스트\s*결과\s*:\s*OK")
