@@ -12,7 +12,7 @@ import urllib.parse
 # =========================
 # 1. 경로 / DB 설정
 # =========================
-BASE_LOG_DIR = Path(r"\\192.168.108.101\HistoryLog")
+BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
 
 DB_CONFIG = {
     "host": "192.168.108.162",
