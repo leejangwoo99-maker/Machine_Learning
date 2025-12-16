@@ -21,7 +21,7 @@ BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
 
 # 날짜 고정 (요구사항)
 START_DATE = date(2025, 10, 1)
-END_DATE   = date(2025, 12, 19)
+END_DATE   = date(2025, 12, 30)
 
 # 매핑 CSV (C:\data 기준)
 MAP_PD  = Path(r"C:\data\PD.csv")
@@ -48,8 +48,7 @@ SRC_TABLE  = "fct_table"
 
 # 성능/인코딩
 ANSI_LOG_ENCODING = "cp949"
-# ✅ 멀티프로세스 워커 수 2개 고정
-NUM_WORKERS = 2
+NUM_WORKERS = max(2, min(16, (cpu_count() or 4)))  # 멀티프로세스 워커 수
 
 # 결과 라인 패턴
 OK_PAT = re.compile(r"테스트\s*결과\s*:\s*OK")
@@ -108,7 +107,7 @@ def ensure_schema_table():
 
 def fetch_existing_file_paths(file_paths):
     """
-    중복 방지(요구사항):
+    중복 방지:
     SELECT DISTINCT file_path 방식으로 신규 파일만 처리
     """
     if not file_paths:
@@ -124,6 +123,26 @@ def fetch_existing_file_paths(file_paths):
         with conn.cursor() as cur:
             cur.execute(q, (list(file_paths),))
             return set(r[0] for r in cur.fetchall())
+
+
+def fetch_processed_file_paths(limit=30):
+    """
+    이미 적재된(처리된) 파일 목록을 최신 processed_at 기준으로 가져옴
+    - 쇼잉 용도 (file_path, remark)
+    """
+    q = sql.SQL("""
+        SELECT file_path, remark
+        FROM {schema}.{table}
+        WHERE file_path IS NOT NULL
+        ORDER BY processed_at DESC NULLS LAST
+        LIMIT %s;
+    """).format(schema=sql.Identifier(TGT_SCHEMA),
+                table=sql.Identifier(TGT_TABLE))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (limit,))
+            return [(r[0], r[1]) for r in cur.fetchall()]
 
 
 def fetch_fct_table_map(barcodes, chunk_size=5000):
@@ -174,6 +193,7 @@ def merge_station_fields(df: pd.DataFrame) -> pd.DataFrame:
     df["end_day"]  = ed_list
     df["end_time"] = et_list
     return df
+
 
 def insert_df(df: pd.DataFrame, batch_size=10000):
     if df is None or df.empty:
@@ -397,23 +417,66 @@ def build_df_from_files(new_cands, map_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def show_already_processed_data(map_df: pd.DataFrame, limit_files=30):
+    """
+    실행 직후: 이미 적재된 file_path들에 대해 다시 파싱하여 출력(쇼잉)
+    - DB에 들어있는 데이터 '후속 처리' 이전에, 기존 처리분을 먼저 보여주는 목적
+    - INSERT는 하지 않음
+    """
+    paths = fetch_processed_file_paths(limit=limit_files)
+    if not paths:
+        print("[INFO] no already-processed file_paths to show.")
+        return
+
+    # ✅ DB에서 가져온 remark를 그대로 사용
+    cands = [(p, remark) for (p, remark) in paths]
+
+    parsed = []
+    print(f"[INFO] show processed: parsing {len(cands)} files for display...")
+
+    with Pool(processes=NUM_WORKERS) as pool:
+        for r in pool.imap_unordered(parse_one_file_fast, cands, chunksize=10):
+            if r:
+                parsed.extend(r)
+
+    df = pd.DataFrame(parsed)
+    if df.empty:
+        print("[INFO] already-processed parse result is empty (maybe files missing).")
+        return
+
+    df["seq"] = pd.to_numeric(df.get("seq"), errors="coerce").astype("Int64")
+    df = df.merge(map_df, how="left", on=["remark", "seq"])
+    if "seq" in df.columns:
+        df.drop(columns=["seq"], inplace=True)
+
+    print(f"[SHOW] parsed rows(from already-processed files): {len(df):,}")
+    print("[SHOW] columns:", list(df.columns))
+    print("[SHOW] head(20):")
+    print(df.head(20).to_string(index=False))
+
+
 # =========================
 # 메인 루프 (요구사항: 1초마다 무한 반복)
 # =========================
 def main_loop():
+    # 1) 실행 즉시: 스키마/테이블 ensure
     ensure_schema_table()
+
+    # 2) 매핑 로딩
     map_df = load_mapping_df()
 
+    # 3) 기존 처리분 먼저 파싱하여 쇼잉
+    show_already_processed_data(map_df, limit_files=30)
+
+    # 4) 이후부터 1초 루프: 신규 파일만 처리
     while True:
         try:
-            # 1) 후보 파일 수집
             cands = list_candidate_files_strict()
             if not cands:
                 print("[INFO] candidates: 0 (sleep 1s)")
                 time.sleep(1)
                 continue
 
-            # 2) DB에 이미 적재된 file_path 확인 -> 신규만 선별
             all_paths = [fp for fp, _ in cands]
             existing = fetch_existing_file_paths(set(all_paths))
             new_cands = [(fp, remark) for (fp, remark) in cands if fp not in existing]
@@ -424,7 +487,7 @@ def main_loop():
                 time.sleep(1)
                 continue
 
-            # 3) 멀티프로세스 파싱 -> DF
+            # 신규 파일 파싱 -> DF
             df_parsed = build_df_from_files(new_cands, map_df)
             print(f"[INFO] parsed rows: {len(df_parsed):,}")
 
@@ -432,10 +495,10 @@ def main_loop():
                 time.sleep(1)
                 continue
 
-            # 4) station/end_day/end_time 매칭
+            # station/end_day/end_time 매칭
             df_ready = merge_station_fields(df_parsed)
 
-            # 5) INSERT
+            # INSERT
             inserted = insert_df(df_ready)
             print(f"[INFO] inserted_rows={inserted:,}")
 
@@ -443,7 +506,6 @@ def main_loop():
             print("[ERROR]", repr(e))
 
         time.sleep(1)
-
 
 if __name__ == "__main__":
     freeze_support()
