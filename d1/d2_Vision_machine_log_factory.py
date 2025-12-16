@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 # ============================================
 # Vision Machine Log Parser (Realtime + MP2 + Dedup + TodayOnly)
+# - 주/야간 로직 제거
+# - dayornight 컬럼 제거
+# - time 컬럼 -> end_time 컬럼으로 변경
+# - end_day는 파일명(YYYYMMDD) 기준으로만 저장
+# - 오늘 파일(YYYYMMDD==오늘)만 처리
+# - (end_day, station, end_time, contents) 중복 방지 (UNIQUE INDEX + ON CONFLICT DO NOTHING)
+# - 현재시간 기준 120초 이내 새롭게 추가/수정된 파일만 처리(mtime 기준)
 # ============================================
 
 import re
 import time as time_mod
 from pathlib import Path
-from datetime import datetime, date, timedelta, time as dt_time
+from datetime import datetime
 from multiprocessing import Pool, freeze_support
 
 import pandas as pd
@@ -70,11 +77,10 @@ def get_engine(config=DB_CONFIG):
 def ensure_schema_tables(engine):
     ddl_template = """
     CREATE TABLE IF NOT EXISTS {schema}."{table}" (
-        id         BIGSERIAL PRIMARY KEY,
-        end_day     VARCHAR(8),
-        station     VARCHAR(10),
-        dayornight  VARCHAR(10),
-        time        VARCHAR(12),
+        id          BIGSERIAL PRIMARY KEY,
+        end_day     VARCHAR(8),     -- yyyymmdd (파일명 기준)
+        station     VARCHAR(10),    -- Vision1 / Vision2
+        end_time    VARCHAR(12),    -- hh:mi:ss.ss
         contents    VARCHAR(200)
     );
     """
@@ -85,47 +91,27 @@ def ensure_schema_tables(engine):
         for st, tbl in TABLE_MAP.items():
             conn.execute(text(ddl_template.format(schema=SCHEMA_NAME, table=tbl)))
 
-            # (4) 중복 방지: (end_day, station, dayornight, time, contents) UNIQUE INDEX
+            # 중복 방지: (end_day, station, end_time, contents) UNIQUE INDEX
             idx_name = f"ux_{SCHEMA_NAME}_{tbl.lower()}_dedup"
             conn.execute(text(f"""
                 CREATE UNIQUE INDEX IF NOT EXISTS {idx_name}
-                ON {SCHEMA_NAME}."{tbl}" (end_day, station, dayornight, time, contents)
+                ON {SCHEMA_NAME}."{tbl}" (end_day, station, end_time, contents)
             """))
 
     print("[INFO] Schema, tables, unique indexes ready")
 
 
 # ============================================
-# 4. Day/Night 판정
+# 4. 파일 파싱 유틸
 # ============================================
-def classify_day_night(file_date: date, t: dt_time):
-    t_day_start = dt_time(8, 30, 0)
-    t_day_end = dt_time(20, 29, 59, 999999)
-    t_night_start = dt_time(20, 30, 0)
-    t_night_end = dt_time(23, 59, 59, 999999)
-    t_morning_end = dt_time(8, 29, 59, 999999)
-
-    if t_day_start <= t <= t_day_end:
-        return file_date.strftime("%Y%m%d"), "day"
-    elif t_night_start <= t <= t_night_end:
-        return file_date.strftime("%Y%m%d"), "night"
-    elif dt_time(0, 0, 0) <= t <= t_morning_end:
-        prev_date = file_date - timedelta(days=1)
-        return prev_date.strftime("%Y%m%d"), "night"
-
-    return file_date.strftime("%Y%m%d"), "day"
+LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
+FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
 
 
-# ============================================
-# 5. 파일 파싱 유틸
-# ============================================
-line_pattern = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
-filename_pattern = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
-
-
-def clean_contents(raw: str, max_len: int = 75):
-    cleaned = "".join(ch for ch in raw if ch.isprintable())
-    return cleaned[:max_len].strip()
+def clean_contents(raw: str, max_len: int = 200):
+    s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = " ".join(s.split())  # 연속 공백 정리
+    return s[:max_len].strip()
 
 
 def _open_text_file(path: Path):
@@ -140,11 +126,12 @@ def parse_machine_log_file(path_str: str):
     """
     멀티프로세스 워커용 (pickle 가능)
     한 파일에서 rows(list[dict]) 반환
-    + (3) end_day가 오늘인 것만 반환
+    - end_day: 파일명 YYYYMMDD 그대로
+    - 오늘 파일(YYYYMMDD==오늘)만 반환
     """
     file_path = Path(path_str)
 
-    m = filename_pattern.search(file_path.name)
+    m = FILENAME_PATTERN.search(file_path.name)
     if not m:
         return []
 
@@ -152,40 +139,35 @@ def parse_machine_log_file(path_str: str):
     vision_no = m.group(2)  # '1' or '2'
     station = f"Vision{vision_no}"
 
-    file_date = datetime.strptime(file_ymd, "%Y%m%d").date()
     today_ymd = datetime.now().strftime("%Y%m%d")
+    if file_ymd != today_ymd:
+        return []  # 오늘 파일만
 
     result = []
     try:
         with _open_text_file(file_path) as f:
             for line in f:
                 line = line.rstrip("\n")
-                m2 = line_pattern.match(line)
+                m2 = LINE_PATTERN.match(line)
                 if not m2:
                     continue
 
-                time_str = m2.group(1)
+                end_time_str = m2.group(1)
                 contents_raw = m2.group(2)
 
+                # 시간 포맷 검증
                 try:
-                    t = datetime.strptime(time_str, "%H:%M:%S.%f").time()
+                    _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
                 except ValueError:
                     continue
 
-                end_day, dayornight = classify_day_night(file_date, t)
-
-                # (3) 오늘 end_day만 적재
-                if end_day != today_ymd:
-                    continue
-
-                contents = clean_contents(contents_raw)
+                contents = clean_contents(contents_raw, max_len=200)
 
                 result.append(
                     {
-                        "end_day": end_day,
+                        "end_day": file_ymd,
                         "station": station,
-                        "dayornight": dayornight,
-                        "time": time_str,
+                        "end_time": end_time_str,
                         "contents": contents,
                     }
                 )
@@ -197,7 +179,7 @@ def parse_machine_log_file(path_str: str):
 
 
 # ============================================
-# 6. "실시간 120초 이내" 신규/수정 파일만 수집
+# 5. "실시간 120초 이내" 신규/수정 파일만 수집
 #    디렉토리 구조: Vision\\YYYY\\MM\\파일명
 # ============================================
 def list_target_files_realtime(base_dir: Path):
@@ -207,7 +189,7 @@ def list_target_files_realtime(base_dir: Path):
         return files
 
     cutoff_ts = time_mod.time() - REALTIME_WINDOW_SEC
-    # print(f"[DEBUG] cutoff_ts={cutoff_ts}")
+    today_ymd = datetime.now().strftime("%Y%m%d")
 
     for year_dir in sorted(base_dir.iterdir()):
         if not (year_dir.is_dir() and year_dir.name.isdigit() and len(year_dir.name) == 4):
@@ -220,7 +202,14 @@ def list_target_files_realtime(base_dir: Path):
             for file_path in month_dir.iterdir():
                 if not file_path.is_file():
                     continue
-                if not filename_pattern.search(file_path.name):
+
+                m = FILENAME_PATTERN.search(file_path.name)
+                if not m:
+                    continue
+
+                # 오늘 파일만
+                file_ymd = m.group(1)
+                if file_ymd != today_ymd:
                     continue
 
                 try:
@@ -228,11 +217,11 @@ def list_target_files_realtime(base_dir: Path):
                 except OSError:
                     continue
 
-                # (5) 120초 이내 변경 파일만
+                # 120초 이내 변경 파일만
                 if mtime < cutoff_ts:
                     continue
 
-                # "새롭게 추가/수정된 파일만" 처리(캐시)
+                # 새롭게 추가/수정된 파일만 (캐시)
                 fp = str(file_path)
                 prev_mtime = PROCESSED_MTIME.get(fp, 0)
                 if mtime <= prev_mtime:
@@ -246,17 +235,15 @@ def list_target_files_realtime(base_dir: Path):
 
 
 # ============================================
-# 7. DB Insert (중복은 DB에서 회피)
+# 6. DB Insert (중복은 DB에서 회피)
 # ============================================
 def insert_to_db(engine, df: pd.DataFrame):
     if df.empty:
         return
 
-    # 정렬(원하시는 기준 유지)
-    df["dayornight"] = pd.Categorical(df["dayornight"], ["day", "night"], ordered=True)
-    df = df.sort_values(["end_day", "dayornight", "time"]).reset_index(drop=True)
+    # 정렬: end_day 오름차순, end_time 오름차순
+    df = df.sort_values(["end_day", "end_time"]).reset_index(drop=True)
 
-    # 테이블별로 ON CONFLICT DO NOTHING 삽입
     with engine.begin() as conn:
         for st, tbl in TABLE_MAP.items():
             sub = df[df["station"] == st]
@@ -264,9 +251,9 @@ def insert_to_db(engine, df: pd.DataFrame):
                 continue
 
             insert_sql = text(f"""
-                INSERT INTO {SCHEMA_NAME}."{tbl}" (end_day, station, dayornight, time, contents)
-                VALUES (:end_day, :station, :dayornight, :time, :contents)
-                ON CONFLICT (end_day, station, dayornight, time, contents) DO NOTHING
+                INSERT INTO {SCHEMA_NAME}."{tbl}" (end_day, station, end_time, contents)
+                VALUES (:end_day, :station, :end_time, :contents)
+                ON CONFLICT (end_day, station, end_time, contents) DO NOTHING
             """)
 
             conn.execute(insert_sql, sub.to_dict(orient="records"))
@@ -274,7 +261,7 @@ def insert_to_db(engine, df: pd.DataFrame):
 
 
 # ============================================
-# 8. main (1초 무한루프)
+# 7. main (1초 무한루프)
 # ============================================
 def main():
     engine = get_engine()
@@ -282,7 +269,6 @@ def main():
 
     while True:
         try:
-            # (5) 실시간 신규/수정 파일만
             files = list_target_files_realtime(BASE_DIR)
             if not files:
                 time_mod.sleep(SLEEP_SEC)
@@ -296,21 +282,18 @@ def main():
                     PROCESSED_MTIME[fp] = time_mod.time()
 
             all_records = []
-            parsed_files = 0
 
             if USE_MULTIPROCESSING and len(files) >= 2:
                 procs = min(N_PROCESSES, len(files))
                 print(f"[INFO] Using multiprocessing: {procs} processes")
                 with Pool(processes=procs) as pool:
                     for rows in pool.imap_unordered(parse_machine_log_file, files, chunksize=POOL_CHUNKSIZE):
-                        parsed_files += 1
                         if rows:
                             all_records.extend(rows)
             else:
                 print("[INFO] Multiprocessing disabled (or not enough files).")
                 for fp in files:
                     rows = parse_machine_log_file(fp)
-                    parsed_files += 1
                     if rows:
                         all_records.extend(rows)
 

@@ -10,6 +10,11 @@ MES 불량 소요 시간 계산 (Vision1/Vision2)
 
 멀티프로세스:
 - (station, end_day) 그룹 단위 병렬 처리
+
+[변경사항(요청 반영)]
+- dayornight 컬럼/속성값 완전 삭제
+- time 컬럼 -> end_time 컬럼으로 변경
+- 결과 테이블에서도 dayornight 제거
 """
 
 import os
@@ -64,9 +69,12 @@ def secs_to_hhmmss_ss(sec: float) -> str:
 
 
 def filter_shift_boundary(df: pd.DataFrame) -> pd.DataFrame:
-    # 교대 경계(08:20~08:30, 20:20~20:30) 제거
+    """
+    교대 경계(08:20~08:30, 20:20~20:30) 제거
+    (변경: time -> end_time 기준)
+    """
     df = df.copy()
-    df["time_secs"] = pd.to_timedelta(df["time"].astype(str)).dt.total_seconds()
+    df["time_secs"] = pd.to_timedelta(df["end_time"].astype(str)).dt.total_seconds()
 
     start_0820 = 8 * 3600 + 20 * 60
     end_0830   = 8 * 3600 + 30 * 60
@@ -91,7 +99,7 @@ def process_one_group(args):
     return: rows(list[dict]) - 결과 레코드들
     """
     (station, end_day), g = args
-    g = g.sort_values("time").reset_index(drop=True).copy()
+    g = g.sort_values("end_time").reset_index(drop=True).copy()
 
     # flags
     g["is_mes_ng"] = g["contents"].astype(str).str.contains("MES 바코드 공정 불량", na=False)
@@ -127,15 +135,16 @@ def process_one_group(args):
     if not from_indices:
         return []
 
-    from_rows = g.loc[from_indices, ["end_day", "station", "dayornight", "time", "contents"]].copy()
-    from_rows = from_rows.rename(columns={"time": "from_time", "contents": "from_contents"})
+    # (변경) dayornight 제거, time -> end_time
+    from_rows = g.loc[from_indices, ["end_day", "station", "end_time", "contents"]].copy()
+    from_rows = from_rows.rename(columns={"end_time": "from_time", "contents": "from_contents"})
     from_rows["from_key"] = time_to_seconds(from_rows["from_time"])
 
-    done_rows = g[g["is_done"]][["time", "contents"]].copy()
+    done_rows = g[g["is_done"]][["end_time", "contents"]].copy()
     if done_rows.empty:
         return []
 
-    done_rows = done_rows.rename(columns={"time": "to_time", "contents": "to_contents"})
+    done_rows = done_rows.rename(columns={"end_time": "to_time", "contents": "to_contents"})
     done_rows["to_key"] = time_to_seconds(done_rows["to_time"])
     done_rows = done_rows.sort_values("to_key").reset_index(drop=True)
 
@@ -163,7 +172,6 @@ def process_one_group(args):
     out = merged[[
         "end_day",
         "station",
-        "dayornight",
         "from_contents",
         "from_time",
         "to_contents",
@@ -171,7 +179,6 @@ def process_one_group(args):
         "wasted_time",
     ]].copy()
 
-    # dict list로 반환
     return out.to_dict("records")
 
 
@@ -181,16 +188,16 @@ def process_one_group(args):
 def main():
     engine = get_engine()
 
-    # Vision1/2 로딩
+    # Vision1/2 로딩 (변경: time -> end_time, dayornight 제거)
     q1 = text(f"""
-        SELECT end_day, time, contents, dayornight, 'Vision1'::text AS station
+        SELECT end_day, end_time, contents, 'Vision1'::text AS station
         FROM {VISION1_TABLE}
-        ORDER BY end_day, time;
+        ORDER BY end_day, end_time;
     """)
     q2 = text(f"""
-        SELECT end_day, time, contents, dayornight, 'Vision2'::text AS station
+        SELECT end_day, end_time, contents, 'Vision2'::text AS station
         FROM {VISION2_TABLE}
-        ORDER BY end_day, time;
+        ORDER BY end_day, end_time;
     """)
 
     df_v1 = pd.read_sql(q1, engine)
@@ -199,7 +206,7 @@ def main():
 
     # 교대 경계 제외 + 정렬
     df = filter_shift_boundary(df)
-    df = df.sort_values(["station", "end_day", "time"]).reset_index(drop=True)
+    df = df.sort_values(["station", "end_day", "end_time"]).reset_index(drop=True)
 
     # (station, end_day) 그룹 생성
     group_items = [((st, day), g.copy()) for (st, day), g in df.groupby(["station", "end_day"], sort=False)]
@@ -212,9 +219,8 @@ def main():
     # 결과 합치기
     flat_rows = [r for sub in results for r in sub]
     if not flat_rows:
-        # 결과가 없으면 테이블은 만들되 empty로 끝냄(원치 않으면 여기서 return 처리)
         result_df = pd.DataFrame(columns=[
-            "id", "end_day", "station", "dayornight",
+            "id", "end_day", "station",
             "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
         ])
     else:
@@ -230,14 +236,13 @@ def main():
         result_df = result_df.reset_index(drop=True)
         result_df.insert(0, "id", result_df.index + 1)
 
-    # DROP → CREATE
+    # DROP → CREATE (변경: dayornight 제거)
     drop_sql = f"DROP TABLE IF EXISTS {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME};"
     create_sql = f"""
     CREATE TABLE {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (
         id            INTEGER,
         end_day       CHAR(8),
         station       TEXT,
-        dayornight    TEXT,
         from_contents TEXT,
         from_time     TEXT,
         to_contents   TEXT,
@@ -260,7 +265,6 @@ def main():
             index=False
         )
 
-    # 로그는 최소만
     print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows={len(result_df)})")
 
 

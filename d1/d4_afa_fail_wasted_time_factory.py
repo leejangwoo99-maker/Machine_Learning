@@ -5,12 +5,18 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 (실시간 루프)
 - 이벤트: NG_TEXT(제품 감지 NG) -> OFF_TEXT(제품 검사 투입요구 ON)
 - Manual mode 전환 ~ Auto mode 전환 구간에서는 NG 무시
 - 결과: d1_machine_log.afa_fail_wasted_time (replace)
-요구사항 추가:
+
+요구사항:
 1) 1초마다 재실행 무한루프
 2) 멀티프로세스 2개 고정
 3) end_day = 오늘 날짜만
 4) 지정 컬럼 중복 제거 (SELECT DISTINCT 효과)
 5) 실시간: 현재시간 기준 120초 이내 데이터만 처리
+
+[변경사항(요청 반영)]
+- dayornight 컬럼/속성값 완전 삭제
+- time 컬럼 -> end_time 컬럼으로 변경
+- 결과 테이블에서도 from_dorn / to_dorn 제거
 """
 
 import os
@@ -77,37 +83,41 @@ def get_engine(config=DB_CONFIG):
 # ============================================
 # 2. FCT 로그 로드 (프로세스 단위 실행)
 #    - 오늘 날짜 + 최근 120초 + 이벤트 텍스트만 DB에서 필터링
+#    - (변경) time -> end_time, dayornight 제거
 # ============================================
 def load_fct_log_mp(args):
     table_name, station_label, db_config, schema_name, realtime_window_sec, force_cutoff_ts = args
     engine = get_engine(db_config)
 
-    # end_day(YYYYMMDD) + time 을 timestamp로 조합
-    # - end_day: int/str 모두 대응 위해 end_day::text 사용
-    # - time: 컬럼명이 time 이므로 충돌 방지를 위해 "time" 로 명시
+    # end_day(YYYYMMDD) + end_time 을 timestamp로 조합
+    # - end_day: int/str 혼재 대응 위해 end_day::text 사용
+    # - end_time: TIME 컬럼인 경우 캐스팅 필요 (end_time::time)
     #
     # 조건:
     #  (3) end_day = CURRENT_DATE
     #  (5) ts >= NOW() - interval '120 seconds'  (또는 FORCE_CUTOFF_TS 있으면 그 기준)
-    #
-    # FORCE_CUTOFF_TS가 있으면: to_timestamp(force_cutoff_ts) 기준
     if force_cutoff_ts is None:
-        ts_filter = f"(to_date(end_day::text,'YYYYMMDD') + \"time\"::time) >= (now() - interval '{int(realtime_window_sec)} seconds')"
+        ts_filter = (
+            f"(to_date(end_day::text,'YYYYMMDD') + end_time::time) "
+            f">= (now() - interval '{int(realtime_window_sec)} seconds')"
+        )
     else:
-        ts_filter = f"(to_date(end_day::text,'YYYYMMDD') + \"time\"::time) >= to_timestamp({float(force_cutoff_ts)})"
+        ts_filter = (
+            f"(to_date(end_day::text,'YYYYMMDD') + end_time::time) "
+            f">= to_timestamp({float(force_cutoff_ts)})"
+        )
 
     sql = f"""
         SELECT
             end_day,
-            "time" as time,
-            contents,
-            dayornight
+            end_time,
+            contents
         FROM {schema_name}."{table_name}"
         WHERE
             to_date(end_day::text,'YYYYMMDD') = CURRENT_DATE
             AND contents IN (%(ng)s, %(off)s, %(manual)s, %(auto)s)
             AND {ts_filter}
-        ORDER BY end_day ASC, "time" ASC
+        ORDER BY end_day ASC, end_time ASC
     """
 
     df = pd.read_sql(
@@ -132,12 +142,12 @@ def load_all_fct_logs_multiprocess(max_workers=MAX_WORKERS) -> pd.DataFrame:
             dfs.append(f.result())
 
     if not dfs:
-        return pd.DataFrame(columns=["end_day", "time", "contents", "dayornight", "station"])
+        return pd.DataFrame(columns=["end_day", "end_time", "contents", "station"])
 
     df_all = pd.concat(dfs, ignore_index=True)
 
-    # 혹시 모를 안전장치: 파이썬에서도 time 파싱 실패행 제거
-    df_all = df_all.dropna(subset=["end_day", "time", "contents", "station"])
+    # 안전장치: 필수 컬럼 결측 제거
+    df_all = df_all.dropna(subset=["end_day", "end_time", "contents", "station"])
     return df_all
 
 
@@ -145,34 +155,33 @@ def load_all_fct_logs_multiprocess(max_workers=MAX_WORKERS) -> pd.DataFrame:
 # 3. 계산 로직
 # ============================================
 def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
+    base_cols = [
+        "id", "end_day", "station",
+        "from_contents", "from_time",
+        "to_contents", "to_time",
+        "wasted_time",
+    ]
+
     if df_all.empty:
-        return pd.DataFrame(
-            columns=[
-                "id", "end_day", "station",
-                "from_contents", "from_time", "from_dorn",
-                "to_contents", "to_time", "to_dorn",
-                "wasted_time",
-            ]
-        )
+        return pd.DataFrame(columns=base_cols)
 
     # 이벤트만 필터링(이미 SQL에서 제한했지만 안전)
     df_evt = df_all[df_all["contents"].isin([NG_TEXT, OFF_TEXT, MANUAL_TEXT, AUTO_TEXT])].copy()
 
-    # 정렬: 같은 end_day 내 station별 time 순
-    df_evt = df_evt.sort_values(["end_day", "station", "time"]).reset_index(drop=True)
+    # 정렬: 같은 end_day 내 station별 end_time 순
+    df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
 
     result_rows = []
 
     for (end_day, station), grp in df_evt.groupby(["end_day", "station"], sort=False):
         pending_from_ts = None
-        pending_from_dorn = None
         in_manual = False
 
         for _, row in grp.iterrows():
             contents = row["contents"]
-            t = row["time"]
-            dorn = row["dayornight"]
+            t = row["end_time"]
 
+            # end_day(YYYYMMDD) + end_time 로 timestamp 생성
             ts = pd.to_datetime(f"{str(end_day)} {str(t)}", errors="coerce")
             if pd.isna(ts):
                 continue
@@ -189,9 +198,9 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
             if contents == NG_TEXT:
                 if in_manual:
                     continue
+                # 연속 NG면 첫 NG만 유지
                 if pending_from_ts is None:
                     pending_from_ts = ts
-                    pending_from_dorn = dorn
                 continue
 
             # OFF
@@ -209,38 +218,31 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
                         "station": station,
                         "from_contents": NG_TEXT,
                         "from_time": from_str,
-                        "from_dorn": pending_from_dorn,
                         "to_contents": OFF_TEXT,
                         "to_time": to_str,
-                        "to_dorn": dorn,
                         "wasted_time": wasted,
                     }
                 )
 
                 pending_from_ts = None
-                pending_from_dorn = None
 
     df_wasted = pd.DataFrame(result_rows)
 
     # (4) 지정 컬럼 기준 중복 제거 (SELECT DISTINCT 효과)
     distinct_cols = [
         "end_day", "station",
-        "from_contents", "from_time", "from_dorn",
-        "to_contents", "to_time", "to_dorn",
+        "from_contents", "from_time",
+        "to_contents", "to_time",
     ]
+
     if not df_wasted.empty:
         df_wasted = df_wasted.drop_duplicates(subset=distinct_cols, keep="first")
         df_wasted = df_wasted.sort_values(["end_day", "station", "from_time"]).reset_index(drop=True)
         df_wasted.insert(0, "id", range(1, len(df_wasted) + 1))
+        # 컬럼 순서 고정
+        df_wasted = df_wasted[base_cols]
     else:
-        df_wasted = pd.DataFrame(
-            columns=[
-                "id", "end_day", "station",
-                "from_contents", "from_time", "from_dorn",
-                "to_contents", "to_time", "to_dorn",
-                "wasted_time",
-            ]
-        )
+        df_wasted = pd.DataFrame(columns=base_cols)
 
     return df_wasted
 

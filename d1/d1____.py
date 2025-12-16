@@ -1,11 +1,14 @@
 # fct_machine_log_parser_mp.py
 # ============================================
 # FCT 머신 로그 파싱 + PostgreSQL 적재 (멀티프로세스 파싱)
+# - 주/야간 로직 제거
+# - dayornight 컬럼 제거
+# - end_day는 파일명(YYYYMMDD) 기준으로만 저장
 # ============================================
 
 import re
 from pathlib import Path
-from datetime import datetime, time, timedelta
+from datetime import datetime
 from multiprocessing import Pool, cpu_count, freeze_support
 
 import pandas as pd
@@ -15,10 +18,10 @@ import urllib.parse
 # ============================================
 # 1. 기본 설정
 # ============================================
-BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
+BASE_LOG_DIR = Path(r"C:\Users\user\Desktop\machinlog\FCT")
 
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "localhost",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -34,12 +37,6 @@ TABLE_BY_STATION = {
     "FCT3": '"FCT3_machine_log"',
     "FCT4": '"FCT4_machine_log"',
 }
-
-# 주/야간 기준
-DAY_START = time(8, 30, 0)
-DAY_END   = time(20, 29, 59)
-NIGHT_START = time(20, 30, 0)
-NIGHT_END_EARLY = time(8, 29, 59)
 
 # 파일명 패턴 (YYYYMMDD_FCT1~4_Machine_Log, YYYYMMDD_PDI1~4_Machine_Log 모두 허용)
 FILENAME_PATTERN = re.compile(r"(\d{8})_(FCT|PDI)([1-4])_Machine_Log", re.IGNORECASE)
@@ -71,9 +68,8 @@ def get_engine(config=DB_CONFIG):
 CREATE_TABLE_TEMPLATE = """
 CREATE TABLE IF NOT EXISTS {schema}.{table} (
     id          BIGSERIAL PRIMARY KEY,
-    end_day     VARCHAR(8),   -- yyyymmdd
+    end_day     VARCHAR(8),   -- yyyymmdd (파일명 기준)
     station     VARCHAR(10),  -- FCT1~4
-    dayornight  VARCHAR(10),  -- day / night
     time        TIME,         -- hh:mi:ss.ss
     contents    VARCHAR(75)   -- 최대 75글자
 );
@@ -92,45 +88,22 @@ def ensure_schema_and_tables(engine):
 
 
 # ============================================
-# 3. 주간/야간 & end_day 계산
-# ============================================
-def get_shift_and_endday(file_ymd: str, t: time):
-    """
-    file_ymd : 파일명 기준 날짜 (YYYYMMDD)
-    t        : 라인에서 추출한 시간
-    반환값   : (end_day(문자열 YYYYMMDD), dayornight 'day'/'night')
-    """
-    file_date = datetime.strptime(file_ymd, "%Y%m%d").date()
-
-    if DAY_START <= t <= DAY_END:
-        return file_ymd, "day"
-
-    if t >= NIGHT_START:
-        return file_ymd, "night"
-
-    if t <= NIGHT_END_EARLY:
-        prev = file_date - timedelta(days=1)
-        return prev.strftime("%Y%m%d"), "night"
-
-    return file_ymd, "day"
-
-
-# ============================================
-# 4. contents 정리 (특수문자 제거 + 75자리 제한)
+# 3. contents 정리 (공백 정리 + 75자리 제한)
 # ============================================
 def clean_contents(raw: str, max_len: int = 75) -> str:
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    s = s.strip()
+    s = " ".join(s.split())  # 연속 공백 정리
     return s[:max_len]
 
 
 # ============================================
-# 5. 단일 로그 파일 파싱 (멀티프로세스용: top-level 함수)
+# 4. 단일 로그 파일 파싱 (멀티프로세스용: top-level 함수)
 # ============================================
 def parse_machine_log_file(path_str: str):
     """
     한 개의 로그 파일을 파싱해서
-    [{'end_day', 'station', 'dayornight', 'time', 'contents'}, ...] 리스트 반환
+    [{'end_day', 'station', 'time', 'contents'}, ...] 리스트 반환
+    - end_day는 파일명 YYYYMMDD 그대로 저장
     """
     path = Path(path_str)
 
@@ -138,7 +111,7 @@ def parse_machine_log_file(path_str: str):
     if not m:
         return []
 
-    file_ymd = m.group(1)        # YYYYMMDD
+    file_ymd = m.group(1)        # YYYYMMDD (파일명 기준 날짜)
     no = m.group(3)              # '1'~'4'
     station = f"FCT{no}"         # PDI1~4도 FCT1~4로 취급
 
@@ -160,14 +133,12 @@ def parse_machine_log_file(path_str: str):
                 except ValueError:
                     continue
 
-                end_day, dayornight = get_shift_and_endday(file_ymd, t)
                 contents = clean_contents(contents_raw)
 
                 rows.append(
                     {
-                        "end_day": end_day,
+                        "end_day": file_ymd,   # ✅ 파일명 기준으로만 저장
                         "station": station,
-                        "dayornight": dayornight,
                         "time": t,
                         "contents": contents,
                     }
@@ -180,7 +151,7 @@ def parse_machine_log_file(path_str: str):
 
 
 # ============================================
-# 6. yyyy/mm 폴더만 순회하며 파일 목록 수집
+# 5. yyyy/mm 폴더만 순회하며 파일 목록 수집
 # ============================================
 def list_target_files():
     files = []
@@ -240,7 +211,7 @@ def collect_all_rows_multiprocess(file_list):
 
 
 # ============================================
-# 7. DB INSERT (end_day 오름차순, day > night, time 오름차순)
+# 6. DB INSERT (end_day 오름차순, time 오름차순)
 # ============================================
 def insert_to_db(engine, data_by_station):
     with engine.begin() as conn:
@@ -251,12 +222,10 @@ def insert_to_db(engine, data_by_station):
 
             df = pd.DataFrame(rows)
 
-            # day → night 순으로 정렬 (요구사항 유지)
-            df["dayornight"] = pd.Categorical(df["dayornight"], ["day", "night"], ordered=True)
-
+            # ✅ dayornight 정렬 제거: end_day + time만
             df.sort_values(
-                by=["end_day", "dayornight", "time"],
-                ascending=[True, True, True],
+                by=["end_day", "time"],
+                ascending=[True, True],
                 inplace=True,
             )
 
@@ -265,8 +234,8 @@ def insert_to_db(engine, data_by_station):
 
             insert_sql = text(
                 f"""
-                INSERT INTO {full_table} (end_day, station, dayornight, time, contents)
-                VALUES (:end_day, :station, :dayornight, :time, :contents)
+                INSERT INTO {full_table} (end_day, station, time, contents)
+                VALUES (:end_day, :station, :time, :contents)
                 """
             )
 
@@ -275,7 +244,7 @@ def insert_to_db(engine, data_by_station):
 
 
 # ============================================
-# 8. main
+# 7. main
 # ============================================
 def main():
     engine = get_engine()
@@ -289,6 +258,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # Windows 멀티프로세스 필수
     freeze_support()
     main()

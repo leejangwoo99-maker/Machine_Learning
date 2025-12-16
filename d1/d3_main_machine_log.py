@@ -1,7 +1,7 @@
 # main_machine_log_parser_multiprocess.py
 import re
 from pathlib import Path
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count, freeze_support
 
@@ -25,13 +25,10 @@ DB_CONFIG = {
 SCHEMA_NAME = "d1_machine_log"
 TABLE_NAME  = "Main_machine_log"
 
-DAY_START = dtime(8, 30, 0)     # 08:30:00
-DAY_END   = dtime(20, 29, 59)   # 20:29:59
-
 # [hh:mi:ss.ss] (내용)
 LINE_PATTERN = re.compile(r'^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$')
 
-# 파일명 패턴
+# 파일명 패턴: 20251101_Main_Machine_Log.txt
 FILE_PATTERN = re.compile(r"^\d{8}_Main_Machine_Log\.txt$")
 
 
@@ -46,36 +43,12 @@ def get_engine(config=DB_CONFIG):
     return create_engine(conn_str)
 
 
-def classify_shift(file_date: date, t: dtime):
-    """
-    주/야간 및 end_day 결정
-
-    - day : 파일 날짜, 08:30:00 ~ 20:29:59
-    - night(저녁) : 파일 날짜, 20:30:00 ~ 23:59:59
-    - night(새벽) : 파일 날짜의 다음날 로그 00:00:00 ~ 08:29:59 → end_day = 파일 날짜 - 1일
-    """
-    if DAY_START <= t <= DAY_END:
-        end_day = file_date
-        dayornight = "day"
-    elif dtime(20, 30, 0) <= t <= dtime(23, 59, 59):
-        end_day = file_date
-        dayornight = "night"
-    elif dtime(0, 0, 0) <= t <= dtime(8, 29, 59):
-        end_day = file_date - timedelta(days=1)
-        dayornight = "night"
-    else:
-        end_day = file_date
-        dayornight = "night"
-
-    end_day_str = end_day.strftime("%Y%m%d")
-    return end_day_str, dayornight
-
-
 def parse_main_log_file(file_path_str: str):
     """
     워커 프로세스에서 실행될 함수.
-    - 입력은 Path 객체 대신 str로 받는 것을 권장(피클 안정성)
-    - 반환: list[dict]
+    - end_day: 파일명(YYYYMMDD) 그대로 저장
+    - end_time: 라인에서 추출한 time_str 저장
+    - dayornight 없음
     """
     file_path = Path(file_path_str)
 
@@ -83,8 +56,7 @@ def parse_main_log_file(file_path_str: str):
     if not m:
         return []
 
-    yyyymmdd = m.group(1)
-    file_date = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    file_ymd = m.group(1)  # YYYYMMDD (파일명 기준)
 
     records = []
     try:
@@ -95,40 +67,40 @@ def parse_main_log_file(file_path_str: str):
                 if not match:
                     continue
 
-                time_str = match.group(1)
+                end_time_str = match.group(1)
                 contents_raw = match.group(2)
 
+                # 시간 포맷 검증(유효하지 않으면 skip)
                 try:
-                    t_obj = datetime.strptime(time_str, "%H:%M:%S.%f").time()
+                    _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
                 except ValueError:
                     continue
-
-                end_day_str, dayornight = classify_shift(file_date, t_obj)
 
                 contents = contents_raw.replace("\x00", "").strip()[:75]
 
                 records.append(
                     {
-                        "end_day": end_day_str,
+                        "end_day": file_ymd,
                         "station": "Main",
-                        "dayornight": dayornight,
-                        "time": time_str,
+                        "end_time": end_time_str,  # time -> end_time
                         "contents": contents,
                     }
                 )
-    except Exception as e:
-        # 파일 단위 예외는 잡고 빈 리스트 반환(전체 작업 중단 방지)
+    except Exception:
         return []
 
     return records
 
 
 def collect_target_files(base_dir: Path):
-    # """
-    # C:\...\Main\yyyy\mm\ 아래에서
-    # 20251101_Main_Machine_Log.txt 만 수집
-    # """
+    """
+    base_dir\\YYYY\\MM\\ 아래에서
+    20251101_Main_Machine_Log.txt 패턴만 수집
+    """
     targets = []
+    if not base_dir.exists():
+        return targets
+
     for year_dir in sorted(base_dir.iterdir()):
         if not (year_dir.is_dir() and year_dir.name.isdigit() and len(year_dir.name) == 4):
             continue
@@ -147,11 +119,23 @@ def collect_target_files(base_dir: Path):
     return targets
 
 
-def main():
-    engine = get_engine()
-
+def ensure_schema_and_table(engine):
+    create_table_sql = f"""
+    CREATE TABLE IF NOT EXISTS "{SCHEMA_NAME}"."{TABLE_NAME}" (
+        end_day     VARCHAR(8),    -- yyyymmdd (파일명 기준)
+        station     VARCHAR(10),   -- Main
+        end_time    VARCHAR(12),   -- hh:mi:ss.ss
+        contents    VARCHAR(75)
+    );
+    """
     with engine.begin() as conn:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA_NAME}"'))
+        conn.execute(text(create_table_sql))
+
+
+def main():
+    engine = get_engine()
+    ensure_schema_and_table(engine)
 
     # 1) 대상 파일 수집
     target_files = collect_target_files(BASE_DIR)
@@ -161,7 +145,7 @@ def main():
         return
 
     # 2) 멀티프로세스 파싱
-    max_workers = max(1, cpu_count() - 1)  # 과부하 방지(원하면 cpu_count()로)
+    max_workers = max(1, cpu_count() - 1)  # 과부하 방지
     print(f"[INFO] 멀티프로세스 workers: {max_workers}")
 
     all_records = []
@@ -189,10 +173,8 @@ def main():
 
     # 3) 정렬 & DB 적재(메인 프로세스에서만)
     df = pd.DataFrame(all_records)
-
-    df["day_order"] = df["dayornight"].map({"day": 0, "night": 1}).fillna(1).astype(int)
-    df = df.sort_values(by=["end_day", "day_order", "time"]).reset_index(drop=True)
-    df = df[["end_day", "station", "dayornight", "time", "contents"]]
+    df = df.sort_values(by=["end_day", "end_time"]).reset_index(drop=True)
+    df = df[["end_day", "station", "end_time", "contents"]]
 
     print("[INFO] Sample head:")
     print(df.head(5).to_string(index=False))
@@ -204,7 +186,7 @@ def main():
         if_exists="replace",  # 누적이면 "append"
         index=False,
         method="multi",
-        chunksize=2000,       # 상황에 따라 1000~10000 조절
+        chunksize=2000,
     )
     print(f"[DONE] {SCHEMA_NAME}.{TABLE_NAME} 테이블에 {len(df)}건 적재 완료")
 

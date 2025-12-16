@@ -5,6 +5,11 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트
 - 이벤트: NG_TEXT(제품 감지 NG) -> OFF_TEXT(제품 검사 투입요구 ON)
 - Manual mode 전환 ~ Auto mode 전환 구간에서는 NG 무시
 - 결과: d1_machine_log.afa_fail_wasted_time (replace)
+
+[변경사항]
+- dayornight 컬럼 제거
+- time 컬럼 -> end_time 컬럼으로 변경
+- 결과 테이블에서도 from_dorn / to_dorn 제거
 """
 
 import os
@@ -62,17 +67,16 @@ def get_engine(config=DB_CONFIG):
 # ============================================
 def load_fct_log_mp(args):
     table_name, station_label, db_config, schema_name = args
-
     engine = get_engine(db_config)
 
+    # (변경) time -> end_time, dayornight 제거
     sql = f"""
         SELECT
             end_day,
-            time,
-            contents,
-            dayornight
+            end_time,
+            contents
         FROM {schema_name}."{table_name}"
-        ORDER BY end_day ASC, time ASC
+        ORDER BY end_day ASC, end_time ASC
     """
     df = pd.read_sql(sql, engine)
     df["station"] = station_label
@@ -80,20 +84,18 @@ def load_fct_log_mp(args):
 
 
 def load_all_fct_logs_multiprocess(max_workers=None) -> pd.DataFrame:
-    tasks = [
-        (t, s, DB_CONFIG, SCHEMA_MACHINE)
-        for t, s in TABLES_FCT
-    ]
+    tasks = [(t, s, DB_CONFIG, SCHEMA_MACHINE) for t, s in TABLES_FCT]
 
     dfs = []
-    # max_workers 미지정이면 CPU 코어수 기반으로 동작
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(load_fct_log_mp, task) for task in tasks]
         for f in as_completed(futs):
             dfs.append(f.result())
 
-    df_all = pd.concat(dfs, ignore_index=True)
-    return df_all
+    if not dfs:
+        return pd.DataFrame(columns=["end_day", "end_time", "contents", "station"])
+
+    return pd.concat(dfs, ignore_index=True)
 
 
 # ============================================
@@ -103,26 +105,23 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
     # 이벤트만 필터링
     df_evt = df_all[df_all["contents"].isin([NG_TEXT, OFF_TEXT, MANUAL_TEXT, AUTO_TEXT])].copy()
 
-    # 정렬
-    df_evt = df_evt.sort_values(["end_day", "station", "time"]).reset_index(drop=True)
+    # 정렬 (변경: end_time 기준)
+    df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
 
     result_rows = []
 
     # end_day, station 단위 처리
     for (end_day, station), grp in df_evt.groupby(["end_day", "station"], sort=False):
         pending_from_ts = None
-        pending_from_dorn = None
         in_manual = False
 
         for _, row in grp.iterrows():
             contents = row["contents"]
-            t = row["time"]
-            dorn = row["dayornight"]
+            t = row["end_time"]
 
             # end_day는 20251001 같은 정수/문자일 수 있으므로 문자열로 안전 변환
             ts = pd.to_datetime(f"{str(end_day)} {str(t)}", errors="coerce")
             if pd.isna(ts):
-                # 시간 파싱이 실패하면 스킵
                 continue
 
             # Manual / Auto 상태
@@ -141,7 +140,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
                 # 연속 NG면 첫 NG만 유지
                 if pending_from_ts is None:
                     pending_from_ts = ts
-                    pending_from_dorn = dorn
                 continue
 
             # OFF 처리 (pending NG가 있을 때만 페어링)
@@ -160,16 +158,13 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
                         "station": station,
                         "from_contents": NG_TEXT,
                         "from_time": from_str,
-                        "from_dorn": pending_from_dorn,
                         "to_contents": OFF_TEXT,
                         "to_time": to_str,
-                        "to_dorn": dorn,
                         "wasted_time": wasted,
                     }
                 )
 
                 pending_from_ts = None
-                pending_from_dorn = None
 
     df_wasted = pd.DataFrame(result_rows)
 
@@ -181,8 +176,8 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
         df_wasted = pd.DataFrame(
             columns=[
                 "id", "end_day", "station",
-                "from_contents", "from_time", "from_dorn",
-                "to_contents", "to_time", "to_dorn",
+                "from_contents", "from_time",
+                "to_contents", "to_time",
                 "wasted_time",
             ]
         )

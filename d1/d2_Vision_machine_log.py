@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 # ============================================
 # Vision Machine Log Parser (Multiprocessing)
+# - 주/야간 로직 제거
+# - dayornight 컬럼 제거
+# - time 컬럼 -> end_time 컬럼으로 변경
+# - end_day는 파일명(YYYYMMDD) 기준으로만 저장
 # ============================================
 
 import re
 from pathlib import Path
-from datetime import datetime, date, timedelta, time as dt_time
+from datetime import datetime
 from multiprocessing import Pool, cpu_count, freeze_support
 
 import pandas as pd
@@ -55,10 +59,9 @@ def ensure_schema_tables(engine):
 
         ddl_template = """
         CREATE TABLE IF NOT EXISTS {schema}."{table}" (
-            end_day     VARCHAR(8),
-            station     VARCHAR(10),
-            dayornight  VARCHAR(10),
-            time        VARCHAR(12),
+            end_day     VARCHAR(8),     -- yyyymmdd (파일명 기준)
+            station     VARCHAR(10),    -- Vision1 / Vision2
+            end_time    VARCHAR(12),    -- hh:mi:ss.ss (문자열)
             contents    VARCHAR(200)
         )
         """
@@ -69,35 +72,15 @@ def ensure_schema_tables(engine):
 
 
 # ============================================
-# 4. Day/Night 판정
+# 4. 파일 파싱 유틸
 # ============================================
-def classify_day_night(file_date: date, t: dt_time):
-    t_day_start = dt_time(8, 30, 0)
-    t_day_end = dt_time(20, 29, 59, 999999)
-    t_night_start = dt_time(20, 30, 0)
-    t_night_end = dt_time(23, 59, 59, 999999)
-    t_morning_end = dt_time(8, 29, 59, 999999)
-
-    if t_day_start <= t <= t_day_end:
-        return file_date.strftime("%Y%m%d"), "day"
-    elif t_night_start <= t <= t_night_end:
-        return file_date.strftime("%Y%m%d"), "night"
-    elif dt_time(0, 0, 0) <= t <= t_morning_end:
-        prev_date = file_date - timedelta(days=1)
-        return prev_date.strftime("%Y%m%d"), "night"
-
-    return file_date.strftime("%Y%m%d"), "day"
+LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
 
 
-# ============================================
-# 5. 파일 파싱 유틸
-# ============================================
-line_pattern = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
-
-
-def clean_contents(raw: str, max_len: int = 75):
-    cleaned = "".join(ch for ch in raw if ch.isprintable())
-    return cleaned[:max_len].strip()
+def clean_contents(raw: str, max_len: int = 200):
+    s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = " ".join(s.split())  # 연속 공백 정리
+    return s[:max_len].strip()
 
 
 def _open_text_file(path: Path):
@@ -113,38 +96,39 @@ def _open_text_file(path: Path):
 def parse_machine_log_file(file_path: Path, station: str):
     """
     파일명 예: 20251001_Vision1_Machine_Log
+    - end_day: 파일명 YYYYMMDD 그대로 저장
+    - end_time: 라인에서 추출한 time_str 그대로 저장
     """
     m = re.search(r"(\d{8})_Vision[12]_Machine_Log", file_path.name)
     if not m:
         return []
 
-    file_date = datetime.strptime(m.group(1), "%Y%m%d").date()
-    result = []
+    file_ymd = m.group(1)  # YYYYMMDD (파일명 기준)
 
+    result = []
     with _open_text_file(file_path) as f:
         for line in f:
             line = line.rstrip("\n")
-            m2 = line_pattern.match(line)
+            m2 = LINE_PATTERN.match(line)
             if not m2:
                 continue
 
-            time_str = m2.group(1)
+            end_time_str = m2.group(1)
             contents_raw = m2.group(2)
 
+            # 시간 포맷 검증(유효하지 않으면 skip)
             try:
-                t = datetime.strptime(time_str, "%H:%M:%S.%f").time()
+                _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
             except ValueError:
                 continue
 
-            end_day, dayornight = classify_day_night(file_date, t)
-            contents = clean_contents(contents_raw)
+            contents = clean_contents(contents_raw, max_len=200)
 
             result.append(
                 {
-                    "end_day": end_day,
+                    "end_day": file_ymd,
                     "station": station,
-                    "dayornight": dayornight,
-                    "time": time_str,
+                    "end_time": end_time_str,   # time -> end_time
                     "contents": contents,
                 }
             )
@@ -153,7 +137,7 @@ def parse_machine_log_file(file_path: Path, station: str):
 
 
 # ============================================
-# 6. 전체 파일 탐색
+# 5. 전체 파일 탐색
 # ============================================
 def iter_log_files(base_dir: Path):
     """
@@ -169,21 +153,14 @@ def iter_log_files(base_dir: Path):
                 continue
 
             for file_path in sorted(month_dir.iterdir()):
-                if (
-                    file_path.is_file()
-                    and re.match(r"\d{8}_Vision[12]_Machine_Log", file_path.name)
-                ):
+                if file_path.is_file() and re.match(r"\d{8}_Vision[12]_Machine_Log", file_path.name):
                     yield file_path
 
 
 # ============================================
-# 7. 멀티프로세스 워커
+# 6. 멀티프로세스 워커
 # ============================================
 def worker_parse_one(file_path_str: str):
-    """
-    Pool 워커 함수는 pickle 가능해야 하므로,
-    Path 대신 str로 받고 내부에서 Path 복원.
-    """
     file_path = Path(file_path_str)
 
     if "_Vision1_" in file_path.name:
@@ -193,21 +170,19 @@ def worker_parse_one(file_path_str: str):
     else:
         return []
 
-    rows = parse_machine_log_file(file_path, station)
-    return rows
+    return parse_machine_log_file(file_path, station)
 
 
 # ============================================
-# 8. DB Insert
+# 7. DB Insert
 # ============================================
 def insert_to_db(engine, df: pd.DataFrame):
     if df.empty:
         print("[WARN] DataFrame empty. Nothing to insert.")
         return
 
-    # 정렬(원하시는 기준 유지)
-    df["dayornight"] = pd.Categorical(df["dayornight"], ["day", "night"], ordered=True)
-    df = df.sort_values(["end_day", "dayornight", "time"]).reset_index(drop=True)
+    # 정렬: end_day 오름차순, end_time 오름차순
+    df = df.sort_values(["end_day", "end_time"]).reset_index(drop=True)
 
     with engine.begin() as conn:
         for st, tbl in TABLE_MAP.items():
@@ -215,7 +190,6 @@ def insert_to_db(engine, df: pd.DataFrame):
             if sub.empty:
                 continue
 
-            # to_sql 성능 옵션: method="multi" + chunksize
             sub.to_sql(
                 tbl,
                 schema=SCHEMA_NAME,
@@ -229,7 +203,7 @@ def insert_to_db(engine, df: pd.DataFrame):
 
 
 # ============================================
-# 9. main
+# 8. main
 # ============================================
 def main():
     engine = get_engine()
@@ -242,7 +216,6 @@ def main():
         print("[DONE] No files.")
         return
 
-    # 멀티프로세스 개수(PC 상황에 따라 조정)
     nproc = max(1, cpu_count() - 1)
     print(f"[INFO] Using multiprocessing: {nproc} processes")
 
@@ -255,11 +228,8 @@ def main():
             if rows:
                 all_records.extend(rows)
 
-            # 진행 로그(과도한 출력 방지)
             if parsed_files % 20 == 0 or parsed_files == len(files):
-                print(
-                    f"[PROGRESS] files={parsed_files}/{len(files)}, total_rows={len(all_records)}"
-                )
+                print(f"[PROGRESS] files={parsed_files}/{len(files)}, total_rows={len(all_records)}")
 
     print(f"[INFO] Total parsed rows = {len(all_records)}")
 
@@ -268,9 +238,7 @@ def main():
         print("[DONE] Parsed 0 rows.")
         return
 
-    # DB 적재
     insert_to_db(engine, df)
-
     print("[DONE] Vision Machine Log Parsing Completed")
 
 

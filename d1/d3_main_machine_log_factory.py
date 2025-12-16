@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 # ============================================
-# Main Machine Log Parser (Realtime / MP=2)
+# Main Machine Log Parser (Realtime / MP=2 / Dedup / TodayOnly)
+# - 주/야간 로직 제거
+# - dayornight 컬럼 제거
+# - time 컬럼 -> end_time 컬럼으로 변경
+# - end_day는 파일명(YYYYMMDD) 기준으로만 저장
+# - 오늘 파일(YYYYMMDD==오늘)만 처리
+# - (end_day, station, end_time, contents) 중복 방지 (UNIQUE INDEX + ON CONFLICT DO NOTHING)
+# - 현재시간 기준 120초 이내 새롭게 추가/수정된 파일만 처리(mtime 기준)
 # ============================================
 
 import re
 import time as time_mod
 from pathlib import Path
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import datetime
 from multiprocessing import Pool, freeze_support
 
 import pandas as pd
@@ -29,9 +36,6 @@ DB_CONFIG = {
 
 SCHEMA_NAME = "d1_machine_log"
 TABLE_NAME  = "Main_machine_log"
-
-DAY_START = dtime(8, 30, 0)
-DAY_END   = dtime(20, 29, 59)
 
 LINE_PATTERN = re.compile(r'^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$')
 FILE_PATTERN = re.compile(r"(\d{8})_Main_Machine_Log\.txt$", re.IGNORECASE)
@@ -71,10 +75,9 @@ def ensure_schema_table(engine):
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS "{SCHEMA_NAME}"."{TABLE_NAME}" (
                 id BIGSERIAL PRIMARY KEY,
-                end_day     VARCHAR(8),
-                station     VARCHAR(10),
-                dayornight  VARCHAR(10),
-                time        VARCHAR(12),
+                end_day     VARCHAR(8),     -- yyyymmdd (파일명 기준)
+                station     VARCHAR(10),    -- Main
+                end_time    VARCHAR(12),    -- hh:mi:ss.ss
                 contents    VARCHAR(75)
             )
         """))
@@ -82,38 +85,32 @@ def ensure_schema_table(engine):
         conn.execute(text(f"""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_{TABLE_NAME.lower()}_dedup
             ON "{SCHEMA_NAME}"."{TABLE_NAME}"
-            (end_day, station, dayornight, time, contents)
+            (end_day, station, end_time, contents)
         """))
 
     print("[INFO] Schema / table / unique index ready")
 
 
 # =========================
-# 4. 주 / 야간 판정
-# =========================
-def classify_shift(file_date: date, t: dtime):
-    if DAY_START <= t <= DAY_END:
-        return file_date.strftime("%Y%m%d"), "day"
-    elif dtime(20, 30, 0) <= t <= dtime(23, 59, 59):
-        return file_date.strftime("%Y%m%d"), "night"
-    elif dtime(0, 0, 0) <= t <= dtime(8, 29, 59):
-        return (file_date - timedelta(days=1)).strftime("%Y%m%d"), "night"
-    else:
-        return file_date.strftime("%Y%m%d"), "night"
-
-
-# =========================
-# 5. 파일 파싱 (워커)
+# 4. 파일 파싱 (워커)
 # =========================
 def parse_main_log_file(path_str: str):
+    """
+    - end_day: 파일명 YYYYMMDD 그대로
+    - end_time: 라인에서 추출한 time_str
+    - 오늘 파일(YYYYMMDD==오늘)만 처리
+    """
     file_path = Path(path_str)
     m = FILE_PATTERN.search(file_path.name)
     if not m:
         return []
 
     file_ymd = m.group(1)
-    file_date = datetime.strptime(file_ymd, "%Y%m%d").date()
     today_ymd = datetime.now().strftime("%Y%m%d")
+
+    # 오늘 파일만
+    if file_ymd != today_ymd:
+        return []
 
     rows = []
     try:
@@ -124,25 +121,20 @@ def parse_main_log_file(path_str: str):
                 if not mm:
                     continue
 
-                time_str, contents_raw = mm.groups()
+                end_time_str, contents_raw = mm.groups()
+
+                # 시간 포맷 검증
                 try:
-                    t = datetime.strptime(time_str, "%H:%M:%S.%f").time()
+                    _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
                 except ValueError:
-                    continue
-
-                end_day, dayornight = classify_shift(file_date, t)
-
-                # (3) 오늘 데이터만
-                if end_day != today_ymd:
                     continue
 
                 contents = contents_raw.replace("\x00", "").strip()[:75]
 
                 rows.append({
-                    "end_day": end_day,
+                    "end_day": file_ymd,
                     "station": "Main",
-                    "dayornight": dayornight,
-                    "time": time_str,
+                    "end_time": end_time_str,   # time -> end_time
                     "contents": contents,
                 })
     except Exception:
@@ -152,11 +144,16 @@ def parse_main_log_file(path_str: str):
 
 
 # =========================
-# 6. 실시간 대상 파일 수집
+# 5. 실시간 대상 파일 수집
 # =========================
 def list_target_files_realtime(base_dir: Path):
     targets = []
+    if not base_dir.exists():
+        print("[WARN] BASE_DIR not found:", base_dir)
+        return targets
+
     cutoff_ts = time_mod.time() - REALTIME_WINDOW_SEC
+    today_ymd = datetime.now().strftime("%Y%m%d")
 
     for year_dir in base_dir.iterdir():
         if not (year_dir.is_dir() and year_dir.name.isdigit()):
@@ -168,6 +165,11 @@ def list_target_files_realtime(base_dir: Path):
 
             for fp in month_dir.iterdir():
                 if not (fp.is_file() and FILE_PATTERN.search(fp.name)):
+                    continue
+
+                # 오늘 파일만
+                m = FILE_PATTERN.search(fp.name)
+                if not m or m.group(1) != today_ymd:
                     continue
 
                 try:
@@ -191,20 +193,19 @@ def list_target_files_realtime(base_dir: Path):
 
 
 # =========================
-# 7. DB INSERT
+# 6. DB INSERT
 # =========================
 def insert_to_db(engine, df: pd.DataFrame):
     if df.empty:
         return
 
-    df["dayornight"] = pd.Categorical(df["dayornight"], ["day", "night"], ordered=True)
-    df = df.sort_values(["end_day", "dayornight", "time"])
+    df = df.sort_values(["end_day", "end_time"])
 
     insert_sql = text(f"""
         INSERT INTO "{SCHEMA_NAME}"."{TABLE_NAME}"
-        (end_day, station, dayornight, time, contents)
-        VALUES (:end_day, :station, :dayornight, :time, :contents)
-        ON CONFLICT (end_day, station, dayornight, time, contents)
+        (end_day, station, end_time, contents)
+        VALUES (:end_day, :station, :end_time, :contents)
+        ON CONFLICT (end_day, station, end_time, contents)
         DO NOTHING
     """)
 
@@ -215,7 +216,7 @@ def insert_to_db(engine, df: pd.DataFrame):
 
 
 # =========================
-# 8. main (1초 무한루프)
+# 7. main (1초 무한루프)
 # =========================
 def main():
     engine = get_engine()
