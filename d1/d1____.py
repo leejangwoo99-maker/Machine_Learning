@@ -18,10 +18,10 @@ import urllib.parse
 # ============================================
 # 1. 기본 설정
 # ============================================
-BASE_LOG_DIR = Path(r"C:\Users\user\Desktop\machinlog\FCT")
+BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")  # 루트
 
 DB_CONFIG = {
-    "host": "localhost",
+    "host": "192.168.108.162",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
