@@ -3,9 +3,14 @@
 FCT OP-CT Boxplot Summary + UPH(병렬합산) 계산 + PostgreSQL 저장 스크립트
 - 실시간 무한루프(1초)
 - 멀티프로세스 2개 고정
-- end_day = 오늘 날짜만
+- end_day = 오늘 날짜 기준 같은 월(YYYYMM)만 처리
+  예) 20251218 -> 2025-12-01 ~ 2026-01-01 미만
 - end_ts 기준 최근 120초 + cutoff_ts 이후만 처리
 - 저장: 테이블 없으면 생성, 있으면 UPSERT로 갱신
+- (추가) 실행 타이밍 2회:
+    1) 08:27:00 ~ 08:29:59 구간에서만 1초 루프 실행
+    2) 20:27:00 ~ 20:29:59 구간에서만 1초 루프 실행
+    (그 외 시간에는 대기)
 
 Source: a1_fct_vision_testlog_txt_processing_history.fct_vision_testlog_txt_processing_history
 Output:
@@ -16,7 +21,7 @@ Output:
 import sys
 import time
 from pathlib import Path
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dtime
 import urllib.parse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -63,6 +68,12 @@ CUTOFF_TS = 1765501841.4473598      # (요청값) epoch seconds
 
 # ===== 멀티프로세스 고정 =====
 MAX_WORKERS = 2
+
+# ===== 실행 타이밍(추가) =====
+RUN_WINDOWS = [
+    (dtime(8, 27, 0),  dtime(8, 29, 59)),
+    (dtime(20, 27, 0), dtime(20, 29, 59)),
+]
 
 
 # =========================
@@ -162,7 +173,11 @@ def upsert_df_psycopg2(df: pd.DataFrame, schema_name: str, table_name: str, key_
     else:
         set_clause = sql.SQL("")
 
-    q = sql.SQL("INSERT INTO {table} ({cols}) VALUES %s ON CONFLICT ({keys}) DO UPDATE SET {set_clause}").format(
+    q = sql.SQL("""
+        INSERT INTO {table} ({cols})
+        VALUES %s
+        ON CONFLICT ({keys}) DO UPDATE SET {set_clause}
+    """).format(
         table=table_ident,
         cols=col_ident,
         keys=key_ident,
@@ -175,20 +190,47 @@ def upsert_df_psycopg2(df: pd.DataFrame, schema_name: str, table_name: str, key_
 
     log(f"[UPSERT] {schema_name}.{table_name} 갱신 완료 (rows={len(df2)})")
 
+# ---- 실행 타이밍 헬퍼(추가) ----
+def _now_time() -> dtime:
+    return datetime.now().time().replace(microsecond=0)
+
+def _is_in_run_window(t: dtime) -> bool:
+    for start_t, end_t in RUN_WINDOWS:
+        if start_t <= t <= end_t:
+            return True
+    return False
+
+def _seconds_until_next_window(t: dtime) -> int:
+    if _is_in_run_window(t):
+        return 0
+
+    now_sec = t.hour * 3600 + t.minute * 60 + t.second
+    starts = []
+    for start_t, _ in RUN_WINDOWS:
+        s = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
+        starts.append(s)
+
+    future = [s for s in starts if s > now_sec]
+    if future:
+        return min(future) - now_sec
+
+    return (24 * 3600 - now_sec) + min(starts)
+
 
 # =========================
-# 2) 소스 로딩 + op_ct 계산 (오늘 + 최근 120초 + cutoff 이후)
+# 2) 소스 로딩 + op_ct 계산 (이번달 + 최근 120초 + cutoff 이후)
 # =========================
 def load_source_df(engine) -> pd.DataFrame:
     """
-    1) SQL에서 end_day = 오늘만 가져옴(로드 최소화)
+    1) SQL에서 end_day = 오늘 기준 같은 월(이번달)만 가져옴(로드 최소화)
     2) end_ts 생성 후
        - end_ts >= (now-120s)
        - end_ts >= cutoff_ts
        둘 다 만족하는 것만 남김
     """
-    log("[1/6] DB에서 원본 데이터(오늘) 로딩 시작...")
+    log("[1/6] DB에서 원본 데이터(이번달) 로딩 시작...")
 
+    # (추가) 이번달 범위: [월초, 다음달 월초)
     sql_query = f"""
     SELECT
         station,
@@ -199,7 +241,8 @@ def load_source_df(engine) -> pd.DataFrame:
         goodorbad
     FROM {SRC_SCHEMA}.{SRC_TABLE}
     WHERE
-        end_day = CURRENT_DATE
+        end_day >= date_trunc('month', CURRENT_DATE)::date
+        AND end_day <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
         AND station IN ('FCT1','FCT2','FCT3','FCT4')
         AND remark IN ('PD','Non-PD')
         AND result <> 'FAIL'
@@ -207,7 +250,7 @@ def load_source_df(engine) -> pd.DataFrame:
     ORDER BY end_day ASC, end_time ASC
     """
     df = pd.read_sql(text(sql_query), engine)
-    log(f"[OK] 오늘 데이터 로딩 완료 (rows={len(df)})")
+    log(f"[OK] 이번달 데이터 로딩 완료 (rows={len(df)})")
 
     if len(df) == 0:
         return df
@@ -490,31 +533,22 @@ def build_final_df_86(summary_df2: pd.DataFrame) -> pd.DataFrame:
 # 6) 1회 실행(루프 내부에서 호출)
 # =========================
 def run_once(engine):
-    # OUT_DIR 생성
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1) Load (오늘 + 최근 120초 + cutoff 이후)
     df_raw = load_source_df(engine)
     if df_raw is None or len(df_raw) == 0:
-        log("[INFO] 처리 대상 데이터 없음 (오늘/120초/cutoff 조건).")
+        log("[INFO] 처리 대상 데이터 없음 (이번달/120초/cutoff 조건).")
         return
 
-    # 2) Summary + html
     summary_df = build_summary_df(df_raw)
-
-    # 3) plotly_json + drop html
     summary_df2 = build_plotly_json_column(df_raw, summary_df)
-
-    # 4) left/right/whole
     final_df_86 = build_final_df_86(summary_df2)
 
-    # 5) DB UPSERT (테이블 없으면 생성)
     log("[6/6] DB 저장(UPSERT) 단계 시작...")
 
     with psycopg2.connect(**DB_CONFIG) as conn:
         ensure_tables(conn)
 
-        # op_ct 테이블: PK (station, remark, month)
         if len(summary_df2) > 0:
             cols_need = [
                 "station","remark","month","sample_amount","op_ct_lower_outlier","q1","median","q3",
@@ -523,7 +557,6 @@ def run_once(engine):
             df_save1 = summary_df2[[c for c in cols_need if c in summary_df2.columns]].copy()
             upsert_df_psycopg2(df_save1, TARGET_SCHEMA, TBL_OPCT, key_cols=["station","remark","month"], conn=conn)
 
-        # whole 테이블: PK (station, remark, month)
         if len(final_df_86) > 0:
             cols_need2 = ["station","remark","month","ct_eq","uph","final_ct"]
             df_save2 = final_df_86[[c for c in cols_need2 if c in final_df_86.columns]].copy()
@@ -533,22 +566,39 @@ def run_once(engine):
 
 
 # =========================
-# 7) main (무한루프, 1초마다 재실행)
+# 7) main (타임윈도우 기반 1초 루프)
 # =========================
 def main():
     try:
-        log("=== FCT OP-CT Realtime Loop START ===")
+        log("=== FCT OP-CT Realtime Loop START (Scheduled) ===")
         log(f"[INFO] MP workers = {MAX_WORKERS} (fixed)")
-        log(f"[INFO] end_day = today({date.today()})")
+        log(f"[INFO] end_day = this month (based on today={date.today()})")
         log(f"[INFO] realtime window = {REALTIME_WINDOW_SEC}s, cutoff_ts = {CUTOFF_TS}")
+        log(f"[INFO] run_windows = {RUN_WINDOWS}")
 
         engine = get_engine(DB_CONFIG)
 
         while True:
+            now_t = _now_time()
+
+            # 윈도우 밖이면 대기
+            if not _is_in_run_window(now_t):
+                wait_sec = _seconds_until_next_window(now_t)
+                log(f"[WAIT] now={now_t} -> next window in {wait_sec}s")
+
+                # 시작 시각 정밀하게 맞추기 위해 1초 단위 체크
+                while wait_sec > 0:
+                    time.sleep(1)
+                    wait_sec -= 1
+                    now_t = _now_time()
+                    if _is_in_run_window(now_t):
+                        break
+                continue
+
+            # 윈도우 안: 1초 주기 실행
             tick = time.time()
             run_once(engine)
 
-            # 1초 주기 유지(처리 시간이 1초 넘으면 즉시 다음 사이클)
             elapsed = time.time() - tick
             sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
             if sleep_sec > 0:

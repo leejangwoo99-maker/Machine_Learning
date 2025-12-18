@@ -19,15 +19,20 @@ FCT RunTime CT 분석 파이프라인 (iqz step 전용) - Realtime Loop + MP=2 �
 추가 사양(요청):
 - [멀티프로세스] 2개 고정
 - [무한 루프] 1초마다 재실행
-- [윈도우] end_day = 오늘(CURRENT_DATE)만
+- [윈도우] end_day = 오늘 기준 같은 월(YYYYMM)만 처리
+  예) 20251218 -> '202512%' 범위만
 - [실시간] end_ts 기준 현재시간 120초 이내 + cutoff_ts 이후만 처리
+- (추가) 실행 타이밍 2회:
+    1) 08:27:00 ~ 08:29:59 구간에서만 1초 루프 실행
+    2) 20:27:00 ~ 20:29:59 구간에서만 1초 루프 실행
+    (그 외 시간에는 대기)
 - DataFrame 콘솔 출력 없음 / 진행상황만 표시
 """
 
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dtime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -69,6 +74,12 @@ MAX_WORKERS = 2
 LOOP_INTERVAL_SEC = 1
 REALTIME_WINDOW_SEC = 120
 CUTOFF_TS = 1765501841.4473598  # 요청값
+
+# ===== 실행 타이밍(추가) =====
+RUN_WINDOWS = [
+    (dtime(8, 27, 0),  dtime(8, 29, 59)),
+    (dtime(20, 27, 0), dtime(20, 29, 59)),
+]
 
 
 # =========================
@@ -116,18 +127,46 @@ def _make_plotly_box_json(values: np.ndarray, name: str):
     fig = go.Figure(data=[go.Box(y=values.tolist(), name=name, boxpoints=False)])
     return pio.to_json(fig, validate=False)
 
+# ---- 실행 타이밍 헬퍼(추가) ----
+def _now_time() -> dtime:
+    return datetime.now().time().replace(microsecond=0)
+
+def _is_in_run_window(t: dtime) -> bool:
+    for start_t, end_t in RUN_WINDOWS:
+        if start_t <= t <= end_t:
+            return True
+    return False
+
+def _seconds_until_next_window(t: dtime) -> int:
+    if _is_in_run_window(t):
+        return 0
+
+    now_sec = t.hour * 3600 + t.minute * 60 + t.second
+    starts = []
+    for start_t, _ in RUN_WINDOWS:
+        s = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
+        starts.append(s)
+
+    future = [s for s in starts if s > now_sec]
+    if future:
+        return min(future) - now_sec
+
+    return (24 * 3600 - now_sec) + min(starts)
+
 
 # =========================
-# 2) 로딩 + 전처리 (오늘 + 최근 120초 + cutoff 이후)
+# 2) 로딩 + 전처리 (이번달 + 최근 120초 + cutoff 이후)
 # =========================
 def load_source(engine) -> pd.DataFrame:
     """
-    - SQL: end_day = CURRENT_DATE 로 로드 최소화
+    - SQL: 오늘 기준 '이번달' 범위만 로드(로드 최소화)
+        end_day >= date_trunc('month', CURRENT_DATE)
+        end_day <  date_trunc('month', CURRENT_DATE) + interval '1 month'
     - end_ts 생성 후:
         end_ts >= max(now-120s, cutoff_dt)
       만족하는 행만 남김
     """
-    log("[1/5] 원본 데이터(오늘) 로딩 시작...")
+    log("[1/5] 원본 데이터(이번달) 로딩 시작...")
 
     query = f"""
     SELECT
@@ -141,7 +180,8 @@ def load_source(engine) -> pd.DataFrame:
         run_time
     FROM {SRC_SCHEMA}.{SRC_TABLE}
     WHERE
-        end_day = CURRENT_DATE
+        end_day >= date_trunc('month', CURRENT_DATE)::date
+        AND end_day <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
         AND station IN ('FCT1','FCT2','FCT3','FCT4')
         AND barcode_information LIKE 'B%%'
         AND result <> 'FAIL'
@@ -172,7 +212,7 @@ def load_source(engine) -> pd.DataFrame:
     # month
     df["month"] = df["end_day"].str.slice(0, 6)
 
-    # run_time NaN 제거
+    # run_time/end_ts NaN 제거
     before = len(df)
     df = df.dropna(subset=["run_time", "end_ts"]).reset_index(drop=True)
     dropped = before - len(df)
@@ -515,7 +555,7 @@ def save_upper_outlier_df(upper_outlier_df: pd.DataFrame):
 def run_once(engine):
     df_raw = load_source(engine)
     if df_raw is None or len(df_raw) == 0:
-        log("[INFO] 처리 대상 데이터 없음 (오늘/120초/cutoff 조건).")
+        log("[INFO] 처리 대상 데이터 없음 (이번달/120초/cutoff 조건).")
         return
 
     summary_df = build_summary_df(df_raw)
@@ -528,18 +568,36 @@ def run_once(engine):
 
 
 # =========================
-# main (무한루프 1초)
+# main (타임윈도우 기반 1초 루프)
 # =========================
 def main():
     try:
-        log("=== FCT RunTime CT Realtime Loop START ===")
+        log("=== FCT RunTime CT Realtime Loop START (Scheduled) ===")
         log(f"[INFO] MP workers = {MAX_WORKERS} (fixed)")
-        log(f"[INFO] end_day = today({date.today()})")
+        log(f"[INFO] end_day = this month (based on today={date.today()})")
         log(f"[INFO] realtime window = {REALTIME_WINDOW_SEC}s, cutoff_ts = {CUTOFF_TS}")
+        log(f"[INFO] run_windows = {RUN_WINDOWS}")
 
         engine = get_engine(DB_CONFIG)
 
         while True:
+            now_t = _now_time()
+
+            # 윈도우 밖이면 대기
+            if not _is_in_run_window(now_t):
+                wait_sec = _seconds_until_next_window(now_t)
+                log(f"[WAIT] now={now_t} -> next window in {wait_sec}s")
+
+                # 시작 시각 정밀하게 맞추기 위해 1초 단위 체크
+                while wait_sec > 0:
+                    time.sleep(1)
+                    wait_sec -= 1
+                    now_t = _now_time()
+                    if _is_in_run_window(now_t):
+                        break
+                continue
+
+            # 윈도우 안: 1초 주기 실행
             tick = time.time()
             run_once(engine)
 

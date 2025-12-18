@@ -4,7 +4,7 @@ Vision RunTime CT (intensity8) 분석 파이프라인 - Realtime Loop + MP=2 고
 
 - Source: a3_vision_table.vision_table
 - Filter:
-  * end_day = 오늘(CURRENT_DATE)
+  * end_day = 오늘(CURRENT_DATE)  -> (요청 반영) 이번달(오늘 기준 같은 YYYYMM)만 처리
   * barcode_information LIKE 'B%'
   * station IN ('Vision1','Vision2')
   * remark IN ('PD','Non-PD')
@@ -32,14 +32,18 @@ Vision RunTime CT (intensity8) 분석 파이프라인 - Realtime Loop + MP=2 고
 - 진행상황만 표시
 - [멀티프로세스] 2개 고정
 - [무한 루프] 1초마다 재실행
-- [윈도우] end_day = 오늘만
+- [윈도우] 오늘 기준 같은 월(YYYYMM)만 처리
 - [실시간] 현재 시간 기준 120초 이내 + cutoff_ts 이후만 처리
+- (추가) 실행 타이밍 2회:
+    1) 08:27:00 ~ 08:29:59 구간에서만 1초 루프 실행
+    2) 20:27:00 ~ 20:29:59 구간에서만 1초 루프 실행
+    (그 외 시간에는 대기)
 """
 
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dtime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -76,6 +80,12 @@ LOOP_INTERVAL_SEC = 1
 REALTIME_WINDOW_SEC = 120
 CUTOFF_TS = 1765501841.4473598  # 요청값
 
+# ===== 실행 타이밍(추가) =====
+RUN_WINDOWS = [
+    (dtime(8, 27, 0),  dtime(8, 29, 59)),
+    (dtime(20, 27, 0), dtime(20, 29, 59)),
+]
+
 
 # =========================
 # 1) 유틸
@@ -93,6 +103,10 @@ def get_engine(cfg=DB_CONFIG):
     return create_engine(conn_str, pool_pre_ping=True)
 
 def _outlier_range_str(values: pd.Series, lower_fence: float, upper_fence: float):
+    """
+    lower_str:  (min(lower_outliers) ~ lower_fence) 형태
+    upper_str:  (upper_fence ~ max(upper_outliers)) 형태
+    """
     v = values.dropna().astype(float)
     if v.empty:
         return None, None
@@ -109,13 +123,41 @@ def _make_plotly_json(values: np.ndarray, name: str) -> str:
     fig.add_trace(go.Box(y=values.tolist(), name=name, boxpoints=False))
     return fig.to_json()
 
+# ---- 실행 타이밍 헬퍼(추가) ----
+def _now_time() -> dtime:
+    return datetime.now().time().replace(microsecond=0)
+
+def _is_in_run_window(t: dtime) -> bool:
+    for start_t, end_t in RUN_WINDOWS:
+        if start_t <= t <= end_t:
+            return True
+    return False
+
+def _seconds_until_next_window(t: dtime) -> int:
+    if _is_in_run_window(t):
+        return 0
+
+    now_sec = t.hour * 3600 + t.minute * 60 + t.second
+    starts = []
+    for start_t, _ in RUN_WINDOWS:
+        s = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
+        starts.append(s)
+
+    future = [s for s in starts if s > now_sec]
+    if future:
+        return min(future) - now_sec
+
+    return (24 * 3600 - now_sec) + min(starts)
+
 
 # =========================
-# 2) 로딩 (오늘만) + end_dt 생성 + 실시간 필터
+# 2) 로딩 (이번달만) + end_dt 생성 + 실시간 필터
 # =========================
 def load_source(engine) -> pd.DataFrame:
     """
-    - SQL에서 end_day=CURRENT_DATE로 오늘만 로딩
+    - SQL에서 이번달만 로딩(로드 최소화)
+        end_day >= date_trunc('month', CURRENT_DATE)::date
+        end_day <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
     - end_dt 생성 후:
         end_dt >= max(now-120s, cutoff_dt)
       만족하는 행만 유지
@@ -132,7 +174,8 @@ def load_source(engine) -> pd.DataFrame:
         run_time
     FROM {SRC_SCHEMA}.{SRC_TABLE}
     WHERE 1=1
-      AND end_day = CURRENT_DATE
+      AND end_day >= date_trunc('month', CURRENT_DATE)::date
+      AND end_day <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
       AND barcode_information LIKE 'B%%'
       AND station IN ('Vision1', 'Vision2')
       AND remark IN ('PD', 'Non-PD')
@@ -141,7 +184,7 @@ def load_source(engine) -> pd.DataFrame:
     ORDER BY end_day ASC, end_time ASC
     """)
 
-    log("[1/5] 원본 데이터 로딩(오늘) 시작...")
+    log("[1/5] 원본 데이터 로딩(이번달) 시작...")
     df = pd.read_sql(query, engine, params={"step_desc": STEP_DESC})
     log(f"[OK] 로딩 완료 (rows={len(df)})")
 
@@ -151,7 +194,7 @@ def load_source(engine) -> pd.DataFrame:
     # end_dt 생성 (실시간 필터용)
     df["end_day"] = df["end_day"].astype(str).str.strip()
     df["end_time"] = df["end_time"].astype(str).str.strip()
-    df["end_dt"] = pd.to_datetime(df["end_day"] + " " + df["end_time"], errors="coerce")
+    df["end_dt"] = pd.to_datetime(df["end_day"] + " " + df["end_time"], errors="coerce", format="mixed")
 
     before = len(df)
     df = df.dropna(subset=["end_dt"]).copy()
@@ -186,7 +229,6 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
 
     # end_day를 YYYYMMDD 형태로 정리(안전)
     out["end_day"] = out["end_day"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
-
     out["month"] = out["end_day"].str.slice(0, 6)
 
     # run_time 숫자화
@@ -367,7 +409,7 @@ def upsert_summary(engine, summary_df: pd.DataFrame):
 def run_once(engine):
     df = load_source(engine)
     if df is None or len(df) == 0:
-        log("[INFO] 처리 대상 데이터 없음 (오늘/120초/cutoff 조건).")
+        log("[INFO] 처리 대상 데이터 없음 (이번달/120초/cutoff 조건).")
         return
 
     df = preprocess(df)
@@ -380,18 +422,36 @@ def run_once(engine):
 
 
 # =========================
-# main (무한루프 1초)
+# main (타임윈도우 기반 1초 루프)
 # =========================
 def main():
     try:
-        log("=== Vision RunTime CT Realtime Loop START ===")
+        log("=== Vision RunTime CT Realtime Loop START (Scheduled) ===")
         log(f"[INFO] MP workers = {MAX_WORKERS} (fixed)")
-        log(f"[INFO] end_day = today({date.today()})")
+        log(f"[INFO] end_day = this month (based on today={date.today()})")
         log(f"[INFO] realtime window = {REALTIME_WINDOW_SEC}s, cutoff_ts = {CUTOFF_TS}")
+        log(f"[INFO] run_windows = {RUN_WINDOWS}")
 
         engine = get_engine(DB_CONFIG)
 
         while True:
+            now_t = _now_time()
+
+            # 윈도우 밖이면 대기
+            if not _is_in_run_window(now_t):
+                wait_sec = _seconds_until_next_window(now_t)
+                log(f"[WAIT] now={now_t} -> next window in {wait_sec}s")
+
+                # 시작 시각 정밀하게 맞추기 위해 1초 단위 체크
+                while wait_sec > 0:
+                    time.sleep(1)
+                    wait_sec -= 1
+                    now_t = _now_time()
+                    if _is_in_run_window(now_t):
+                        break
+                continue
+
+            # 윈도우 안: 1초 주기 실행
             tick = time.time()
             run_once(engine)
 

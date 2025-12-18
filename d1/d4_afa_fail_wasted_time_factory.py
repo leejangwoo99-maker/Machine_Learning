@@ -9,18 +9,19 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 (실시간 루프)
 요구사항:
 1) 1초마다 재실행 무한루프
 2) 멀티프로세스 2개 고정
-3) end_day = 오늘 날짜만
+3) end_day = 오늘 날짜 기준 같은 월(YYYYMM)만 처리
+   예) 20251218 -> '202512%' 범위만
 4) 지정 컬럼 중복 제거 (SELECT DISTINCT 효과)
 5) 실시간: 현재시간 기준 120초 이내 데이터만 처리
 
-[변경사항(요청 반영)]
-- dayornight 컬럼/속성값 완전 삭제
-- time 컬럼 -> end_time 컬럼으로 변경
-- 결과 테이블에서도 from_dorn / to_dorn 제거
+추가(실행 타이밍):
+- 08:27:00 ~ 08:29:59 구간에만 1초 루프 실행
+- 20:27:00 ~ 20:29:59 구간에만 1초 루프 실행
+(그 외 시간에는 대기)
 """
 
-import os
 import time as pytime
+from datetime import datetime, time as dtime
 import pandas as pd
 from sqlalchemy import create_engine
 import urllib.parse
@@ -63,8 +64,44 @@ MAX_WORKERS = 2
 REALTIME_WINDOW_SEC = 120
 
 # (선택) epoch cutoff 강제 적용하고 싶으면 아래에 float epoch 넣기 (없으면 None)
-# 예: 1765501841.4473598
 FORCE_CUTOFF_TS = None
+
+
+# ============================================
+# 실행 타이밍(추가)
+# ============================================
+RUN_WINDOWS = [
+    (dtime(8, 27, 0),  dtime(8, 29, 59)),
+    (dtime(20, 27, 0), dtime(20, 29, 59)),
+]
+
+
+def _now_time() -> dtime:
+    return datetime.now().time().replace(microsecond=0)
+
+
+def _is_in_run_window(t: dtime) -> bool:
+    for start_t, end_t in RUN_WINDOWS:
+        if start_t <= t <= end_t:
+            return True
+    return False
+
+
+def _seconds_until_next_window(t: dtime) -> int:
+    if _is_in_run_window(t):
+        return 0
+
+    now_sec = t.hour * 3600 + t.minute * 60 + t.second
+    starts = []
+    for start_t, _ in RUN_WINDOWS:
+        s = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
+        starts.append(s)
+
+    future = [s for s in starts if s > now_sec]
+    if future:
+        return min(future) - now_sec
+
+    return (24 * 3600 - now_sec) + min(starts)
 
 
 # ============================================
@@ -82,20 +119,11 @@ def get_engine(config=DB_CONFIG):
 
 # ============================================
 # 2. FCT 로그 로드 (프로세스 단위 실행)
-#    - 오늘 날짜 + 최근 120초 + 이벤트 텍스트만 DB에서 필터링
-#    - (변경) time -> end_time, dayornight 제거
 # ============================================
 def load_fct_log_mp(args):
     table_name, station_label, db_config, schema_name, realtime_window_sec, force_cutoff_ts = args
     engine = get_engine(db_config)
 
-    # end_day(YYYYMMDD) + end_time 을 timestamp로 조합
-    # - end_day: int/str 혼재 대응 위해 end_day::text 사용
-    # - end_time: TIME 컬럼인 경우 캐스팅 필요 (end_time::time)
-    #
-    # 조건:
-    #  (3) end_day = CURRENT_DATE
-    #  (5) ts >= NOW() - interval '120 seconds'  (또는 FORCE_CUTOFF_TS 있으면 그 기준)
     if force_cutoff_ts is None:
         ts_filter = (
             f"(to_date(end_day::text,'YYYYMMDD') + end_time::time) "
@@ -107,6 +135,9 @@ def load_fct_log_mp(args):
             f">= to_timestamp({float(force_cutoff_ts)})"
         )
 
+    # (3) 오늘 날짜 기준 같은 월(YYYYMM)만 처리
+    month_filter = "end_day::text LIKE (to_char(CURRENT_DATE,'YYYYMM') || '%')"
+
     sql = f"""
         SELECT
             end_day,
@@ -114,7 +145,7 @@ def load_fct_log_mp(args):
             contents
         FROM {schema_name}."{table_name}"
         WHERE
-            to_date(end_day::text,'YYYYMMDD') = CURRENT_DATE
+            {month_filter}
             AND contents IN (%(ng)s, %(off)s, %(manual)s, %(auto)s)
             AND {ts_filter}
         ORDER BY end_day ASC, end_time ASC
@@ -145,8 +176,6 @@ def load_all_fct_logs_multiprocess(max_workers=MAX_WORKERS) -> pd.DataFrame:
         return pd.DataFrame(columns=["end_day", "end_time", "contents", "station"])
 
     df_all = pd.concat(dfs, ignore_index=True)
-
-    # 안전장치: 필수 컬럼 결측 제거
     df_all = df_all.dropna(subset=["end_day", "end_time", "contents", "station"])
     return df_all
 
@@ -165,10 +194,7 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
     if df_all.empty:
         return pd.DataFrame(columns=base_cols)
 
-    # 이벤트만 필터링(이미 SQL에서 제한했지만 안전)
     df_evt = df_all[df_all["contents"].isin([NG_TEXT, OFF_TEXT, MANUAL_TEXT, AUTO_TEXT])].copy()
-
-    # 정렬: 같은 end_day 내 station별 end_time 순
     df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
 
     result_rows = []
@@ -181,12 +207,10 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
             contents = row["contents"]
             t = row["end_time"]
 
-            # end_day(YYYYMMDD) + end_time 로 timestamp 생성
             ts = pd.to_datetime(f"{str(end_day)} {str(t)}", errors="coerce")
             if pd.isna(ts):
                 continue
 
-            # Manual / Auto 구간
             if contents == MANUAL_TEXT:
                 in_manual = True
                 continue
@@ -194,16 +218,13 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
                 in_manual = False
                 continue
 
-            # NG
             if contents == NG_TEXT:
                 if in_manual:
                     continue
-                # 연속 NG면 첫 NG만 유지
                 if pending_from_ts is None:
                     pending_from_ts = ts
                 continue
 
-            # OFF
             if contents == OFF_TEXT and pending_from_ts is not None:
                 from_ts = pending_from_ts
                 to_ts = ts
@@ -239,7 +260,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
         df_wasted = df_wasted.drop_duplicates(subset=distinct_cols, keep="first")
         df_wasted = df_wasted.sort_values(["end_day", "station", "from_time"]).reset_index(drop=True)
         df_wasted.insert(0, "id", range(1, len(df_wasted) + 1))
-        # 컬럼 순서 고정
         df_wasted = df_wasted[base_cols]
     else:
         df_wasted = pd.DataFrame(columns=base_cols)
@@ -256,27 +276,42 @@ def save_to_db(df_wasted: pd.DataFrame):
         TABLE_SAVE_NAME,
         con=engine,
         schema=TABLE_SAVE_SCHEMA,
-        if_exists="replace",   # 요구사항 유지
+        if_exists="replace",
         index=False,
     )
-    print(f"[DONE] {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} 저장: {len(df_wasted)} rows")
+    print(f"[DONE] {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} 저장: {len(df_wasted)} rows", flush=True)
 
 
 # ============================================
-# 5. main (1초 무한루프)
+# 5. main (타임윈도우 기반 1초 루프)
 # ============================================
 def main_loop():
-    print("[INFO] AFA FAIL wasted time realtime loop start")
-    print(f"[INFO] workers={MAX_WORKERS}, realtime_window={REALTIME_WINDOW_SEC}s, force_cutoff_ts={FORCE_CUTOFF_TS}")
+    print("[INFO] AFA FAIL wasted time scheduled realtime loop start", flush=True)
+    print(f"[INFO] workers={MAX_WORKERS}, realtime_window={REALTIME_WINDOW_SEC}s, force_cutoff_ts={FORCE_CUTOFF_TS}", flush=True)
+    print("[INFO] run_windows =", RUN_WINDOWS, flush=True)
 
     while True:
+        now_t = _now_time()
+
+        # 윈도우 밖이면 다음 윈도우까지 대기
+        if not _is_in_run_window(now_t):
+            wait_sec = _seconds_until_next_window(now_t)
+            print(f"[WAIT] now={now_t} -> next window in {wait_sec}s", flush=True)
+            while wait_sec > 0:
+                pytime.sleep(1)
+                wait_sec -= 1
+                now_t = _now_time()
+                if _is_in_run_window(now_t):
+                    break
+            continue
+
+        # 윈도우 안: 1초 루프 실행
         try:
             df_all = load_all_fct_logs_multiprocess(max_workers=MAX_WORKERS)
             df_wasted = compute_afa_fail_wasted(df_all)
             save_to_db(df_wasted)
         except Exception as e:
-            # 루프가 죽지 않게 로그만 남기고 계속
-            print("[ERROR]", repr(e))
+            print("[ERROR]", repr(e), flush=True)
 
         pytime.sleep(1)
 

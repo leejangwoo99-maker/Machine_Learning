@@ -13,9 +13,15 @@ MES 불량 소요 시간 계산 (Vision1/Vision2) - Realtime Loop Version
 추가 요구사항(동일 5개):
 1) 1초마다 재실행 무한루프
 2) 멀티프로세스 2개 고정
-3) end_day = 오늘 날짜만 처리
+3) end_day = 오늘 날짜 기준 같은 월(YYYYMM)만 처리
+   예) 20251218 -> '202512%' 범위만
 4) 중복 제거(SELECT DISTINCT 효과)
 5) 실시간: 현재 시간 기준 120초 이내 데이터만 처리
+
+추가(실행 타이밍 2회):
+- 08:27:00 시작 ~ 08:29:59 종료 구간에서만 1초 루프 실행
+- 20:27:00 시작 ~ 20:29:59 종료 구간에서만 1초 루프 실행
+(그 외 시간에는 대기)
 
 [요청 반영(동일 변경)]
 - dayornight 컬럼/속성값 완전 삭제
@@ -24,6 +30,7 @@ MES 불량 소요 시간 계산 (Vision1/Vision2) - Realtime Loop Version
 """
 
 import time as pytime
+from datetime import datetime, time as dtime
 import urllib.parse
 import numpy as np
 import pandas as pd
@@ -68,6 +75,43 @@ def get_engine(config=DB_CONFIG):
     dbname = config["dbname"]
     conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
     return create_engine(conn_str)
+
+
+# ============================================
+# 실행 타이밍(추가)
+# ============================================
+RUN_WINDOWS = [
+    (dtime(8, 27, 0),  dtime(8, 29, 59)),
+    (dtime(20, 27, 0), dtime(20, 29, 59)),
+]
+
+
+def _now_time() -> dtime:
+    return datetime.now().time().replace(microsecond=0)
+
+
+def _is_in_run_window(t: dtime) -> bool:
+    for start_t, end_t in RUN_WINDOWS:
+        if start_t <= t <= end_t:
+            return True
+    return False
+
+
+def _seconds_until_next_window(t: dtime) -> int:
+    if _is_in_run_window(t):
+        return 0
+
+    now_sec = t.hour * 3600 + t.minute * 60 + t.second
+    starts = []
+    for start_t, _ in RUN_WINDOWS:
+        s = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
+        starts.append(s)
+
+    future = [s for s in starts if s > now_sec]
+    if future:
+        return min(future) - now_sec
+
+    return (24 * 3600 - now_sec) + min(starts)
 
 
 # ============================================
@@ -149,7 +193,6 @@ def process_one_group(args):
     if not from_indices:
         return []
 
-    # (변경) dayornight 제거, time -> end_time
     from_rows = g.loc[from_indices, ["end_day", "station", "end_time", "contents"]].copy()
     from_rows = from_rows.rename(columns={"end_time": "from_time", "contents": "from_contents"})
     from_rows["from_key"] = time_to_seconds(from_rows["from_time"])
@@ -222,8 +265,6 @@ def recreate_out_table(engine):
 # [5] 단일 실행(루프에서 호출)
 # ============================================
 def run_once(engine):
-    # (3) 오늘 날짜만 + (5) 최근 120초만 SQL에서 필터
-    # (변경) time -> end_time, dayornight 제거
     if FORCE_CUTOFF_TS is None:
         ts_filter = (
             f"(to_date(end_day::text,'YYYYMMDD') + end_time::time) "
@@ -235,11 +276,14 @@ def run_once(engine):
             f">= to_timestamp({float(FORCE_CUTOFF_TS)})"
         )
 
+    # (3) 오늘 날짜 기준 같은 월(YYYYMM)만 처리
+    month_filter = "end_day::text LIKE (to_char(CURRENT_DATE,'YYYYMM') || '%')"
+
     q1 = text(f"""
         SELECT end_day, end_time, contents, 'Vision1'::text AS station
         FROM {VISION1_TABLE}
         WHERE
-            to_date(end_day::text,'YYYYMMDD') = CURRENT_DATE
+            {month_filter}
             AND {ts_filter}
         ORDER BY end_day, end_time;
     """)
@@ -247,7 +291,7 @@ def run_once(engine):
         SELECT end_day, end_time, contents, 'Vision2'::text AS station
         FROM {VISION2_TABLE}
         WHERE
-            to_date(end_day::text,'YYYYMMDD') = CURRENT_DATE
+            {month_filter}
             AND {ts_filter}
         ORDER BY end_day, end_time;
     """)
@@ -256,21 +300,19 @@ def run_once(engine):
     df_v2 = pd.read_sql(q2, engine)
     df = pd.concat([df_v1, df_v2], ignore_index=True)
 
-    # (4) 입력 데이터 단계에서 DISTINCT 효과(지정 컬럼)
-    # - 같은 로그가 반복 적재된 경우(혹은 조회 중복) 방어
+    # (4) 입력 단계 DISTINCT 효과
     if not df.empty:
         df = df.drop_duplicates(subset=["end_day", "station", "end_time", "contents"], keep="first")
 
     if df.empty:
         recreate_out_table(engine)
-        print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)")
+        print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)", flush=True)
         return
 
     # 교대 경계 제외 + 정렬
     df = filter_shift_boundary(df)
     df = df.sort_values(["station", "end_day", "end_time"]).reset_index(drop=True)
 
-    # (station, end_day) 그룹
     group_items = [((st, day), g.copy()) for (st, day), g in df.groupby(["station", "end_day"], sort=False)]
 
     # (2) 멀티프로세스 2개 고정
@@ -281,7 +323,7 @@ def run_once(engine):
 
     if not flat_rows:
         recreate_out_table(engine)
-        print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)")
+        print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)", flush=True)
         return
 
     result_df = pd.DataFrame(flat_rows)
@@ -293,7 +335,7 @@ def run_once(engine):
         .str.zfill(8)
     )
 
-    # (4) 중복 제거(SELECT DISTINCT 효과) - 결과 단계에서도 한 번 더
+    # (4) 결과 단계 DISTINCT 효과(2차)
     distinct_cols = [
         "end_day", "station",
         "from_contents", "from_time",
@@ -312,22 +354,41 @@ def run_once(engine):
         index=False
     )
 
-    print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows={len(result_df)})")
+    print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows={len(result_df)})", flush=True)
 
 
 # ============================================
-# [6] main: (1) 1초마다 무한루프
+# [6] main: 타임윈도우 기반 1초 루프
 # ============================================
 def main_loop():
     engine = get_engine()
-    print("[INFO] MES fail wasted time realtime loop start")
-    print(f"[INFO] workers={WORKERS}, realtime_window={REALTIME_WINDOW_SEC}s, force_cutoff_ts={FORCE_CUTOFF_TS}")
+    print("[INFO] MES fail wasted time scheduled realtime loop start", flush=True)
+    print(f"[INFO] workers={WORKERS}, realtime_window={REALTIME_WINDOW_SEC}s, force_cutoff_ts={FORCE_CUTOFF_TS}", flush=True)
+    print("[INFO] run_windows =", RUN_WINDOWS, flush=True)
 
     while True:
+        now_t = _now_time()
+
+        # 윈도우 밖이면 대기
+        if not _is_in_run_window(now_t):
+            wait_sec = _seconds_until_next_window(now_t)
+            print(f"[WAIT] now={now_t} -> next window in {wait_sec}s", flush=True)
+
+            # 정확히 시작 시각에 맞추기 위해 1초 단위 체크
+            while wait_sec > 0:
+                pytime.sleep(1)
+                wait_sec -= 1
+                now_t = _now_time()
+                if _is_in_run_window(now_t):
+                    break
+            continue
+
+        # 윈도우 안: 1초마다 실행
         try:
             run_once(engine)
         except Exception as e:
-            print("[ERROR]", repr(e))
+            print("[ERROR]", repr(e), flush=True)
+
         pytime.sleep(1)
 
 
