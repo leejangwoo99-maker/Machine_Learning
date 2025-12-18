@@ -21,10 +21,13 @@ Vision OP-CT 분석 파이프라인
 요구사항:
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
+- 실행 시작/종료 시각 및 총 소요 시간 출력 추가
 """
 
 import os
 import sys
+import time
+from datetime import datetime
 import warnings
 
 # --- Thread 제한(원 코드 유지)
@@ -224,7 +227,6 @@ def summarize(df_an: pd.DataFrame) -> pd.DataFrame:
         groups = list(dsub.groupby(group_cols, sort=True))
 
         for idx, ((st, rk, mo), g) in enumerate(groups, start=1):
-            # 진행 로그(너무 잦지 않게)
             if idx % 30 == 0 or idx == 1 or idx == len(groups):
                 log(f"[PROGRESS] group {idx}/{len(groups)} ... ({st}, {rk}, {mo})")
 
@@ -260,12 +262,10 @@ def summarize(df_an: pd.DataFrame) -> pd.DataFrame:
                 "plotly_json": plotly_json,
             })
 
-    # (A) 정상: only_run 제외
     df_normal = df_an[df_an["is_vision_only_run"] == False].copy()
     log(f"[INFO] 정상군 rows={len(df_normal)}")
     summarize_subset(df_normal)
 
-    # (B) only: only_run만
     df_only = df_an[df_an["is_vision_only_run"] == True].copy()
     log(f"[INFO] only군 rows={len(df_only)}")
     summarize_subset(df_only, station_label_map={"Vision1": "Vision1_only", "Vision2": "Vision2_only"})
@@ -300,13 +300,11 @@ def save_to_db(summary_df: pd.DataFrame):
 
     with get_conn_pg(DB_CONFIG) as conn:
         with conn.cursor() as cur:
-            # 1) 스키마 생성
             cur.execute(
                 sql.SQL("CREATE SCHEMA IF NOT EXISTS {}")
                    .format(sql.Identifier(TARGET_SCHEMA))
             )
 
-            # 2) 테이블 생성
             cur.execute(
                 sql.SQL("""
                 CREATE TABLE IF NOT EXISTS {}.{} (
@@ -383,9 +381,13 @@ def save_to_db(summary_df: pd.DataFrame):
 # main
 # =========================
 def main():
-    try:
-        log("=== Vision OP-CT Pipeline START ===")
+    start_dt = datetime.now()
+    start_ts = time.perf_counter()
 
+    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+    log("=== Vision OP-CT Pipeline START ===")
+
+    try:
         engine = get_engine(DB_CONFIG)
 
         df = load_source(engine)
@@ -399,6 +401,12 @@ def main():
     except Exception as e:
         log(f"[ERROR] {type(e).__name__}: {e}")
         sys.exit(1)
+
+    finally:
+        end_dt = datetime.now()
+        elapsed = time.perf_counter() - start_ts
+        log(f"[END]   {end_dt:%Y-%m-%d %H:%M:%S}")
+        log(f"[TIME]  total_elapsed = {elapsed:.2f} sec ({elapsed/60:.2f} min)")
 
 
 if __name__ == "__main__":

@@ -25,9 +25,12 @@ Vision RunTime CT (intensity8) 분석 파이프라인
 요구사항:
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
+- 실행 시작/종료 시각 및 총 소요 시간 출력 추가
 """
 
 import sys
+import time
+from datetime import datetime
 import urllib.parse
 
 import numpy as np
@@ -133,7 +136,6 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     out["month"] = out["end_day"].str.slice(0, 6)
     out = out.sort_values(["end_day", "end_time"], ascending=True).reset_index(drop=True)
 
-    # run_time 숫자화 (혹시 문자열이면 대비)
     out["run_time"] = pd.to_numeric(out["run_time"], errors="coerce")
     before = len(out)
     out = out.dropna(subset=["run_time"]).reset_index(drop=True)
@@ -279,9 +281,13 @@ def upsert_summary(engine, summary_df: pd.DataFrame):
 # main
 # =========================
 def main():
-    try:
-        log("=== Vision RunTime CT Pipeline START ===")
+    start_dt = datetime.now()
+    start_ts = time.perf_counter()
 
+    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+    log("=== Vision RunTime CT Pipeline START ===")
+
+    try:
         engine = get_engine(DB_CONFIG)
 
         df = load_source(engine)
@@ -296,6 +302,12 @@ def main():
     except Exception as e:
         log(f"[ERROR] {type(e).__name__}: {e}")
         sys.exit(1)
+
+    finally:
+        end_dt = datetime.now()
+        elapsed = time.perf_counter() - start_ts
+        log(f"[END]   {end_dt:%Y-%m-%d %H:%M:%S}")
+        log(f"[TIME]  total_elapsed = {elapsed:.2f} sec ({elapsed/60:.2f} min)")
 
 
 if __name__ == "__main__":

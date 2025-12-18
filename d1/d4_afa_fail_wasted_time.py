@@ -10,14 +10,19 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트
 - dayornight 컬럼 제거
 - time 컬럼 -> end_time 컬럼으로 변경
 - 결과 테이블에서도 from_dorn / to_dorn 제거
+- 실행 시작/종료 시각 및 총 소요 시간 출력 추가
 """
 
 import os
+import time
+from datetime import datetime
+
 import pandas as pd
 from sqlalchemy import create_engine
 import urllib.parse
 from multiprocessing import freeze_support
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
 
 # ============================================
 # 0. DB / 상수 설정
@@ -63,13 +68,11 @@ def get_engine(config=DB_CONFIG):
 
 # ============================================
 # 2. FCT 로그 로드 (프로세스 단위 실행)
-#    - 멀티프로세스에서는 엔진을 프로세스 내부에서 생성해야 함
 # ============================================
 def load_fct_log_mp(args):
     table_name, station_label, db_config, schema_name = args
     engine = get_engine(db_config)
 
-    # (변경) time -> end_time, dayornight 제거
     sql = f"""
         SELECT
             end_day,
@@ -102,15 +105,11 @@ def load_all_fct_logs_multiprocess(max_workers=None) -> pd.DataFrame:
 # 3. 계산 로직
 # ============================================
 def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
-    # 이벤트만 필터링
     df_evt = df_all[df_all["contents"].isin([NG_TEXT, OFF_TEXT, MANUAL_TEXT, AUTO_TEXT])].copy()
-
-    # 정렬 (변경: end_time 기준)
     df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
 
     result_rows = []
 
-    # end_day, station 단위 처리
     for (end_day, station), grp in df_evt.groupby(["end_day", "station"], sort=False):
         pending_from_ts = None
         in_manual = False
@@ -119,12 +118,10 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
             contents = row["contents"]
             t = row["end_time"]
 
-            # end_day는 정수/문자 혼재 가능 -> 문자열 안전 변환
             ts = pd.to_datetime(f"{str(end_day)} {str(t)}", errors="coerce")
             if pd.isna(ts):
                 continue
 
-            # Manual / Auto 상태
             if contents == MANUAL_TEXT:
                 in_manual = True
                 continue
@@ -132,35 +129,24 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
                 in_manual = False
                 continue
 
-            # NG 처리
             if contents == NG_TEXT:
-                if in_manual:
-                    continue
-
-                # 연속 NG면 첫 NG만 유지
-                if pending_from_ts is None:
+                if not in_manual and pending_from_ts is None:
                     pending_from_ts = ts
                 continue
 
-            # OFF 처리 (pending NG가 있을 때만 페어링)
             if contents == OFF_TEXT and pending_from_ts is not None:
                 from_ts = pending_from_ts
                 to_ts = ts
-
-                from_str = from_ts.strftime("%H:%M:%S.%f")[:-4]
-                to_str   = to_ts.strftime("%H:%M:%S.%f")[:-4]
-
-                wasted = round(abs((to_ts - from_ts).total_seconds()), 2)
 
                 result_rows.append(
                     {
                         "end_day": end_day,
                         "station": station,
                         "from_contents": NG_TEXT,
-                        "from_time": from_str,
+                        "from_time": from_ts.strftime("%H:%M:%S.%f")[:-4],
                         "to_contents": OFF_TEXT,
-                        "to_time": to_str,
-                        "wasted_time": wasted,
+                        "to_time": to_ts.strftime("%H:%M:%S.%f")[:-4],
+                        "wasted_time": round(abs((to_ts - from_ts).total_seconds()), 2),
                     }
                 )
 
@@ -172,7 +158,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
         df_wasted = df_wasted.sort_values(["end_day", "station", "from_time"]).reset_index(drop=True)
         df_wasted.insert(0, "id", range(1, len(df_wasted) + 1))
     else:
-        # 컬럼 고정 (빈 결과여도 스키마 유지 목적)
         df_wasted = pd.DataFrame(
             columns=[
                 "id", "end_day", "station",
@@ -195,7 +180,7 @@ def save_to_db(df_wasted: pd.DataFrame):
         TABLE_SAVE_NAME,
         con=engine,
         schema=TABLE_SAVE_SCHEMA,
-        if_exists="replace",   # 누적이면 "append"
+        if_exists="replace",
         index=False,
     )
 
@@ -206,16 +191,22 @@ def save_to_db(df_wasted: pd.DataFrame):
 # 5. main
 # ============================================
 def main():
-    # (1) 멀티프로세스로 FCT1~4 로드
+    start_dt = datetime.now()
+    start_ts = time.perf_counter()
+
+    print(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+
     df_all = load_all_fct_logs_multiprocess(max_workers=min(4, os.cpu_count() or 1))
-
-    # (2) 계산
     df_wasted = compute_afa_fail_wasted(df_all)
-
-    # (3) DB 저장
     save_to_db(df_wasted)
+
+    elapsed = time.perf_counter() - start_ts
+    end_dt = datetime.now()
+
+    print(f"[END]   {end_dt:%Y-%m-%d %H:%M:%S}")
+    print(f"[TIME]  total_elapsed = {elapsed:.2f} sec ({elapsed/60:.2f} min)")
 
 
 if __name__ == "__main__":
-    freeze_support()  # Windows 멀티프로세스 안전장치
+    freeze_support()
     main()

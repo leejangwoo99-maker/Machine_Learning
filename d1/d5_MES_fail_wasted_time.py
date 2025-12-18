@@ -15,9 +15,13 @@ MES 불량 소요 시간 계산 (Vision1/Vision2)
 - dayornight 컬럼/속성값 완전 삭제
 - time 컬럼 -> end_time 컬럼으로 변경
 - 결과 테이블에서도 dayornight 제거
+- 실행 시작/종료 시각 및 총 소요 시간 출력 추가
 """
 
+import time
+from datetime import datetime
 import urllib.parse
+
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -134,7 +138,6 @@ def process_one_group(args):
     if not from_indices:
         return []
 
-    # (변경) dayornight 제거, time -> end_time
     from_rows = g.loc[from_indices, ["end_day", "station", "end_time", "contents"]].copy()
     from_rows = from_rows.rename(columns={"end_time": "from_time", "contents": "from_contents"})
     from_rows["from_key"] = time_to_seconds(from_rows["from_time"])
@@ -185,9 +188,14 @@ def process_one_group(args):
 # [4] 메인 로직
 # ============================================
 def main():
+    # ---- 실행 시간 측정 시작 ----
+    start_dt = datetime.now()
+    start_ts = time.perf_counter()
+    print(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+
     engine = get_engine()
 
-    # Vision1/2 로딩 (변경: time -> end_time, dayornight 제거)
+    # Vision1/2 로딩
     q1 = text(f"""
         SELECT end_day, end_time, contents, 'Vision1'::text AS station
         FROM {VISION1_TABLE}
@@ -235,7 +243,7 @@ def main():
         result_df = result_df.reset_index(drop=True)
         result_df.insert(0, "id", result_df.index + 1)
 
-    # DROP → CREATE (변경: dayornight 제거)
+    # DROP → CREATE
     drop_sql = f"DROP TABLE IF EXISTS {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME};"
     create_sql = f"""
     CREATE TABLE {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (
@@ -265,6 +273,12 @@ def main():
         )
 
     print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows={len(result_df)})")
+
+    # ---- 실행 시간 측정 종료 ----
+    elapsed = time.perf_counter() - start_ts
+    end_dt = datetime.now()
+    print(f"[END]   {end_dt:%Y-%m-%d %H:%M:%S}")
+    print(f"[TIME]  total_elapsed = {elapsed:.2f} sec ({elapsed/60:.2f} min)")
 
 
 if __name__ == "__main__":

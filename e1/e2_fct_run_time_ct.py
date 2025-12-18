@@ -18,9 +18,12 @@ FCT RunTime CT 분석 파이프라인 (iqz step 전용)
 요구사항:
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
+- 실행 시작/종료 시각 및 총 소요 시간 출력 추가
 """
 
 import sys
+import time
+from datetime import datetime
 import urllib.parse
 
 import numpy as np
@@ -181,7 +184,6 @@ def boxplot_summary_from_values(vals: np.ndarray, name: str) -> dict:
         "run_time_upper_outlier": _outlier_range_str(upper_outliers),
         "del_out_run_time_av": _round2(del_out_mean),
         "plotly_json": plotly_json,
-        # 참고: threshold는 summary 테이블에 저장하지 않음(원 코드 동일)
     }
 
 def build_summary_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -203,7 +205,6 @@ def build_summary_df(df: pd.DataFrame) -> pd.DataFrame:
     summary_df = pd.DataFrame(rows)
     summary_df.insert(0, "id", np.arange(1, len(summary_df) + 1))
 
-    # 컬럼 정렬(요구사항)
     cols_order = [
         "id", "station", "remark", "month", "sample_amount",
         "run_time_lower_outlier", "q1", "median", "q3",
@@ -361,10 +362,8 @@ def save_upper_outlier_df(upper_outlier_df: pd.DataFrame):
         log("[SKIP] upper outlier 저장 생략 (데이터 없음)")
         return
 
-    # 저장 컬럼 보정
     save_df = upper_outlier_df.copy()
 
-    # barcode -> barcode_information으로 복원
     if "barcode_information" not in save_df.columns and "barcode" in save_df.columns:
         save_df = save_df.rename(columns={"barcode": "barcode_information"})
 
@@ -437,9 +436,13 @@ def save_upper_outlier_df(upper_outlier_df: pd.DataFrame):
 # main
 # =========================
 def main():
-    try:
-        log("=== FCT RunTime CT Pipeline START ===")
+    # ---- 실행 시간 측정 시작 ----
+    start_dt = datetime.now()
+    start_ts = time.perf_counter()
+    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+    log("=== FCT RunTime CT Pipeline START ===")
 
+    try:
         engine = get_engine(DB_CONFIG)
 
         df_raw = load_source(engine)
@@ -455,6 +458,13 @@ def main():
     except Exception as e:
         log(f"[ERROR] {type(e).__name__}: {e}")
         sys.exit(1)
+
+    finally:
+        # ---- 실행 시간 측정 종료 ----
+        elapsed = time.perf_counter() - start_ts
+        end_dt = datetime.now()
+        log(f"[END]   {end_dt:%Y-%m-%d %H:%M:%S}")
+        log(f"[TIME]  total_elapsed = {elapsed:.2f} sec ({elapsed/60:.2f} min)")
 
 
 if __name__ == "__main__":

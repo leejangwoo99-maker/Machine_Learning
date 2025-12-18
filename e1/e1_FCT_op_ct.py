@@ -11,9 +11,12 @@ FCT OP-CT Boxplot Summary + UPH(병렬합산) 계산 + PostgreSQL 저장 스크�
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
 - 테이블 존재 시 PASS
+- 실행 시작/종료 시각 및 총 소요 시간 출력 추가
 """
 
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 import urllib.parse
 
@@ -162,7 +165,6 @@ def load_source_df(engine) -> pd.DataFrame:
     df["op_ct"] = df.groupby(["station", "remark"])["end_ts"].diff().dt.total_seconds()
     df["month"] = pd.to_datetime(df["end_day"].astype(str)).dt.strftime("%Y%m")
 
-    # end_ts 파싱 실패 행은 op_ct 계산이 깨질 수 있어 경고만
     n_bad_ts = int(df["end_ts"].isna().sum())
     if n_bad_ts > 0:
         log(f"[WARN] end_ts 파싱 실패 행 {n_bad_ts}개 (end_time 형식 확인 필요)")
@@ -214,7 +216,6 @@ def summarize_group(g: pd.DataFrame):
     s_wo = s[(s >= lower_bound) & (s <= upper_bound)]
     avg_wo = float(s_wo.mean()) if len(s_wo) else None
 
-    # html boxplot 저장
     station = g["station"].iloc[0]
     remark  = g["remark"].iloc[0]
     month   = g["month"].iloc[0]
@@ -261,7 +262,6 @@ def build_summary_df(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     summary_df = pd.DataFrame(summary_rows)
 
-    # id 컬럼 맨 앞
     summary_df.insert(0, "id", range(1, len(summary_df) + 1))
     summary_df = summary_df.sort_values(["month", "remark", "station"]).reset_index(drop=True)
     summary_df["id"] = range(1, len(summary_df) + 1)
@@ -305,7 +305,6 @@ def build_plotly_json_column(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> 
 
         out.at[i, "plotly_json"] = make_boxplot_json(g) if len(g) else None
 
-    # html 필요 없으면 제거
     if "html" in out.columns:
         out = out.drop(columns=["html"])
 
@@ -387,9 +386,13 @@ def build_final_df_86(summary_df2: pd.DataFrame) -> pd.DataFrame:
 # 6) main
 # =========================
 def main():
-    try:
-        log("=== FCT OP-CT Pipeline START ===")
+    # ---- 실행 시간 측정 시작 ----
+    start_dt = datetime.now()
+    start_ts = time.perf_counter()
+    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+    log("=== FCT OP-CT Pipeline START ===")
 
+    try:
         engine = get_engine(DB_CONFIG)
 
         # 1) Load
@@ -414,6 +417,13 @@ def main():
     except Exception as e:
         log(f"[ERROR] {type(e).__name__}: {e}")
         sys.exit(1)
+
+    finally:
+        # ---- 실행 시간 측정 종료 ----
+        elapsed = time.perf_counter() - start_ts
+        end_dt = datetime.now()
+        log(f"[END]   {end_dt:%Y-%m-%d %H:%M:%S}")
+        log(f"[TIME]  total_elapsed = {elapsed:.2f} sec ({elapsed/60:.2f} min)")
 
 
 if __name__ == "__main__":
