@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # fct_machine_log_parser_mp_realtime.py
 # ============================================
 # FCT 머신 로그 파싱 + PostgreSQL 적재 (실시간/중복방지/오늘자만)
@@ -6,6 +7,7 @@
 # - end_day = 오늘(현재 날짜)만 적재  (파일명 YYYYMMDD 기준)
 # - (end_day, station, end_time, contents) 중복 방지 (UNIQUE INDEX + ON CONFLICT DO NOTHING)
 # - 현재시간 기준 120초 이내 새롭게 추가/수정된 파일만 처리(mtime 기준)
+# - end_time은 hh:mm:ss.ss 문자열로 고정 저장(VARCHAR(12))
 # ============================================
 
 import re
@@ -17,6 +19,7 @@ from multiprocessing import Pool, freeze_support
 import pandas as pd
 from sqlalchemy import create_engine, text
 import urllib.parse
+
 
 # ============================================
 # 1. 기본 설정
@@ -34,6 +37,7 @@ DB_CONFIG = {
 SCHEMA = "d1_machine_log"
 
 # 테이블명은 정확히 FCT1_machine_log ~ FCT4_machine_log 사용
+# (대문자/특수문자 안전 위해 " "로 감쌈)
 TABLE_BY_STATION = {
     "FCT1": '"FCT1_machine_log"',
     "FCT2": '"FCT2_machine_log"',
@@ -44,8 +48,11 @@ TABLE_BY_STATION = {
 # 파일명 패턴 (YYYYMMDD_FCT1~4_Machine_Log, YYYYMMDD_PDI1~4_Machine_Log 모두 허용)
 FILENAME_PATTERN = re.compile(r"(\d{8})_(FCT|PDI)([1-4])_Machine_Log", re.IGNORECASE)
 
-# 라인 패턴: [hh:mi:ss.ss] 내용
-LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
+# 라인 패턴:
+# - [hh:mm:ss] 또는 [hh:mm:ss.xx] 또는 [hh:mm:ss.xxxxxx] 모두 허용
+# - group(1)=hh:mm:ss, group(2)=frac(옵션), group(3)=contents
+LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?\]\s*(.*)$")
+
 
 # ============================================
 # 2) 요구사항: 멀티프로세스 2개 고정
@@ -63,6 +70,7 @@ SLEEP_SEC = 1
 # 처리 캐시: path -> last_mtime
 PROCESSED_MTIME = {}
 
+
 # ============================================
 # 4. DB 엔진 생성 & 스키마/테이블 생성 + UNIQUE INDEX
 # ============================================
@@ -75,34 +83,35 @@ def get_engine(config=DB_CONFIG):
 
     conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
     print("[INFO] Connection String:", conn_str)
-    return create_engine(conn_str)
+    return create_engine(conn_str, pool_pre_ping=True)
 
 
 CREATE_TABLE_TEMPLATE = """
 CREATE TABLE IF NOT EXISTS {schema}.{table} (
     id          BIGSERIAL PRIMARY KEY,
-    end_day     VARCHAR(8),   -- yyyymmdd (파일명 기준)
-    station     VARCHAR(10),  -- FCT1~4
-    end_time    TIME,         -- hh:mi:ss.ss
-    contents    VARCHAR(75)   -- 최대 75글자
+    end_day     VARCHAR(8),    -- yyyymmdd (파일명 기준)
+    station     VARCHAR(10),   -- FCT1~4
+    end_time    VARCHAR(12),   -- hh:mm:ss.ss (문자열 고정)
+    contents    VARCHAR(75)    -- 최대 75글자
 );
 """
+
 
 def _index_safe_name(table_quoted: str) -> str:
     # '"FCT1_machine_log"' -> fct1_machine_log
     return table_quoted.replace('"', "").lower()
 
+
 def ensure_schema_and_tables(engine):
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
 
-    with engine.begin() as conn:
         for station, table_quoted in TABLE_BY_STATION.items():
             ddl = CREATE_TABLE_TEMPLATE.format(schema=SCHEMA, table=table_quoted)
             conn.execute(text(ddl))
             print(f"[INFO] Table ensured: {SCHEMA}.{table_quoted}")
 
-            # 중복 방지용 UNIQUE INDEX
+            # 중복 방지용 UNIQUE INDEX (end_time 문자열 기준)
             idx_name = f"ux_{SCHEMA}_{_index_safe_name(table_quoted)}_dedup"
             conn.execute(text(f"""
                 CREATE UNIQUE INDEX IF NOT EXISTS {idx_name}
@@ -116,13 +125,14 @@ def ensure_schema_and_tables(engine):
 # ============================================
 def clean_contents(raw: str, max_len: int = 75) -> str:
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    s = " ".join(s.split())  # 연속 공백 정리
-    return s[:max_len]
+    s = " ".join(s.split())
+    return s[:max_len].strip()
 
 
 # ============================================
-# 6. 단일 로그 파일 파싱 (멀티프로세스용: top-level 함수)
+# 6. 단일 로그 파일 파싱
 #    + end_day=오늘인 파일/행만 적재(파일명 YYYYMMDD 기준)
+#    + end_time은 hh:mm:ss.ss로 정규화 후 문자열 저장
 # ============================================
 def parse_machine_log_file(path_str: str):
     """
@@ -130,6 +140,7 @@ def parse_machine_log_file(path_str: str):
     [{'end_day','station','end_time','contents'}, ...] 반환
     - end_day는 파일명(YYYYMMDD) 그대로 저장
     - 오늘 날짜(YYYYMMDD)와 같은 파일만 적재
+    - end_time은 항상 hh:mm:ss.ss 로 정규화 (문자열)
     """
     path = Path(path_str)
 
@@ -139,7 +150,7 @@ def parse_machine_log_file(path_str: str):
 
     file_ymd = m.group(1)        # YYYYMMDD (파일명 날짜)
     no = m.group(3)              # '1'~'4'
-    station = f"FCT{no}"         # PDI1~4도 FCT1~4로 취급
+    station = f"FCT{no}"         # PDI도 FCT로 취급
 
     today_ymd = datetime.now().strftime("%Y%m%d")
     if file_ymd != today_ymd:
@@ -154,11 +165,21 @@ def parse_machine_log_file(path_str: str):
                 if not mm:
                     continue
 
-                time_str = mm.group(1)
-                contents_raw = mm.group(2)
+                hms = mm.group(1)           # "13:16:34"
+                frac = mm.group(2) or ""    # "12" or "" or "123456"
+                contents_raw = mm.group(3)
 
+                # 항상 소수점 2자리로 정규화
+                if frac:
+                    frac2 = frac.ljust(2, "0")[:2]
+                else:
+                    frac2 = "00"
+
+                end_time_str = f"{hms}.{frac2}"  # "13:16:34.12" or "13:16:34.00"
+
+                # 유효성 검증
                 try:
-                    t = datetime.strptime(time_str, "%H:%M:%S.%f").time()
+                    datetime.strptime(end_time_str, "%H:%M:%S.%f")
                 except ValueError:
                     continue
 
@@ -166,9 +187,9 @@ def parse_machine_log_file(path_str: str):
 
                 rows.append(
                     {
-                        "end_day": file_ymd,    # 오늘(파일명 기준)
+                        "end_day": file_ymd,
                         "station": station,
-                        "end_time": t,          # time -> end_time
+                        "end_time": end_time_str,   # ✅ 문자열 저장
                         "contents": contents,
                     }
                 )
@@ -249,6 +270,7 @@ def collect_all_rows_multiprocess(file_list):
     if USE_MULTIPROCESSING and len(file_list) >= 2:
         procs = min(N_PROCESSES, len(file_list))
         print(f"[INFO] Multiprocessing enabled: processes={procs}, chunksize={POOL_CHUNKSIZE}")
+
         with Pool(processes=procs) as pool:
             for rows in pool.imap_unordered(parse_machine_log_file, file_list, chunksize=POOL_CHUNKSIZE):
                 for r in rows:
@@ -279,11 +301,7 @@ def insert_to_db(engine, data_by_station):
             df = pd.DataFrame(rows)
 
             # 정렬: end_day 오름차순, end_time 오름차순
-            df.sort_values(
-                by=["end_day", "end_time"],
-                ascending=[True, True],
-                inplace=True,
-            )
+            df.sort_values(by=["end_day", "end_time"], ascending=[True, True], inplace=True)
 
             table_quoted = TABLE_BY_STATION[station]
             full_table = f"{SCHEMA}.{table_quoted}"
@@ -312,7 +330,7 @@ def main():
                 time_mod.sleep(SLEEP_SEC)
                 continue
 
-            # 캐시 업데이트(원본 코드 정책 유지: 재시도 필요하면 insert 후로 이동)
+            # 캐시 업데이트 (원본 정책 유지)
             for fp in file_list:
                 try:
                     PROCESSED_MTIME[fp] = Path(fp).stat().st_mtime

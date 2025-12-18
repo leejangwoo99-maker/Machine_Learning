@@ -1,30 +1,55 @@
-# fct_detail_loader.py
-# -*- coding: utf-8 -*-
+# c1_fct_detail_loader_realtime.py
+# ============================================
+# FCT Detail TXT Parser -> PostgreSQL 적재 (Realtime Loop)
+#
+# 추가 반영 사항:
+# A) remark는 반드시 'PD' 또는 'Non-PD'만 허용
+#    - 폴더명에 'PD NONE' 포함 -> 'Non-PD'
+#    - 그 외 폴더명에 'PD' 포함 -> 'PD'
+#    - 둘 다 아니면 해당 파일은 "파일 전체 제외"
+#
+# B) test_ct 음수 보정 (자정 넘김 케이스)
+#    - 현재 test_time - 이전 test_time < 0 이면 +86400(초) 보정
+#
+# Scan:
+#   C:\Users\user\Desktop\machinlog\FCT\yyyy\mm\dd\**\*.txt (반드시 yyyy/mm/dd 형식만)
+# filename:
+#   (barcode)_yyyymmdd_(start time).txt
+# line:
+#   [hh:mm:ss.ss] (내용)  (형식 외 라인은 제외)
+#
+# end_time:
+#   마지막 행 시간 반올림 -> hh:mm:ss
+#
+# end_day:
+#   파일명 yyyymmdd (단, end_time < start_time이면 end_day +1)
+#
+# 중복방지:
+#   file_path 이미 존재하면 파일 통째 PASS (in-memory set + insert 후 set 갱신)
+#
+# 추가 요구 사양:
+# - [멀티프로세스] 2개 고정
+# - [무한 루프] 1초마다 재실행
+# - [유효 날짜] end_day == 오늘(date.today()) 인 row만 적재
+# - [실시간] 현재시간 기준 60초 이내로 새로 생성/수정된 파일만 파싱 (mtime)
+# ============================================
 
 import re
-import time
+import time as time_mod
 from pathlib import Path
-from datetime import date, datetime
+from datetime import datetime, timedelta, date, time as dt_time
 from multiprocessing import Pool, freeze_support
 
-import numpy as np
-import pandas as pd
+import urllib.parse
 import psycopg2
-from psycopg2 import sql
 from psycopg2.extras import execute_values
 
-# =========================
-# 고정 경로
-# =========================
-BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
-
-# 매핑 CSV
-MAP_PD  = Path(r"C:\data\PD.csv")
-MAP_NPD = Path(r"C:\data\Non-PD.csv")
 
 # =========================
-# DB 설정
+# 0) 설정
 # =========================
+BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")  # 루트 (YYYY/MM 구조)
+
 DB_CONFIG = {
     "host": "192.168.108.162",
     "port": 5432,
@@ -33,307 +58,338 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
-TGT_SCHEMA = "c1_fct_detail"
-TGT_TABLE  = "fct_detail"
+SCHEMA_NAME = "c1_fct_detail"
+TABLE_NAME = "fct_detail"
 
-SRC_SCHEMA = "a2_fct_table"
-SRC_TABLE  = "fct_table"
+# 실시간 mtime 컷오프(초)
+MTIME_WINDOW_SEC = 60
+
+# 무한루프 주기(초)
+LOOP_SLEEP_SEC = 1
+
+# 멀티프로세스 고정
+MP_PROCESSES = 2
+
+# 라인 패턴: [hh:mm:ss.ss] 내용
+LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{1,3})\]\s(.+)$")
+
+# yyyy/mm/dd 디렉토리명 검증
+YEAR_RE = re.compile(r"^\d{4}$")
+MONTH_RE = re.compile(r"^\d{2}$")
+DAY_RE = re.compile(r"^\d{2}$")
+
+# 파일명: (barcode)_yyyymmdd_(start time).txt
+FNAME_RE = re.compile(r"^(.+?)_(\d{8})_(.+?)\.txt$", re.IGNORECASE)
+
 
 # =========================
-# 성능 / 실시간 조건
+# 1) 유틸
 # =========================
-ANSI_LOG_ENCODING = "cp949"
+def _conn_str(cfg: dict) -> str:
+    pw = urllib.parse.quote_plus(cfg["password"])
+    return f"postgresql+psycopg2://{cfg['user']}:{pw}@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
 
-NUM_WORKERS = 2                      # 멀티프로세스 고정
-REALTIME_WINDOW_SEC = 120            # 120초 이내 파일만
-REALTIME_MODE = True
+def _psycopg2_conn(cfg: dict):
+    return psycopg2.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
+    )
 
-OK_PAT = re.compile(r"테스트\s*결과\s*:\s*OK")
-NG_PAT = re.compile(r"테스트\s*결과\s*:\s*NG")
+def _ensure_schema_and_table():
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};
 
+    CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{TABLE_NAME} (
+        barcode_information TEXT,
+        remark              TEXT,
+        end_day             DATE,
+        end_time            TIME,
+        contents            VARCHAR(80),
+        test_ct             DOUBLE PRECISION,
+        test_time           VARCHAR(12),
+        file_path           TEXT
+    );
 
-# =========================
-# DB 유틸
-# =========================
-def get_conn():
-    return psycopg2.connect(**DB_CONFIG)
-
-
-def ensure_schema_table():
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}")
-                    .format(sql.Identifier(TGT_SCHEMA)))
-
-        cur.execute(sql.SQL("""
-            CREATE TABLE IF NOT EXISTS {}.{} (
-                id BIGSERIAL PRIMARY KEY,
-                "group" INTEGER,
-                barcode_information TEXT,
-                station TEXT,
-                contents TEXT,
-                "time" TEXT,
-                ct NUMERIC(10,2),
-                result TEXT,
-                test_item TEXT,
-                problem1 TEXT,
-                problem2 TEXT,
-                problem3 TEXT,
-                problem4 TEXT,
-                end_day TEXT,
-                end_time TEXT,
-                remark TEXT,
-                file_path TEXT,
-                processed_at TIMESTAMP
-            );
-        """).format(sql.Identifier(TGT_SCHEMA), sql.Identifier(TGT_TABLE)))
-
-        cur.execute(sql.SQL("""
-            CREATE INDEX IF NOT EXISTS {} ON {}.{} (file_path);
-        """).format(
-            sql.Identifier(f"idx_{TGT_TABLE}_file_path"),
-            sql.Identifier(TGT_SCHEMA),
-            sql.Identifier(TGT_TABLE),
-        ))
+    CREATE INDEX IF NOT EXISTS ix_{TABLE_NAME}_file_path
+        ON {SCHEMA_NAME}.{TABLE_NAME} (file_path);
+    """
+    with _psycopg2_conn(DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
         conn.commit()
 
+def _load_existing_file_paths() -> set:
+    sql = f"SELECT DISTINCT file_path FROM {SCHEMA_NAME}.{TABLE_NAME};"
+    with _psycopg2_conn(DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    return {r[0] for r in rows if r and r[0]}
 
-def fetch_existing_file_paths(file_paths):
-    if not file_paths:
-        return set()
+def _parse_time_to_seconds(t_str: str) -> float:
+    hh = int(t_str[0:2])
+    mm = int(t_str[3:5])
+    ss = float(t_str[6:])
+    return hh * 3600.0 + mm * 60.0 + ss
 
-    q = sql.SQL("""
-        SELECT DISTINCT file_path
-        FROM {}.{}
-        WHERE file_path = ANY(%s);
-    """).format(sql.Identifier(TGT_SCHEMA), sql.Identifier(TGT_TABLE))
+def _round_to_hms(t_str: str) -> dt_time:
+    sec = _parse_time_to_seconds(t_str)
+    sec_rounded = int(sec + 0.5)
+    sec_rounded %= 24 * 3600
+    hh = sec_rounded // 3600
+    mm = (sec_rounded % 3600) // 60
+    ss = sec_rounded % 60
+    return dt_time(hour=hh, minute=mm, second=ss)
 
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(q, (list(file_paths),))
-        return set(r[0] for r in cur.fetchall())
-
-
-def fetch_processed_file_paths(limit=30):
-    q = sql.SQL("""
-        SELECT file_path, remark
-        FROM {}.{}
-        ORDER BY processed_at DESC NULLS LAST
-        LIMIT %s;
-    """).format(sql.Identifier(TGT_SCHEMA), sql.Identifier(TGT_TABLE))
-
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(q, (limit,))
-        return [(r[0], r[1]) for r in cur.fetchall()]
-
-
-# =========================
-# 매핑 / 병합
-# =========================
-def fetch_fct_table_map(barcodes):
-    if not barcodes:
-        return {}
-
-    q = sql.SQL("""
-        SELECT barcode_information, station, end_day, end_time
-        FROM {}.{}
-        WHERE barcode_information = ANY(%s);
-    """).format(sql.Identifier(SRC_SCHEMA), sql.Identifier(SRC_TABLE))
-
-    out = {}
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(q, (barcodes,))
-        for bc, st, ed, et in cur.fetchall():
-            out[bc] = (st, str(ed) if ed else None, et)
-    return out
-
-
-def merge_station_fields(df):
-    barcodes = df["barcode_information"].dropna().unique().tolist()
-    mp = fetch_fct_table_map(barcodes)
-
-    df["station"]  = df["barcode_information"].map(lambda x: mp.get(x, (None,None,None))[0])
-    df["end_day"]  = df["barcode_information"].map(lambda x: mp.get(x, (None,None,None))[1])
-    df["end_time"] = df["barcode_information"].map(lambda x: mp.get(x, (None,None,None))[2])
-    return df
-
-
-# =========================
-# 매핑 CSV
-# =========================
-def load_mapping_df():
-    def _read(p):
-        try:
-            return pd.read_csv(p, encoding="cp949")
-        except:
-            return pd.read_csv(p, encoding="utf-8-sig")
-
-    def _norm(df, remark):
-        if "seq" not in df.columns:
-            df.insert(0, "seq", np.arange(1, len(df)+1))
-        df["remark"] = remark
-        return df[["seq","problem1","problem2","problem3","problem4","test_item","remark"]]
-
-    return pd.concat([
-        _norm(_read(MAP_PD), "PD"),
-        _norm(_read(MAP_NPD), "Non-PD")
-    ], ignore_index=True)
-
-
-# =========================
-# 파일 스캔 (날짜 요구사항 제거)
-# =========================
-def detect_remark_from_folder(name):
-    u = name.upper()
-    if "PD NONE" in u:
+def _infer_remark_strict(file_path: Path):
+    parts_upper = [p.upper() for p in file_path.parts]
+    if any("PD NONE" in p for p in parts_upper):
         return "Non-PD"
-    if "PD" in u:
+    if any("PD" in p for p in parts_upper):
         return "PD"
     return None
 
+def _safe_read_lines(path: Path) -> list[str]:
+    encodings = ["cp949", "cp1252", "utf-8"]
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc, errors="strict") as f:
+                return f.read().splitlines()
+        except Exception:
+            pass
+    with open(path, "r", encoding="cp949", errors="replace") as f:
+        return f.read().splitlines()
 
-def list_candidate_files_realtime(cutoff_ts):
-    """
-    ✅ 오늘 날짜 폴더만 스캔
-    ✅ mtime >= cutoff_ts 인 파일만
-    """
-    today = date.today()
-    day_dir = BASE_DIR / f"{today.year:04d}" / f"{today.month:02d}" / f"{today.day:02d}"
-    if not day_dir.exists():
-        return []
+def _try_parse_start_time_to_seconds(s: str):
+    s = s.strip()
+    m1 = re.match(r"^(\d{2}:\d{2}:\d{2})(\.\d{1,3})?$", s)
+    if m1:
+        base = m1.group(1)
+        frac = m1.group(2) or ".00"
+        return _parse_time_to_seconds(base + frac)
+    m2 = re.match(r"^(\d{2})(\d{2})(\d{2})$", s)
+    if m2:
+        return float(int(m2.group(1)) * 3600 + int(m2.group(2)) * 60 + int(m2.group(3)))
+    return None
 
-    out = []
-    for folder in day_dir.iterdir():
-        if not folder.is_dir():
+
+# =========================
+# 2) 파일 파싱 (멀티프로세스 worker)
+# =========================
+def _parse_one_file_only_today(file_path_str: str):
+    """
+    end_day == 오늘(date.today()) 인 row만 리턴.
+    return:
+      (file_path_str, rows, status)
+      status: "OK" | "SKIP_REMARK" | "SKIP_EMPTY" | "SKIP_BADNAME" | "SKIP_NOT_TODAY"
+    """
+    p = Path(file_path_str)
+
+    remark = _infer_remark_strict(p)
+    if remark is None:
+        return file_path_str, [], "SKIP_REMARK"
+
+    m = FNAME_RE.match(p.name)
+    if not m:
+        return file_path_str, [], "SKIP_BADNAME"
+
+    barcode = m.group(1).strip()
+    yyyymmdd = m.group(2).strip()
+    start_time_raw = m.group(3).strip()
+
+    try:
+        base_day = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    except ValueError:
+        return file_path_str, [], "SKIP_BADNAME"
+
+    lines = _safe_read_lines(p)
+
+    parsed_times = []
+    parsed_contents = []
+
+    for line in lines:
+        mm2 = LINE_RE.match(line)
+        if not mm2:
             continue
-        remark = detect_remark_from_folder(folder.name)
-        for fp in folder.iterdir():
-            if fp.is_file() and "_" in fp.name:
-                try:
-                    if fp.stat().st_mtime >= cutoff_ts:
-                        out.append((str(fp), remark))
-                except:
-                    pass
-    return out
+        t_str = mm2.group(1).strip()
+        content = mm2.group(2).strip()
+        if not content:
+            continue
+        parsed_times.append(t_str[:12])
+        parsed_contents.append(content[:80])
 
+    if not parsed_times:
+        return file_path_str, [], "SKIP_EMPTY"
 
-# =========================
-# 파싱
-# =========================
-def t_to_cs(t):
-    return ((int(t[:2])*60 + int(t[3:5]))*60 + int(t[6:8]))*100 + int(t[9:11])
+    end_time_obj = _round_to_hms(parsed_times[-1])
 
+    start_sec = _try_parse_start_time_to_seconds(start_time_raw)
+    end_sec_last = _parse_time_to_seconds(parsed_times[-1])
+    end_day = base_day
+    if start_sec is not None and end_sec_last < start_sec:
+        end_day = base_day + timedelta(days=1)
 
-def parse_one_file_fast(args):
-    fp_str, remark = args
-    fp = Path(fp_str)
-    barcode = fp.name.split("_",1)[0]
+    # [유효 날짜] end_day == 오늘만
+    today = date.today()
+    if end_day != today:
+        return file_path_str, [], "SKIP_NOT_TODAY"
 
     rows = []
-    try:
-        with open(fp, encoding=ANSI_LOG_ENCODING, errors="ignore") as f:
-            for ln in f:
-                ln = ln.strip()
-                if ln.startswith("[") and len(ln) >= 13:
-                    t = ln[1:12]
-                    if t[2]==":" and t[5]==":" and t[8]==".":
-                        rows.append((t_to_cs(t), t, ln.split("]",1)[1].strip()))
-    except:
-        return None
+    prev_sec = None
+    for t_str, content in zip(parsed_times, parsed_contents):
+        cur_sec = _parse_time_to_seconds(t_str)
+        test_ct = None
+        if prev_sec is not None:
+            diff = cur_sec - prev_sec
+            if diff < 0:
+                diff += 86400.0
+            test_ct = diff
+        prev_sec = cur_sec
 
-    rows.sort()
-    out, prev, seq = [], None, 0
-    for cs,t,c in rows:
-        ct = None if prev is None else round((cs-prev)/100,2)
-        prev = cs
-        res = None
-        if OK_PAT.search(c) or NG_PAT.search(c):
-            seq += 1
-            res = "PASS" if OK_PAT.search(c) else "FAIL"
-        out.append({
-            "barcode_information": barcode,
-            "remark": remark,
-            "contents": c,
-            "time": t,
-            "ct": ct,
-            "result": res,
-            "seq": seq if res else None,
-            "file_path": str(fp)
-        })
-    return out
+        rows.append((
+            barcode,
+            remark,
+            end_day,
+            end_time_obj,
+            content,
+            test_ct,
+            t_str,
+            str(p),
+        ))
 
-
-def build_df_from_files(cands, map_df):
-    parsed = []
-    with Pool(NUM_WORKERS) as p:
-        for r in p.imap_unordered(parse_one_file_fast, cands):
-            if r: parsed.extend(r)
-
-    df = pd.DataFrame(parsed)
-    if df.empty:
-        return df
-
-    df = df.merge(map_df, how="left", on=["remark","seq"])
-    df.drop(columns=["seq"], inplace=True)
-    df["processed_at"] = datetime.now()
-
-    gmap = {b:i+1 for i,b in enumerate(df["barcode_information"].unique())}
-    df.insert(0,"group",df["barcode_information"].map(gmap))
-    return df
+    return file_path_str, rows, "OK"
 
 
 # =========================
-# SHOW
+# 3) 스캔: yyyy/mm/dd 형식만 + 실시간(mtime 60초)
 # =========================
-def show_already_processed_data(map_df):
-    paths = fetch_processed_file_paths(30)
-    if not paths:
-        return
-    cands = [(p,r) for p,r in paths]
-    df = build_df_from_files(cands, map_df)
-    print(df.head(20).to_string(index=False))
+def _iter_valid_month_folders(base: Path):
+    for y in sorted([p for p in base.iterdir() if p.is_dir() and YEAR_RE.match(p.name)]):
+        for m in sorted([p for p in y.iterdir() if p.is_dir() and MONTH_RE.match(p.name)]):
+            yield m
+
+def _collect_realtime_files(base: Path, cutoff_ts: float) -> list[str]:
+    """
+    cutoff_ts 이후 mtime 변경이 있는 txt만 수집
+    """
+    targets = []
+    for month_dir in _iter_valid_month_folders(base):
+        day_dirs = [d for d in month_dir.iterdir() if d.is_dir() and DAY_RE.match(d.name)]
+        for dd in day_dirs:
+            for fp in dd.rglob("*.txt"):
+                if not fp.is_file():
+                    continue
+                try:
+                    if fp.stat().st_mtime >= cutoff_ts:
+                        targets.append(str(fp))
+                except Exception:
+                    # 접근 중 삭제/권한 등은 스킵
+                    continue
+    return targets
 
 
 # =========================
-# MAIN LOOP
+# 4) DB Insert
 # =========================
-def main_loop():
-    ensure_schema_table()
-    map_df = load_mapping_df()
+def _insert_rows(rows: list[tuple]) -> int:
+    if not rows:
+        return 0
+    sql = f"""
+    INSERT INTO {SCHEMA_NAME}.{TABLE_NAME}
+    (barcode_information, remark, end_day, end_time, contents, test_ct, test_time, file_path)
+    VALUES %s
+    """
+    with _psycopg2_conn(DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            execute_values(cur, sql, rows, page_size=5000)
+        conn.commit()
+    return len(rows)
 
-    show_already_processed_data(map_df)
+
+# =========================
+# 5) main loop
+# =========================
+def main():
+    print(f"[INFO] Connection String: {_conn_str(DB_CONFIG)}")
+    _ensure_schema_and_table()
+    print(f"[INFO] Table ensured: {SCHEMA_NAME}.{TABLE_NAME}")
+
+    # 기동 시 1회만 로딩 (이후 insert될 때 set 갱신)
+    existing = _load_existing_file_paths()
+    print(f"[INFO] existing_files_loaded={len(existing):,}")
+
+    chunksize = 10
+    print(f"[INFO] Multiprocessing fixed: processes={MP_PROCESSES}, chunksize={chunksize}")
+    print(f"[INFO] Realtime window: mtime within {MTIME_WINDOW_SEC}s, loop every {LOOP_SLEEP_SEC}s")
+    print(f"[INFO] Only insert rows where end_day == today")
+
+    # 누적 통계(옵션)
+    total_inserted = 0
 
     while True:
-        cutoff_ts = time.time() - REALTIME_WINDOW_SEC
-        print(f"[INFO] cutoff_ts={cutoff_ts}")
+        try:
+            now_ts = time_mod.time()
+            cutoff_ts = now_ts - MTIME_WINDOW_SEC  # 실시간 컷오프(요구사항)
 
-        cands = list_candidate_files_realtime(cutoff_ts)
-        if not cands:
-            time.sleep(1)
-            continue
+            candidate_files = _collect_realtime_files(BASE_DIR, cutoff_ts)
 
-        existing = fetch_existing_file_paths([p for p,_ in cands])
-        new_cands = [(p,r) for p,r in cands if p not in existing]
+            # 중복(이미 적재된 file_path) 제외
+            new_files = [f for f in candidate_files if f not in existing]
 
-        if not new_cands:
-            time.sleep(1)
-            continue
+            if not new_files:
+                # 너무 시끄럽지 않게 주기적으로만 출력
+                time_mod.sleep(LOOP_SLEEP_SEC)
+                continue
 
-        df = build_df_from_files(new_cands, map_df)
-        if df.empty:
-            time.sleep(1)
-            continue
+            parsed_rows_all = []
+            processed = 0
 
-        df = merge_station_fields(df)
+            skip_remark = 0
+            skip_empty = 0
+            skip_badname = 0
+            skip_not_today = 0
 
-        # ✅ 오늘 end_day만 유효
-        today = str(date.today())
-        df = df[df["end_day"] == today]
+            with Pool(processes=MP_PROCESSES) as pool:
+                for file_path_str, rows, status in pool.imap_unordered(_parse_one_file_only_today, new_files, chunksize=chunksize):
+                    processed += 1
+                    if status == "OK":
+                        parsed_rows_all.extend(rows)
+                        # 파일 단위 중복방지 set에 즉시 반영 (동일 loop 내 재처리 방지)
+                        existing.add(file_path_str)
+                    else:
+                        if status == "SKIP_REMARK":
+                            skip_remark += 1
+                        elif status == "SKIP_EMPTY":
+                            skip_empty += 1
+                        elif status == "SKIP_BADNAME":
+                            skip_badname += 1
+                        elif status == "SKIP_NOT_TODAY":
+                            skip_not_today += 1
 
-        if not df.empty:
-            insert_df(df)
+                        # 파싱 실패/스킵 파일은 다음 loop에서 재시도될 수 있으므로 set에 넣지 않음
 
-        time.sleep(1)
+            inserted = _insert_rows(parsed_rows_all)
+            total_inserted += inserted
+
+            print(
+                f"[INFO] loop_done | candidates={len(candidate_files):,} new_files={len(new_files):,} "
+                f"processed={processed:,} inserted_rows={inserted:,} total_inserted={total_inserted:,} "
+                f"| skipped: remark={skip_remark:,}, empty={skip_empty:,}, badname={skip_badname:,}, not_today={skip_not_today:,}"
+            )
+
+        except KeyboardInterrupt:
+            print("[INFO] KeyboardInterrupt. Stop.")
+            break
+        except Exception as e:
+            # 실시간 루프이므로 죽지 않게
+            print(f"[WARN] loop_error: {e}")
+
+        time_mod.sleep(LOOP_SLEEP_SEC)
 
 
 if __name__ == "__main__":
     freeze_support()
-    main_loop()
+    main()

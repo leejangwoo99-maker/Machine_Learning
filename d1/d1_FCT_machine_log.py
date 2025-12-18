@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # fct_machine_log_parser_mp.py
 # ============================================
 # FCT 머신 로그 파싱 + PostgreSQL 적재 (멀티프로세스 파싱)
@@ -5,6 +6,7 @@
 # - dayornight 컬럼 제거
 # - time 컬럼 -> end_time 컬럼으로 변경
 # - end_day는 파일명(YYYYMMDD) 기준으로만 저장
+# - end_time은 hh:mm:ss.ss 문자열로 고정 저장 (VARCHAR(12))
 # ============================================
 
 import re
@@ -15,6 +17,7 @@ from multiprocessing import Pool, cpu_count, freeze_support
 import pandas as pd
 from sqlalchemy import create_engine, text
 import urllib.parse
+
 
 # ============================================
 # 1. 기본 설정
@@ -31,24 +34,25 @@ DB_CONFIG = {
 
 SCHEMA = "d1_machine_log"
 
-# 테이블명은 정확히 FCT1_machine_log ~ FCT4_machine_log 사용
+# 테이블명은 정확히 FCT1_machine_log ~ FCT4_machine_log 사용 (대문자 포함 가능해서 " " 유지)
 TABLE_BY_STATION = {
-    "FCT1": '"FCT1_machine_log"',
-    "FCT2": '"FCT2_machine_log"',
-    "FCT3": '"FCT3_machine_log"',
-    "FCT4": '"FCT4_machine_log"',
+    "FCT1": 'FCT1_machine_log',
+    "FCT2": 'FCT2_machine_log',
+    "FCT3": 'FCT3_machine_log',
+    "FCT4": 'FCT4_machine_log',
 }
 
 # 파일명 패턴 (YYYYMMDD_FCT1~4_Machine_Log, YYYYMMDD_PDI1~4_Machine_Log 모두 허용)
 FILENAME_PATTERN = re.compile(r"(\d{8})_(FCT|PDI)([1-4])_Machine_Log", re.IGNORECASE)
 
-# 라인 패턴: [hh:mi:ss.ss] 내용
-LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
+# 라인 패턴: [hh:mi:ss] 또는 [hh:mi:ss.xxx...] 모두 허용
+# group(1)=hh:mm:ss, group(2)=frac(옵션), group(3)=contents
+LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?\]\s*(.*)$")
 
 # 멀티프로세스 설정
 USE_MULTIPROCESSING = True
 N_PROCESSES = max(1, cpu_count() - 1)  # CPU 여유 1개 남김
-POOL_CHUNKSIZE = 10                   # 파일 수가 많으면 10~50 권장
+POOL_CHUNKSIZE = 10                    # 파일 수가 많으면 10~50 권장
 
 
 # ============================================
@@ -63,29 +67,28 @@ def get_engine(config=DB_CONFIG):
 
     conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
     print("[INFO] Connection String:", conn_str)
-    return create_engine(conn_str)
+    return create_engine(conn_str, pool_pre_ping=True)
 
 
 CREATE_TABLE_TEMPLATE = """
-CREATE TABLE IF NOT EXISTS {schema}.{table} (
-    id          BIGSERIAL PRIMARY KEY,
-    end_day     VARCHAR(8),   -- yyyymmdd (파일명 기준)
-    station     VARCHAR(10),  -- FCT1~4
-    end_time    TIME,         -- hh:mi:ss.ss
-    contents    VARCHAR(75)   -- 최대 75글자
+CREATE TABLE IF NOT EXISTS {schema}."{table}" (
+    id        BIGSERIAL PRIMARY KEY,
+    end_day   VARCHAR(8),     -- yyyymmdd (파일명 기준)
+    station   VARCHAR(10),    -- FCT1~4
+    end_time  VARCHAR(12),    -- hh:mm:ss.ss (문자열 고정)
+    contents  VARCHAR(75)     -- 최대 75글자
 );
 """
 
 
 def ensure_schema_and_tables(engine):
     with engine.begin() as conn:
-        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS {SCHEMA}'))
 
-    with engine.begin() as conn:
         for station, table in TABLE_BY_STATION.items():
             ddl = CREATE_TABLE_TEMPLATE.format(schema=SCHEMA, table=table)
             conn.execute(text(ddl))
-            print(f"[INFO] Table ensured: {SCHEMA}.{table}")
+            print(f'[INFO] Table ensured: {SCHEMA}."{table}"')
 
 
 # ============================================
@@ -94,17 +97,19 @@ def ensure_schema_and_tables(engine):
 def clean_contents(raw: str, max_len: int = 75) -> str:
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     s = " ".join(s.split())  # 연속 공백 정리
-    return s[:max_len]
+    return s[:max_len].strip()
 
 
 # ============================================
-# 4. 단일 로그 파일 파싱 (멀티프로세스용: top-level 함수)
+# 4. 단일 로그 파일 파싱 (멀티프로세스용)
 # ============================================
 def parse_machine_log_file(path_str: str):
     """
     한 개의 로그 파일을 파싱해서
     [{'end_day', 'station', 'end_time', 'contents'}, ...] 리스트 반환
     - end_day는 파일명 YYYYMMDD 그대로 저장
+    - end_time은 hh:mm:ss.ss 문자열로 정규화하여 저장
+      (소수점이 없으면 .00, 1자리면 0패딩, 3~6자리는 앞 2자리만)
     """
     path = Path(path_str)
 
@@ -122,15 +127,26 @@ def parse_machine_log_file(path_str: str):
         with path.open("r", encoding="cp949", errors="ignore") as f:
             for line in f:
                 line = line.rstrip("\n")
+
                 mm = LINE_PATTERN.match(line)
                 if not mm:
                     continue
 
-                time_str = mm.group(1)
-                contents_raw = mm.group(2)
+                hms = mm.group(1)          # "13:16:34"
+                frac = mm.group(2) or ""   # "12" or "" or "123456"
+                contents_raw = mm.group(3)
 
+                # 항상 소수점 2자리로 정규화
+                if frac:
+                    frac2 = frac.ljust(2, "0")[:2]   # 1자리면 0패딩, 3~6자리는 앞 2자리
+                else:
+                    frac2 = "00"
+
+                end_time_str = f"{hms}.{frac2}"      # "13:16:34.12" 또는 "13:16:34.00"
+
+                # 유효성 검증 (hh:mm:ss.ss)
                 try:
-                    t = datetime.strptime(time_str, "%H:%M:%S.%f").time()
+                    datetime.strptime(end_time_str, "%H:%M:%S.%f")
                 except ValueError:
                     continue
 
@@ -138,9 +154,9 @@ def parse_machine_log_file(path_str: str):
 
                 rows.append(
                     {
-                        "end_day": file_ymd,   # ✅ 파일명 기준으로만 저장
+                        "end_day": file_ymd,
                         "station": station,
-                        "end_time": t,         # ✅ 컬럼명 변경
+                        "end_time": end_time_str,   # ✅ 문자열 저장
                         "contents": contents,
                     }
                 )
@@ -222,15 +238,10 @@ def insert_to_db(engine, data_by_station):
                 continue
 
             df = pd.DataFrame(rows)
+            df.sort_values(by=["end_day", "end_time"], ascending=[True, True], inplace=True)
 
-            df.sort_values(
-                by=["end_day", "end_time"],
-                ascending=[True, True],
-                inplace=True,
-            )
-
-            table_quoted = TABLE_BY_STATION[station]
-            full_table = f"{SCHEMA}.{table_quoted}"
+            table_name = TABLE_BY_STATION[station]
+            full_table = f'{SCHEMA}."{table_name}"'
 
             insert_sql = text(
                 f"""
