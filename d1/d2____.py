@@ -20,7 +20,7 @@ import urllib.parse
 # ============================================
 # 1. 기본 설정
 # ============================================
-BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")  # 루트
+BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log")  # 루트
 VISION_DIR_NAME = "Vision"  # 루트 하위 Vision 폴더를 탐색
 
 DB_CONFIG = {
