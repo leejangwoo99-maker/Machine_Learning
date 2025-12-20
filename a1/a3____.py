@@ -37,7 +37,7 @@ TABLE_NAME  = "vision_table"
 # 날짜 범위 고정 (요청)
 # ==========================
 START_DAY = 20251001
-END_DAY   = 20251219
+END_DAY   = 20251220
 
 # ==========================
 # DB 유틸
@@ -375,14 +375,9 @@ def run_once():
 # ==========================
 # 무한 루프 (1초)
 # ==========================
-def main():
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            print("[ERROR] run_once 중 예외 발생:", e, flush=True)
-        time.sleep(1)
-
 if __name__ == "__main__":
     mp.freeze_support()
-    main()
+    try:
+        run_once()
+    except Exception as e:
+        print("[ERROR] run_once 중 예외 발생:", e, flush=True)

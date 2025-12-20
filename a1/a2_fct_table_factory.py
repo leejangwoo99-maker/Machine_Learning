@@ -1,24 +1,62 @@
-from pathlib import Path
+# -*- coding: utf-8 -*-
+"""
+a2_fct_table_parser_mp_realtime.py
+
+추가 반영
+- 파일 저장 중(미완성) 파싱 방지:
+  * 파일 size/mtime이 짧은 간격으로 2회 연속 동일하면 안정 파일로 판단
+  * 불일치/예외 시 이번 루프 스킵
+
+기존 반영
+- 최근 60초(mtime) 파일만 파싱
+- 중복 방지: UNIQUE(file_path) + ON CONFLICT DO NOTHING
+- 폴더 구조: \\HistoryLog\\TCx\\YYYYMMDD\\{BadFile,GoodFile}\\*.txt
+- 멀티프로세스 2개 고정
+- 1초마다 무한 루프
+"""
+
+from __future__ import annotations
+
 import re
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
 from multiprocessing import Pool, freeze_support
+from typing import List, Optional, Tuple
 
 import psycopg2
-from psycopg2 import sql
-import pandas as pd
+from psycopg2.extras import execute_values
 
-# ============================================
-# 0) 공장 전용: 경로 / DB 설정
-# ============================================
 
-# a. 공장 NAS 경로
-BASE_LOG_DIR = Path(r"\\192.168.108.101\HistoryLog")
+# =========================
+# 0) 설정
+# =========================
 
-TC_FOLDERS = ["TC6", "TC7", "TC8", "TC9"]
-TARGET_FOLDERS = ["GoodFile", "BadFile"]
+BASE_DIR = Path(r"\\192.168.108.101\HistoryLog")
 
-# b. 공장 DB 접속 정보
+TC_TO_STATION = {
+    "TC6": "FCT1",
+    "TC7": "FCT2",
+    "TC8": "FCT3",
+    "TC9": "FCT4",
+}
+
+TARGET_SUBFOLDERS = ["GoodFile", "BadFile"]
+
+# 실시간 조건
+REALTIME_SEC = 60     # 최근 60초
+LOOP_SEC = 1          # 1초마다 재실행
+
+# 멀티프로세스 고정
+USE_MULTIPROCESSING = True
+WORKERS = 2
+
+# [추가] 미완성 파일 방지(안정성 체크)
+STABILITY_CHECK_ENABLED = True
+STABILITY_INTERVAL_SEC = 0.2   # 200ms 후 다시 stat 비교
+STABILITY_TRIES = 2            # 연속 2회 동일해야 통과 (요청 취지에 맞춤)
+
 DB_CONFIG = {
     "host": "192.168.108.162",
     "port": 5432,
@@ -26,457 +64,402 @@ DB_CONFIG = {
     "user": "postgres",
     "password": "leejangwoo1!",
 }
-
-# 스키마/테이블
 SCHEMA_NAME = "a2_fct_table"
-TABLE_NAME = "fct_table"
+TABLE_NAME  = "fct_table"
 
-# d. 실시간 처리 윈도우(초)
-REALTIME_WINDOW_SEC = 120
-
-# e. 멀티프로세스 2개 고정
-MP_PROCESSES = 2
+EXECUTE_VALUES_PAGE_SIZE = 10_000
 
 
-# ============================================
-# 1) PostgreSQL 관련 함수
-# ============================================
+# =========================
+# 1) 유틸
+# =========================
 
-def get_connection():
-    conn = psycopg2.connect(**DB_CONFIG)
-    conn.autocommit = True
-    return conn
+@dataclass(frozen=True)
+class ParsedRow:
+    barcode_information: str
+    remark: str
+    station: str
+    end_day: str
+    end_time: str
+    run_time: str
+    step_description: str
+    value: str
+    min_v: str
+    max_v: str
+    result: str
+    file_path: str
 
-
-def init_db(conn):
-    """
-    스키마/테이블 생성.
-    컬럼 순서(요청):
-    id, barcode_information, station, run_time, end_day, end_time, remark,
-    step_description, value, min, max, result, file_path, processed_at
-    """
-    create_schema_sql = sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
-        sql.Identifier(SCHEMA_NAME)
-    )
-
-    create_table_sql = sql.SQL("""
-        CREATE TABLE IF NOT EXISTS {}.{} (
-            id BIGSERIAL PRIMARY KEY,
-
-            barcode_information TEXT,
-            station            TEXT,
-            run_time           TEXT,
-            end_day            TEXT,
-            end_time           TEXT,
-            remark             TEXT,
-
-            step_description   TEXT,
-            value              TEXT,
-            min                TEXT,
-            max                TEXT,
-            result             TEXT,
-
-            file_path          TEXT NOT NULL,
-            processed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-    """).format(sql.Identifier(SCHEMA_NAME), sql.Identifier(TABLE_NAME))
-
-    create_idx_sql_1 = sql.SQL("""
-        CREATE INDEX IF NOT EXISTS {} ON {}.{} (file_path);
-    """).format(
-        sql.Identifier(f"idx_{TABLE_NAME}_file_path"),
-        sql.Identifier(SCHEMA_NAME),
-        sql.Identifier(TABLE_NAME),
-    )
-
-    with conn.cursor() as cur:
-        cur.execute(create_schema_sql)
-        cur.execute(create_table_sql)
-        cur.execute(create_idx_sql_1)
-
-
-def get_processed_file_paths(conn) -> set:
-    """
-    file_path가 이미 존재하면 해당 파일은 중복으로 간주하여 처리하지 않음.
-    """
-    query = sql.SQL("SELECT DISTINCT file_path FROM {}.{}").format(
-        sql.Identifier(SCHEMA_NAME),
-        sql.Identifier(TABLE_NAME),
-    )
-    with conn.cursor() as cur:
-        cur.execute(query)
-        rows = cur.fetchall()
-    return {r[0] for r in rows}
-
-
-def insert_records(conn, records: list[dict]):
-    if not records:
-        return
-
-    df = pd.DataFrame(records)
-
-    expected_cols = [
-        "barcode_information",
-        "station",
-        "run_time",
-        "end_day",
-        "end_time",
-        "remark",
-        "step_description",
-        "value",
-        "min",
-        "max",
-        "result",
-        "file_path",
-    ]
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = ""
-
-    rows = list(df[expected_cols].itertuples(index=False, name=None))
-
-    insert_sql = sql.SQL("""
-        INSERT INTO {}.{} (
-            barcode_information,
-            station,
-            run_time,
-            end_day,
-            end_time,
-            remark,
-            step_description,
-            value,
-            min,
-            max,
-            result,
-            file_path
+    def as_tuple(self) -> Tuple[str, str, str, str, str, str, str, str, str, str, str, str]:
+        return (
+            self.barcode_information,
+            self.remark,
+            self.station,
+            self.end_day,
+            self.end_time,
+            self.run_time,
+            self.step_description,
+            self.value,
+            self.min_v,
+            self.max_v,
+            self.result,
+            self.file_path,
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """).format(sql.Identifier(SCHEMA_NAME), sql.Identifier(TABLE_NAME))
-
-    with conn.cursor() as cur:
-        cur.executemany(insert_sql, rows)
 
 
-# ============================================
-# 2) FCT 로그 파싱용 정규식/유틸
-# ============================================
-
-STATION_PATTERN = re.compile(r"Station\s*:?\s*(\S+)", re.IGNORECASE)
-BARCODE_PATTERN = re.compile(r"Barcode\s+information\s*:?\s*(.+)", re.IGNORECASE)
-
-# Run Time              :27.0
-RUNTIME_PATTERN = re.compile(r"Run\s*Time\s*:?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def normalize_step_desc(desc: str) -> str:
-    return " ".join(desc.split())
+def today_yyyymmdd(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    return now.strftime("%Y%m%d")
 
 
-def parse_end_day_end_time_from_path(file_path: Path):
-    """
-    end_day: ...\\TCx\\yyyymmdd\\GoodFile(or BadFile)\\... 에서 yyyymmdd
-    end_time: 파일명 ..._yyyymmddhhmiss_... 에서 hh:mi:ss
-    """
-    end_day = ""
+def safe_read_text(file_path: Path) -> Optional[List[str]]:
     try:
-        end_day = file_path.parent.parent.name
+        for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
+            try:
+                return file_path.read_text(encoding=enc, errors="strict").splitlines()
+            except UnicodeDecodeError:
+                continue
+        return file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
     except Exception:
-        end_day = ""
+        return None
 
-    end_time = ""
+
+def file_is_stable(fp: Path) -> bool:
+    """
+    미완성 파일 방지:
+    - 지정한 간격(STABILITY_INTERVAL_SEC)으로 stat을 반복해서
+      (size, mtime)가 연속으로 동일하면 stable 판정.
+    - 네트워크/락/권한 이슈 등 예외 발생 시 False.
+    """
     try:
-        stem = file_path.stem
-        parts = stem.split("_")
-        if len(parts) >= 2:
-            ts = parts[1]
-            if ts.isdigit() and len(ts) == 14:
-                hh, mi, ss = ts[8:10], ts[10:12], ts[12:14]
-                end_time = f"{hh}:{mi}:{ss}"
+        s0 = fp.stat()
+        prev = (s0.st_size, s0.st_mtime)
+
+        for _ in range(STABILITY_TRIES - 1):
+            time.sleep(STABILITY_INTERVAL_SEC)
+            s1 = fp.stat()
+            cur = (s1.st_size, s1.st_mtime)
+            if cur != prev:
+                return False
+            prev = cur
+
+        # size가 0인 파일은 보통 미완성/깨짐일 확률이 높아서 방어적으로 제외
+        if prev[0] <= 0:
+            return False
+
+        return True
     except Exception:
-        end_time = ""
-
-    return end_day, end_time
+        return False
 
 
-def make_remark_from_barcode(barcode: str) -> str:
-    if barcode and len(barcode) >= 18:
-        c18 = barcode[17]
-        return "PD" if c18 in ("J", "S") else "Non-PD"
-    return ""
+# =========================
+# 2) 파싱 로직
+# =========================
 
+_RUN_TIME_RE = re.compile(r"Run\s*Time\s*:\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 
-def strip_brackets_result(result_raw: str) -> str:
+def parse_filename(file_path: Path) -> Optional[Tuple[str, str, str, str]]:
     """
-    "[PASS]" -> "PASS"
-    " [ FAIL ] " -> "FAIL"
+    return (barcode_information, end_day, end_time, remark)
     """
-    if not result_raw:
-        return ""
-    s = result_raw.strip()
-    if s.startswith("[") and s.endswith("]") and len(s) >= 2:
-        s = s[1:-1]
-    return s.strip()
+    name = file_path.name
+    if "_" not in name:
+        return None
+
+    parts = name.split("_")
+    if len(parts) < 2:
+        return None
+
+    barcode_information = parts[0].strip()
+    dt14 = parts[1].strip()
+    if not re.fullmatch(r"\d{14}", dt14):
+        return None
+
+    end_day = dt14[:8]
+    end_time = dt14[8:]
+
+    remark = "Non-PD"
+    if len(barcode_information) >= 18:
+        ch = barcode_information[17]
+        if ch in ("J", "S"):
+            remark = "PD"
+
+    return barcode_information, end_day, end_time, remark
 
 
-def parse_run_time_from_lines(lines: list[str]) -> str:
-    """
-    파일 14번째 줄(1-indexed) 우선에서 Run Time 값을 추출
-    없으면 전체 라인에서 보조 검색
-    """
+def parse_run_time(lines: List[str]) -> str:
     if len(lines) >= 14:
-        m = RUNTIME_PATTERN.search(lines[13])
+        m = _RUN_TIME_RE.search(lines[13])
         if m:
             return m.group(1).strip()
-
-    for line in lines:
-        m = RUNTIME_PATTERN.search(line)
+    for ln in lines:
+        m = _RUN_TIME_RE.search(ln)
         if m:
             return m.group(1).strip()
-
     return ""
 
 
-def parse_station_barcode(lines: list[str]):
-    station = None
-    barcode = None
+def parse_test_lines(lines: List[str]) -> List[Tuple[str, str, str, str, str]]:
+    out: List[Tuple[str, str, str, str, str]] = []
+    if len(lines) < 19:
+        return out
 
-    # Station (3번째 줄 우선)
-    if len(lines) >= 3:
-        m = STATION_PATTERN.search(lines[2])
-        if m:
-            station = m.group(1).strip()
-    if station is None:
-        for line in lines:
-            m = STATION_PATTERN.search(line)
-            if m:
-                station = m.group(1).strip()
-                break
+    for raw in lines[18:]:
+        if not raw.strip():
+            continue
+        cols = [c.strip() for c in raw.split(",")]
+        if len(cols) < 5:
+            continue
 
-    # Barcode information (5번째 줄 우선)
-    if len(lines) >= 5:
-        m = BARCODE_PATTERN.search(lines[4])
-        if m:
-            barcode = m.group(1).strip()
-    if barcode is None:
-        for line in lines:
-            m = BARCODE_PATTERN.search(line)
-            if m:
-                barcode = m.group(1).strip()
-                break
+        step = cols[0].strip()[:41]
+        value = cols[1].strip()
+        min_v = cols[2].strip()
+        max_v = cols[3].strip()
+        result = cols[4].strip().replace("[", "").replace("]", "").strip()
 
-    return station or "", barcode or ""
+        if not step:
+            continue
+        if result not in ("PASS", "FAIL"):
+            result = re.sub(r"\s+", "", result)
+
+        out.append((step, value, min_v, max_v, result))
+
+    return out
 
 
-def parse_step_rows_from_fixed_lines(lines: list[str]) -> list[dict]:
+def parse_one_file(args: Tuple[str, str, str]) -> List[ParsedRow]:
     """
-    ✅ 요청사항 그대로 적용:
-    - 파일 내용의 19번째 줄 ~ 54번째 줄(1-indexed)만 사용
-    - 각 라인은 CSV(콤마) 5개 컬럼 형태:
-      desc, value, min, max, [PASS|FAIL]
-    - result는 [] 제거해서 저장
-
-    반환: [{"step_description","value","min","max","result"}, ...]
+    args = (file_path_str, station, today)
     """
-    start_idx = 18  # 19번째 줄
-    end_idx_excl = 54  # 54번째 줄까지 포함하려면 slice end를 54로(파이썬은 end exclusive)
-    if len(lines) <= start_idx:
+    file_path_str, station, today = args
+    fp = Path(file_path_str)
+
+    # [추가] 안정성 체크: 쓰는 중이면 파싱 스킵
+    if STABILITY_CHECK_ENABLED:
+        if not file_is_stable(fp):
+            return []
+
+    info = parse_filename(fp)
+    if info is None:
+        return []
+    barcode_information, end_day, end_time, remark = info
+
+    # 오늘 파일만
+    if end_day != today:
         return []
 
-    step_lines = lines[start_idx:end_idx_excl]
-
-    step_rows: list[dict] = []
-    for raw in step_lines:
-        if not raw:
-            continue
-
-        parts = [p.strip() for p in raw.split(",")]
-        if len(parts) < 5:
-            continue
-
-        step_desc = normalize_step_desc(parts[0])
-        value_raw = parts[1].strip()
-        min_raw = parts[2].strip()
-        max_raw = parts[3].strip()
-        result_raw = parts[4].strip()
-
-        if not step_desc:
-            continue
-
-        step_rows.append({
-            "step_description": step_desc,
-            "value": value_raw,
-            "min": min_raw,
-            "max": max_raw,
-            "result": strip_brackets_result(result_raw),
-        })
-
-    return step_rows
-
-
-def parse_fct_file(file_path: Path) -> list[dict]:
-    """
-    ✅ 통합 적용:
-    - 공통 헤더(Station/Barcode/Run Time/end_day/end_time/remark)는 파일에서 1회 추출
-    - 19~54줄의 step 라인을 CSV로 파싱하여 step별로 여러 행 생성
-    - 기존 기능(파일 경로, 실시간 처리, MP 등)에는 영향 없음
-    """
-    try:
-        with file_path.open("r", encoding="cp949", errors="ignore") as f:
-            lines = [line.rstrip("\n") for line in f]
-    except UnicodeDecodeError:
-        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
-            lines = [line.rstrip("\n") for line in f]
-
-    if not lines:
+    lines = safe_read_text(fp)
+    if lines is None:
         return []
 
-    end_day, end_time = parse_end_day_end_time_from_path(file_path)
-    station, barcode = parse_station_barcode(lines)
-    run_time = parse_run_time_from_lines(lines)
-    remark = make_remark_from_barcode(barcode)
-
-    # ✅ 19~54줄 step 데이터 파싱
-    step_rows = parse_step_rows_from_fixed_lines(lines)
-    if not step_rows:
+    run_time = parse_run_time(lines)
+    tests = parse_test_lines(lines)
+    if not tests:
         return []
 
-    records: list[dict] = []
-    for step in step_rows:
-        records.append({
-            "barcode_information": barcode,
-            "station": station,
-            "run_time": run_time,
-            "end_day": end_day,
-            "end_time": end_time,
-            "remark": remark,
-            "step_description": step.get("step_description", ""),
-            "value": step.get("value", ""),
-            "min": step.get("min", ""),
-            "max": step.get("max", ""),
-            "result": step.get("result", ""),
-            "file_path": str(file_path),
-        })
+    rows: List[ParsedRow] = []
+    for (step_description, value, min_v, max_v, result) in tests:
+        rows.append(
+            ParsedRow(
+                barcode_information=barcode_information,
+                remark=remark,
+                station=station,
+                end_day=end_day,
+                end_time=end_time,
+                run_time=run_time,
+                step_description=step_description,
+                value=value,
+                min_v=min_v,
+                max_v=max_v,
+                result=result,
+                file_path=str(fp),
+            )
+        )
+    return rows
 
-    return records
 
+# =========================
+# 3) 파일 수집 (오늘 폴더 + 최근 60초 mtime)
+# =========================
 
-# ============================================
-# 3) 파일 수집 (공장 실시간: 오늘 폴더 + 120초 이내)
-# ============================================
+def collect_recent_files(today: str, cutoff_ts: float) -> List[Tuple[str, str, str]]:
+    jobs: List[Tuple[str, str, str]] = []
 
-def collect_realtime_today_files(base_dir: Path, today_yyyymmdd: str, cutoff_ts: float) -> list[Path]:
-    """
-    오늘 날짜 폴더만 + cutoff_ts(현재-120초) 이후 수정된 파일만
-    """
-    file_list: list[Path] = []
-
-    for tc in TC_FOLDERS:
-        tc_path = base_dir / tc
-        if not tc_path.exists():
+    for tc, station in TC_TO_STATION.items():
+        day_dir = BASE_DIR / tc / today
+        if not day_dir.exists():
             continue
 
-        date_dir = tc_path / today_yyyymmdd
-        if not date_dir.exists() or (not date_dir.is_dir()):
-            continue
-
-        for gb in TARGET_FOLDERS:
-            target_dir = date_dir / gb
-            if not target_dir.exists():
+        for sub in TARGET_SUBFOLDERS:
+            sub_dir = day_dir / sub
+            if not sub_dir.exists():
                 continue
 
-            for f in target_dir.glob("*.txt"):
+            for fp in sub_dir.glob("*.txt"):
                 try:
-                    if f.stat().st_mtime < cutoff_ts:
+                    if not fp.is_file():
                         continue
+                    # 최근 60초 mtime
+                    if fp.stat().st_mtime >= cutoff_ts:
+                        jobs.append((str(fp), station, today))
                 except Exception:
                     continue
-                file_list.append(f)
 
-    return file_list
+    return jobs
 
 
-# ============================================
-# 4) 한 번의 사이클에서 할 일 (공장 실시간)
-# ============================================
+# =========================
+# 4) DB DDL + INSERT
+# =========================
 
-def process_once_factory():
-    """
-    공장 실시간 1회 사이클:
-    - 오늘 폴더만 스캔
-    - 120초 이내 수정된 파일만 처리
-    - file_path 중복이면 파일 단위로 스킵
-    - 멀티프로세스 2개 고정
-    """
-    now_ts = time.time()
-    cutoff_ts = now_ts - REALTIME_WINDOW_SEC
-    today_yyyymmdd = datetime.now().strftime("%Y%m%d")
+DDL_SQL = f"""
+CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};
 
-    conn = get_connection()
+CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{TABLE_NAME} (
+    barcode_information TEXT,
+    remark              TEXT,
+    station             TEXT,
+    end_day             TEXT,
+    end_time            TEXT,
+    run_time            TEXT,
+    step_description    TEXT,
+    value               TEXT,
+    min                 TEXT,
+    max                 TEXT,
+    result              TEXT,
+    file_path           TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_{TABLE_NAME}_file_path
+    ON {SCHEMA_NAME}.{TABLE_NAME} (file_path);
+
+CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_end_day
+    ON {SCHEMA_NAME}.{TABLE_NAME} (end_day);
+
+CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_station_end_day
+    ON {SCHEMA_NAME}.{TABLE_NAME} (station, end_day);
+"""
+
+INSERT_COLS = (
+    "barcode_information, remark, station, end_day, end_time, run_time, "
+    "step_description, value, min, max, result, file_path"
+)
+
+INSERT_SQL = f"""
+INSERT INTO {SCHEMA_NAME}.{TABLE_NAME} ({INSERT_COLS})
+VALUES %s
+ON CONFLICT (file_path) DO NOTHING
+"""
+
+
+def get_conn():
+    return psycopg2.connect(
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        dbname=DB_CONFIG["dbname"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+    )
+
+
+def ensure_schema_table() -> None:
+    with get_conn() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(DDL_SQL)
+
+
+def flush_rows(cur, buffer_rows: List[ParsedRow]) -> int:
+    if not buffer_rows:
+        return 0
+    tuples = [r.as_tuple() for r in buffer_rows]
+    execute_values(cur, INSERT_SQL, tuples, page_size=EXECUTE_VALUES_PAGE_SIZE)
+    return len(buffer_rows)
+
+
+# =========================
+# 5) 무한 루프 실행
+# =========================
+
+def run_forever() -> int:
+    job_name = "a2_fct_table_parser_mp_realtime"
+    log("============================================================")
+    log(f"[BOOT] {job_name} | {datetime.now():%Y-%m-%d %H:%M:%S}")
+    log(f"[INFO] BASE_DIR = {BASE_DIR}")
+    log(f"[INFO] REALTIME_SEC = {REALTIME_SEC} | LOOP_SEC = {LOOP_SEC}")
+    log(f"[INFO] WORKERS = {WORKERS}")
+    log(f"[INFO] STABILITY_CHECK = {STABILITY_CHECK_ENABLED} | interval={STABILITY_INTERVAL_SEC}s | tries={STABILITY_TRIES}")
+    log(f"[INFO] TARGET = {SCHEMA_NAME}.{TABLE_NAME}")
+    log("============================================================")
+
+    log("[STEP] Ensure schema/table/index ...")
+    ensure_schema_table()
+    log("[OK] Schema/table ready.")
+
+    pool: Optional[Pool] = None
+    if USE_MULTIPROCESSING:
+        pool = Pool(processes=WORKERS)
+
     try:
-        init_db(conn)
+        while True:
+            loop_start_dt = datetime.now()
+            loop_start_ts = time.perf_counter()
 
-        processed_files = get_processed_file_paths(conn)
-        realtime_files = collect_realtime_today_files(BASE_LOG_DIR, today_yyyymmdd, cutoff_ts)
+            now = datetime.now()
+            today = today_yyyymmdd(now)
+            cutoff_ts = (now - timedelta(seconds=REALTIME_SEC)).timestamp()
 
-        # file_path 중복 스킵
-        new_files = [p for p in realtime_files if str(p) not in processed_files]
+            jobs = collect_recent_files(today=today, cutoff_ts=cutoff_ts)
 
-        # 이번 사이클 내에서도 중복 제거
-        seen = set()
-        uniq_new_files = []
-        for p in new_files:
-            s = str(p)
-            if s in seen:
+            if not jobs:
+                time.sleep(LOOP_SEC)
                 continue
-            seen.add(s)
-            uniq_new_files.append(p)
-        new_files = uniq_new_files
 
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] today={today_yyyymmdd} window={REALTIME_WINDOW_SEC}s")
-        print(f"  후보 파일 수(오늘/120초): {len(realtime_files)}개")
-        print(f"  이미 처리된 파일 수(DB distinct file_path): {len(processed_files)}개")
-        print(f"  이번에 처리할 파일 수: {len(new_files)}개")
+            total_files = 0
+            total_rows_try_insert = 0
+            buffer: List[ParsedRow] = []
 
-        if not new_files:
-            return
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if pool is not None:
+                        for rows in pool.imap_unordered(parse_one_file, jobs, chunksize=50):
+                            total_files += 1
+                            if rows:
+                                buffer.extend(rows)
+                    else:
+                        for j in jobs:
+                            rows = parse_one_file(j)
+                            total_files += 1
+                            if rows:
+                                buffer.extend(rows)
 
-        all_records: list[dict] = []
+                    if buffer:
+                        inserted = flush_rows(cur, buffer)
+                        conn.commit()
+                        total_rows_try_insert += inserted
+                        buffer.clear()
 
-        print(f"  멀티프로세싱 사용: 프로세스 {MP_PROCESSES}개")
-        with Pool(processes=MP_PROCESSES) as pool:
-            for idx, recs in enumerate(
-                pool.imap_unordered(parse_fct_file, new_files, chunksize=10), start=1
-            ):
-                all_records.extend(recs)
-                if idx % 200 == 0 or idx == len(new_files):
-                    print(f"    → 현재 {idx}/{len(new_files)} 파일 파싱 완료")
+            elapsed = time.perf_counter() - loop_start_ts
+            log(
+                f"[LOOP] {loop_start_dt:%H:%M:%S} | today={today} | "
+                f"recent_files={len(jobs):,} | parsed_files={total_files:,} | "
+                f"rows_try_insert={total_rows_try_insert:,} | elapsed={elapsed:,.2f}s"
+            )
 
-        print(f"  총 레코드 수(행 수): {len(all_records)}개 → DB 적재 중...")
-        insert_records(conn, all_records)
-        print("  DB 적재 완료.")
+            time.sleep(LOOP_SEC)
 
+    except KeyboardInterrupt:
+        log("[STOP] KeyboardInterrupt. Exit.")
+        return 0
     finally:
-        conn.close()
-
-
-# ============================================
-# 5) 메인 루프 (1초마다 재실행)
-# ============================================
-
-def main_loop():
-    print("=== [FACTORY] a2_fct_table / fct_table 실시간 파싱 시작 (1초 폴링) ===")
-    print(f"로그 경로: {BASE_LOG_DIR}")
-    print(f"DB: {DB_CONFIG['host']}:{DB_CONFIG['port']} / {DB_CONFIG['dbname']} (user={DB_CONFIG['user']})")
-    print(f"조건: 오늘 폴더만 + 최근 {REALTIME_WINDOW_SEC}초 이내 수정 파일만 + MP={MP_PROCESSES}")
-
-    while True:
-        try:
-            process_once_factory()
-        except Exception as e:
-            print(f"[에러 발생] {e}")
-        time.sleep(1)
+        if pool is not None:
+            pool.close()
+            pool.join()
 
 
 if __name__ == "__main__":
     freeze_support()
-    main_loop()
+    raise SystemExit(run_forever())

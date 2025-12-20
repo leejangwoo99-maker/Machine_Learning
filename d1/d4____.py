@@ -13,15 +13,27 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트
 """
 
 import os
-import pandas as pd
-from sqlalchemy import create_engine
 import urllib.parse
 from multiprocessing import freeze_support
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import pandas as pd
+from sqlalchemy import create_engine
+
+# chained assignment를 에러로 승격(디버그용)
+pd.options.mode.chained_assignment = "raise"
+
 # ============================================
 # 0. DB / 상수 설정
 # ============================================
+# DB_CONFIG = {
+#     "host": "localhost",
+#     "port": 5432,
+#     "dbname": "postgres",
+#     "user": "postgres",
+#     "password": "leejangwoo1!",
+# }
+
 DB_CONFIG = {
     "host": "192.168.108.162",
     "port": 5432,
@@ -69,7 +81,6 @@ def load_fct_log_mp(args):
     table_name, station_label, db_config, schema_name = args
     engine = get_engine(db_config)
 
-    # (변경) time -> end_time, dayornight 제거
     sql = f"""
         SELECT
             end_day,
@@ -78,8 +89,13 @@ def load_fct_log_mp(args):
         FROM {schema_name}."{table_name}"
         ORDER BY end_day ASC, end_time ASC
     """
-    df = pd.read_sql(sql, engine)
-    df["station"] = station_label
+
+    # ✅ EXE/Pandas 환경에서도 view/copy 이슈 차단
+    df = pd.read_sql(sql, engine).copy()
+
+    # ✅ 단일-step 대입으로 chained assignment 경고 차단
+    df.loc[:, "station"] = station_label
+
     return df
 
 
@@ -105,12 +121,11 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
     # 이벤트만 필터링
     df_evt = df_all[df_all["contents"].isin([NG_TEXT, OFF_TEXT, MANUAL_TEXT, AUTO_TEXT])].copy()
 
-    # 정렬 (변경: end_time 기준)
+    # 정렬 (end_time 기준)
     df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
 
     result_rows = []
 
-    # end_day, station 단위 처리
     for (end_day, station), grp in df_evt.groupby(["end_day", "station"], sort=False):
         pending_from_ts = None
         in_manual = False
@@ -119,12 +134,10 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
             contents = row["contents"]
             t = row["end_time"]
 
-            # end_day는 20251001 같은 정수/문자일 수 있으므로 문자열로 안전 변환
             ts = pd.to_datetime(f"{str(end_day)} {str(t)}", errors="coerce")
             if pd.isna(ts):
                 continue
 
-            # Manual / Auto 상태
             if contents == MANUAL_TEXT:
                 in_manual = True
                 continue
@@ -132,17 +145,13 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
                 in_manual = False
                 continue
 
-            # NG 처리
             if contents == NG_TEXT:
                 if in_manual:
                     continue
-
-                # 연속 NG면 첫 NG만 유지
                 if pending_from_ts is None:
                     pending_from_ts = ts
                 continue
 
-            # OFF 처리 (pending NG가 있을 때만 페어링)
             if contents == OFF_TEXT and pending_from_ts is not None:
                 from_ts = pending_from_ts
                 to_ts = ts
@@ -172,7 +181,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame) -> pd.DataFrame:
         df_wasted = df_wasted.sort_values(["end_day", "station", "from_time"]).reset_index(drop=True)
         df_wasted.insert(0, "id", range(1, len(df_wasted) + 1))
     else:
-        # 컬럼 고정 (빈 결과여도 테이블 스키마 유지 목적)
         df_wasted = pd.DataFrame(
             columns=[
                 "id", "end_day", "station",
@@ -195,27 +203,22 @@ def save_to_db(df_wasted: pd.DataFrame):
         TABLE_SAVE_NAME,
         con=engine,
         schema=TABLE_SAVE_SCHEMA,
-        if_exists="replace",   # 누적이면 "append"
+        if_exists="replace",
         index=False,
     )
 
-    print(f"[DONE] {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} 테이블에 {len(df_wasted)}행 저장 완료")
+    print(f"[DONE] {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} 테이블에 {len(df_wasted)}행 저장 완료", flush=True)
 
 
 # ============================================
 # 5. main
 # ============================================
 def main():
-    # (1) 멀티프로세스로 FCT1~4 로드
     df_all = load_all_fct_logs_multiprocess(max_workers=min(4, os.cpu_count() or 1))
-
-    # (2) 계산
     df_wasted = compute_afa_fail_wasted(df_all)
-
-    # (3) DB 저장
     save_to_db(df_wasted)
 
 
 if __name__ == "__main__":
-    freeze_support()  # Windows 멀티프로세스 안전장치
+    freeze_support()
     main()
