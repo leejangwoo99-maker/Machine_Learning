@@ -516,6 +516,26 @@ def main() -> int:
     return 0
 
 
+# =========================
+# 7) 엔트리포인트 (EXE 콘솔 자동 종료 방지 통합)
+# =========================
 if __name__ == "__main__":
     freeze_support()
-    raise SystemExit(main())
+
+    exit_code = 0
+    try:
+        exit_code = main()
+    except KeyboardInterrupt:
+        print("\n[ABORT] 사용자 중단(CTRL+C)")
+        exit_code = 130
+    except Exception as e:
+        print("\n[ERROR] Unhandled exception:", repr(e))
+        exit_code = 1
+    finally:
+        # EXE 실행 시 자동으로 콘솔이 닫히는 것을 방지
+        try:
+            input("\n[HOLD] 작업이 끝났습니다. 콘솔을 닫으려면 Enter를 누르세요...")
+        except EOFError:
+            pass
+
+    raise SystemExit(exit_code)
