@@ -26,6 +26,8 @@ Vision RunTime CT (intensity8) 분석 파이프라인 - MP 최대 적용
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
 - 멀티프로세스: 최대 (CPU 코어 기준 상한 적용)
+- EXE(onefile)에서 plotly validators 오류 방지 (validate=False)
+- EXE에서 콘솔이 강제로 닫히지 않도록 유지 (frozen일 때만)
 """
 
 import sys
@@ -94,9 +96,13 @@ def _outlier_range_str(values: pd.Series, lower_fence: float, upper_fence: float
     return lower_str, upper_str
 
 def _make_plotly_json(values: np.ndarray, name: str) -> str:
+    """
+    ★ 중요: EXE(onefile)에서 plotly validators(_validators.json) 찾다가 터지는 문제 방지
+    -> validate=False 강제
+    """
     fig = go.Figure()
-    fig.add_trace(go.Box(y=values.tolist(), name=name, boxpoints=False))
-    return fig.to_json()
+    fig.add_trace(go.Box(y=values.astype(float), name=name, boxpoints=False))
+    return fig.to_json(validate=False)
 
 
 # =========================
@@ -126,7 +132,6 @@ def load_source(engine) -> pd.DataFrame:
     log("[1/5] 원본 데이터 로딩 시작...")
     df = pd.read_sql(query, engine, params={"step_desc": STEP_DESC})
     log(f"[OK] 로딩 완료 (rows={len(df)})")
-
     return df
 
 
@@ -137,7 +142,7 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     log("[2/5] month 생성 및 정렬...")
 
     out = df.copy()
-    out["end_day"] = out["end_day"].astype(str).str.zfill(8)
+    out["end_day"] = out["end_day"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
     out["month"] = out["end_day"].str.slice(0, 6)
     out = out.sort_values(["end_day", "end_time"], ascending=True).reset_index(drop=True)
 
@@ -172,7 +177,6 @@ def _summary_worker(args):
     lower_fence = q1 - 1.5 * iqr
     upper_fence = q3 + 1.5 * iqr
 
-    # outlier range string
     v = pd.Series(rt)
     lower_str, upper_str = _outlier_range_str(v, lower_fence, upper_fence)
 
@@ -198,16 +202,13 @@ def _summary_worker(args):
 def build_summary(df: pd.DataFrame) -> pd.DataFrame:
     log(f"[3/5] 요약(summary_df) 생성... (MP 최대={MAX_WORKERS})")
 
-    group_cols = ["station", "remark", "month"]
-
     tasks = []
-    for (station, remark, month), g in df.groupby(group_cols, dropna=False, sort=True):
+    for (station, remark, month), g in df.groupby(["station", "remark", "month"], dropna=False, sort=True):
         rt_list = g["run_time"].dropna().astype(float).tolist()
         tasks.append((station, remark, str(month), rt_list))
 
     total = len(tasks)
     log(f"[INFO] 그룹 수 = {total}")
-
     if total == 0:
         log("[WARN] 그룹이 없어 summary_df 생성 불가")
         return pd.DataFrame()
@@ -241,7 +242,6 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def ensure_table(engine):
     create_schema_sql = text(f'CREATE SCHEMA IF NOT EXISTS "{TARGET_SCHEMA}";')
-
     create_table_sql = text(f"""
     CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}"."{TARGET_TABLE}" (
         id                     INTEGER,
@@ -260,7 +260,6 @@ def ensure_table(engine):
         PRIMARY KEY (station, remark, month)
     );
     """)
-
     with engine.begin() as conn:
         conn.execute(create_schema_sql)
         conn.execute(create_table_sql)
@@ -310,26 +309,34 @@ def upsert_summary(engine, summary_df: pd.DataFrame):
 # main
 # =========================
 def main():
-    try:
-        log("=== Vision RunTime CT Pipeline START ===")
-        log(f"[INFO] MP max_workers = {MAX_WORKERS} (cpu={cpu_count()}, cap={MAX_WORKERS_CAP})")
+    log("=== Vision RunTime CT Pipeline START ===")
+    log(f"[INFO] MP max_workers = {MAX_WORKERS} (cpu={cpu_count()}, cap={MAX_WORKERS_CAP})")
 
-        engine = get_engine(DB_CONFIG)
+    engine = get_engine(DB_CONFIG)
 
-        df = load_source(engine)
-        df = preprocess(df)
-        summary_df = build_summary(df)
+    df = load_source(engine)
+    df = preprocess(df)
+    summary_df = build_summary(df)
 
-        ensure_table(engine)
-        upsert_summary(engine, summary_df)
+    ensure_table(engine)
+    upsert_summary(engine, summary_df)
 
-        log("=== Vision RunTime CT Pipeline DONE ===")
-
-    except Exception as e:
-        log(f"[ERROR] {type(e).__name__}: {e}")
-        sys.exit(1)
+    log("=== Vision RunTime CT Pipeline DONE ===")
 
 
 if __name__ == "__main__":
     freeze_support()
-    main()
+
+    exit_code = 0
+    try:
+        main()
+    except Exception as e:
+        log(f"[ERROR] {type(e).__name__}: {e}")
+        exit_code = 1
+    finally:
+        # EXE(Nuitka/pyinstaller) 실행 시 콘솔 유지
+        if getattr(sys, "frozen", False):
+            print("\n[INFO] 프로그램이 종료되었습니다.")
+            input("Press Enter to exit...")
+
+    sys.exit(exit_code)

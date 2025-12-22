@@ -505,4 +505,14 @@ def main():
 
 if __name__ == "__main__":
     freeze_support()
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[FATAL] {type(e).__name__}: {e}")
+        raise
+    finally:
+        # Nuitka / PyInstaller EXE로 실행된 경우에만 콘솔 유지
+        if getattr(sys, "frozen", False):
+            print("\n[INFO] 프로그램이 종료되었습니다.")
+            input("Press Enter to exit...")
+

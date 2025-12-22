@@ -132,10 +132,16 @@ def boxplot_stats(values: np.ndarray) -> dict:
     }
 
 def make_plotly_box_json(values: np.ndarray, title: str) -> str:
+    """
+    ✅ 권장 조합(validator 누락 방지):
+    - validate=False 로 JSON 생성 (EXE onefile에서 plotly validators 데이터 누락 시에도 안정적으로 동작)
+    """
     fig = go.Figure()
     fig.add_trace(go.Box(y=values.astype(float), boxpoints=False, name=title))
     fig.update_layout(title=title, showlegend=False)
-    return fig.to_json()
+
+    # 핵심: validate=False
+    return fig.to_json(validate=False)
 
 def fmt_range(a: float, b: float) -> str:
     return f"{a:.2f}~{b:.2f}"
@@ -167,6 +173,8 @@ def load_source(engine) -> pd.DataFrame:
     log("[2/6] end_dt 생성 및 month 생성...")
     df["end_day"] = df["end_day"].astype(str).str.replace(r"\D", "", regex=True)
     dt_str = df["end_day"] + " " + df["end_time"].astype(str).str.strip()
+
+    # 주의: format="mixed"는 Pandas 버전에 따라 동작이 달라질 수 있음 (현재는 유지)
     df["end_dt"] = pd.to_datetime(dt_str, errors="coerce", format="mixed")
 
     before = len(df)
@@ -278,7 +286,10 @@ def summarize(df_an: pd.DataFrame) -> pd.DataFrame:
     # (B) only군: station_out = Vision1_only / Vision2_only
     if not df_only.empty:
         do = df_only.copy()
-        do["station_out"] = do["station"].map({"Vision1": "Vision1_only", "Vision2": "Vision2_only"}).fillna(do["station"])
+        do["station_out"] = (
+            do["station"].map({"Vision1": "Vision1_only", "Vision2": "Vision2_only"})
+            .fillna(do["station"])
+        )
         for (st, rk, mo), g in do.groupby(["station_out", "remark", "month"], sort=True):
             op_list = g["op_ct"].dropna().astype(float).tolist()
             tasks.append((st, rk, mo, op_list))
@@ -416,25 +427,32 @@ def save_to_db(summary_df: pd.DataFrame):
 # main
 # =========================
 def main():
-    try:
-        log("=== Vision OP-CT Pipeline START ===")
-        log(f"[INFO] MP max_workers = {MAX_WORKERS} (cpu={cpu_count()}, cap={MAX_WORKERS_CAP})")
+    log("=== Vision OP-CT Pipeline START ===")
+    log(f"[INFO] MP max_workers = {MAX_WORKERS} (cpu={cpu_count()}, cap={MAX_WORKERS_CAP})")
 
-        engine = get_engine(DB_CONFIG)
+    engine = get_engine(DB_CONFIG)
 
-        df = load_source(engine)
-        df = mark_only_runs(df)
-        df_an = build_analysis_df(df)
-        summary_df = summarize(df_an)
-        save_to_db(summary_df)
+    df = load_source(engine)
+    df = mark_only_runs(df)
+    df_an = build_analysis_df(df)
+    summary_df = summarize(df_an)
+    save_to_db(summary_df)
 
-        log("=== Vision OP-CT Pipeline DONE ===")
-
-    except Exception as e:
-        log(f"[ERROR] {type(e).__name__}: {e}")
-        sys.exit(1)
+    log("=== Vision OP-CT Pipeline DONE ===")
 
 
 if __name__ == "__main__":
     freeze_support()
-    main()
+    exit_code = 0
+    try:
+        main()
+    except Exception as e:
+        log(f"[ERROR] {type(e).__name__}: {e}")
+        exit_code = 1
+    finally:
+        # ✅ EXE로 실행 시 콘솔이 자동으로 닫히지 않도록 유지
+        if getattr(sys, "frozen", False):
+            print("\n[INFO] 프로그램이 종료되었습니다.")
+            input("Press Enter to exit...")
+
+    sys.exit(exit_code)

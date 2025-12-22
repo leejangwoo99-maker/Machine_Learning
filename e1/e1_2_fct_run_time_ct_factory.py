@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FCT RunTime CT 분석 파이프라인 (iqz step 전용) - Realtime Loop + MP=2 고정
+FCT RunTime CT 분석 파이프라인 (iqz step 전용) - Realtime Window + MP=2 고정
 
 - Source: a2_fct_table.fct_table
 - Filter:
@@ -16,23 +16,29 @@ FCT RunTime CT 분석 파이프라인 (iqz step 전용) - Realtime Loop + MP=2 �
   2) e1_FCT_ct.fct_upper_outlier_ct_list
      UNIQUE INDEX (station, remark, barcode_information, end_day, end_time), ON CONFLICT DO NOTHING
 
-추가 사양(요청):
-- [멀티프로세스] 2개 고정
-- [무한 루프] 1초마다 재실행
-- [윈도우] end_day = 오늘 기준 같은 월(YYYYMM)만 처리
-  예) 20251218 -> '202512%' 범위만
-- [실시간] end_ts 기준 현재시간 120초 이내 + cutoff_ts 이후만 처리
-- (추가) 실행 타이밍 2회:
-    1) 08:27:00 ~ 08:29:59 구간에서만 1초 루프 실행
-    2) 20:27:00 ~ 20:29:59 구간에서만 1초 루프 실행
-    (그 외 시간에는 대기)
-- DataFrame 콘솔 출력 없음 / 진행상황만 표시
+요구사항(추가 반영):
+- DataFrame 콘솔 출력 없음
+- 진행상황만 표시
+- [멀티프로세스] 2개 고정 (요청)
+- [무한 루프 기능] 1초마다 재실행
+- [윈도우] 08:27:00 ~ 08:29:59, 20:27:00 ~ 20:29:59 에만 실행
+- [유효 날짜 범위] end_day가 "현재 날짜 기준의 달(YYYYMM)"만 해당
+- [실시간] 현재 시간 기준 120초 이내 데이터만 반영 (end_day+end_time -> end_ts 기준)
+- [미완성 방지 역할 분리] 이 스크립트는 파일을 직접 파싱하지 않고 DB만 읽음
+  * 따라서 "파일 크기/mtime/lock" 같은 파일 안정화 로직은 a2(파서/적재) 쪽에서 처리
+  * 본 스크립트(e*)는 DB에서 최근 120초 범위 + 안정화 버퍼(STABLE_DATA_SEC) 적용으로 안전하게 조회
+
+주의(필수 확인):
+- a2_fct_table.fct_table 의 end_day 포맷이 'YYYYMMDD' 인지, 'YYYY-MM-DD' 인지에 따라 SQL 파싱이 달라집니다.
+  현재 코드는 end_day가 'YYYYMMDD'라고 가정하고 to_timestamp(end_day||end_time, 'YYYYMMDDHH24MISS') 를 사용합니다.
+  만약 end_time이 'HHMMSS'가 아니라 'HH:MM:SS'이면, 아래의 ENDTIME_FORMAT 을 'HH24:MI:SS' 형태로 바꿔주세요.
 """
 
 import sys
-import time
 import urllib.parse
-from datetime import datetime, timedelta, date, time as dtime
+from datetime import datetime, time as dtime
+import time as time_mod
+from multiprocessing import freeze_support
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -67,19 +73,33 @@ TARGET_TABLE_1  = "fct_run_time_ct"
 TARGET_SCHEMA_2 = "e1_FCT_ct"
 TARGET_TABLE_2  = "fct_upper_outlier_ct_list"
 
-# ===== 멀티프로세스 고정 =====
+# =========================
+# Realtime Loop 사양(요청 반영)
+# =========================
+# ✅ 워커 2개 고정
 MAX_WORKERS = 2
 
-# ===== 실시간 루프/필터 =====
-LOOP_INTERVAL_SEC = 1
-REALTIME_WINDOW_SEC = 120
-CUTOFF_TS = 1765501841.4473598  # 요청값
+# ✅ 1초 루프
+LOOP_INTERVAL_SEC = 1.0
 
-# ===== 실행 타이밍(추가) =====
-RUN_WINDOWS = [
+# ✅ 최근 120초
+RECENT_SECONDS = 120
+
+# ✅ DB 안정화 버퍼(방금 적재된 row 회피)
+STABLE_DATA_SEC = 2
+
+# ✅ 실행 윈도우
+WINDOWS = [
     (dtime(8, 27, 0),  dtime(8, 29, 59)),
     (dtime(20, 27, 0), dtime(20, 29, 59)),
 ]
+
+HEARTBEAT_EVERY_LOOPS = 30
+
+# end_day/end_time 포맷 가정
+# end_day: 'YYYYMMDD'
+# end_time: 'HHMMSS' (6자리)
+ENDTS_FORMAT = "YYYYMMDDHH24MISS"
 
 
 # =========================
@@ -87,6 +107,16 @@ RUN_WINDOWS = [
 # =========================
 def log(msg: str):
     print(msg, flush=True)
+
+def current_yyyymm() -> str:
+    return datetime.now().strftime("%Y%m")
+
+def now_in_windows(now_dt: datetime) -> bool:
+    t = now_dt.time()
+    for s, e in WINDOWS:
+        if s <= t <= e:
+            return True
+    return False
 
 def get_engine(config=DB_CONFIG):
     user = config["user"]
@@ -127,112 +157,71 @@ def _make_plotly_box_json(values: np.ndarray, name: str):
     fig = go.Figure(data=[go.Box(y=values.tolist(), name=name, boxpoints=False)])
     return pio.to_json(fig, validate=False)
 
-# ---- 실행 타이밍 헬퍼(추가) ----
-def _now_time() -> dtime:
-    return datetime.now().time().replace(microsecond=0)
-
-def _is_in_run_window(t: dtime) -> bool:
-    for start_t, end_t in RUN_WINDOWS:
-        if start_t <= t <= end_t:
-            return True
-    return False
-
-def _seconds_until_next_window(t: dtime) -> int:
-    if _is_in_run_window(t):
-        return 0
-
-    now_sec = t.hour * 3600 + t.minute * 60 + t.second
-    starts = []
-    for start_t, _ in RUN_WINDOWS:
-        s = start_t.hour * 3600 + start_t.minute * 60 + start_t.second
-        starts.append(s)
-
-    future = [s for s in starts if s > now_sec]
-    if future:
-        return min(future) - now_sec
-
-    return (24 * 3600 - now_sec) + min(starts)
-
 
 # =========================
-# 2) 로딩 + 전처리 (이번달 + 최근 120초 + cutoff 이후)
+# 2) 로딩 + 전처리 (현재달 + 최근120초 + 안정화버퍼)
 # =========================
 def load_source(engine) -> pd.DataFrame:
     """
-    - SQL: 오늘 기준 '이번달' 범위만 로드(로드 최소화)
-        end_day >= date_trunc('month', CURRENT_DATE)
-        end_day <  date_trunc('month', CURRENT_DATE) + interval '1 month'
-    - end_ts 생성 후:
-        end_ts >= max(now-120s, cutoff_dt)
-      만족하는 행만 남김
+    - end_day: 현재달(YYYYMM)만
+    - end_ts: now-RECENT_SECONDS ~ now-STABLE_DATA_SEC 만
     """
-    log("[1/5] 원본 데이터(이번달) 로딩 시작...")
+    yyyymm = current_yyyymm()
 
     query = f"""
+    WITH base AS (
+        SELECT
+            station,
+            remark,
+            barcode_information,
+            step_description,
+            result,
+            end_day,
+            end_time,
+            run_time,
+            to_timestamp(end_day || end_time, '{ENDTS_FORMAT}') AS end_ts
+        FROM {SRC_SCHEMA}.{SRC_TABLE}
+        WHERE
+            station IN ('FCT1','FCT2','FCT3','FCT4')
+            AND barcode_information LIKE 'B%%'
+            AND result <> 'FAIL'
+            AND (
+                (remark = 'PD' AND step_description = '1.36 Test iqz(uA)')
+                OR
+                (remark = 'Non-PD' AND step_description = '1.32 Test iqz(uA)')
+            )
+            AND substring(end_day from 1 for 6) = :yyyymm
+    )
     SELECT
-        station,
-        remark,
-        barcode_information,
-        step_description,
-        result,
-        end_day,
-        end_time,
-        run_time
-    FROM {SRC_SCHEMA}.{SRC_TABLE}
+        station, remark, barcode_information, step_description, result, end_day, end_time, run_time
+    FROM base
     WHERE
-        end_day >= date_trunc('month', CURRENT_DATE)::date
-        AND end_day <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
-        AND station IN ('FCT1','FCT2','FCT3','FCT4')
-        AND barcode_information LIKE 'B%%'
-        AND result <> 'FAIL'
-        AND (
-            (remark = 'PD' AND step_description = '1.36 Test iqz(uA)')
-            OR
-            (remark = 'Non-PD' AND step_description = '1.32 Test iqz(uA)')
-        )
-    ORDER BY end_day ASC, end_time ASC
+        end_ts IS NOT NULL
+        AND end_ts >= (now() - INTERVAL '{RECENT_SECONDS} seconds')
+        AND end_ts <= (now() - INTERVAL '{STABLE_DATA_SEC} seconds')
+    ORDER BY end_ts ASC
     """
 
-    df = pd.read_sql(text(query), engine)
+    log("[1/5] 원본 데이터 로딩 시작(현재달 + 최근120초 + 안정화버퍼)...")
+    df = pd.read_sql(text(query), engine, params={"yyyymm": yyyymm})
     log(f"[OK] 로딩 완료 (rows={len(df)})")
 
-    if df is None or len(df) == 0:
+    if len(df) == 0:
         return df
 
-    log("[2/5] 전처리 (end_ts/월/run_time 숫자화 + realtime filter)...")
-
-    # 문자열 정리 + run_time 숫자화
+    log("[2/5] 전처리 (end_day/end_time 정리, month 생성, run_time 숫자화)...")
     df["end_day"] = df["end_day"].astype(str).str.strip()
     df["end_time"] = df["end_time"].astype(str).str.strip()
     df["run_time"] = pd.to_numeric(df["run_time"], errors="coerce")
 
-    # end_ts 생성
-    df["end_ts"] = pd.to_datetime(df["end_day"] + " " + df["end_time"], errors="coerce")
-
-    # month
     df["month"] = df["end_day"].str.slice(0, 6)
+    df = df.sort_values(["end_day", "end_time"], ascending=[True, True]).reset_index(drop=True)
 
-    # run_time/end_ts NaN 제거
     before = len(df)
-    df = df.dropna(subset=["run_time", "end_ts"]).reset_index(drop=True)
+    df = df.dropna(subset=["run_time"]).reset_index(drop=True)
     dropped = before - len(df)
     if dropped:
-        log(f"[INFO] run_time/end_ts NaN 제거: {dropped} rows drop")
-
-    # ===== 실시간 필터 =====
-    now_dt = datetime.now()
-    window_start = now_dt - timedelta(seconds=REALTIME_WINDOW_SEC)
-    cutoff_dt = datetime.fromtimestamp(float(CUTOFF_TS))
-    threshold = max(window_start, cutoff_dt)
-
-    before2 = len(df)
-    df = df[df["end_ts"] >= threshold].copy()
-    after2 = len(df)
-
-    log(f"[INFO] realtime filter: end_ts >= {threshold.strftime('%Y-%m-%d %H:%M:%S')}  (kept {after2}/{before2})")
-
-    # 정렬
-    df = df.sort_values(["end_day", "end_time"], ascending=[True, True]).reset_index(drop=True)
+        log(f"[INFO] run_time NaN 제거: {dropped} rows drop")
 
     log("[OK] 전처리 완료")
     return df
@@ -283,10 +272,10 @@ def build_summary_df(df: pd.DataFrame) -> pd.DataFrame:
     log(f"[3/5] (station, remark, month) 요약 DF 생성... (MP={MAX_WORKERS})")
 
     if df is None or len(df) == 0:
+        log("[SKIP] 입력 데이터 없음 -> summary_df 빈 DF 반환")
         return pd.DataFrame(columns=[
-            "id","station","remark","month","sample_amount",
-            "run_time_lower_outlier","q1","median","q3",
-            "run_time_upper_outlier","del_out_run_time_av","plotly_json"
+            "id","station","remark","month","sample_amount","run_time_lower_outlier",
+            "q1","median","q3","run_time_upper_outlier","del_out_run_time_av","plotly_json"
         ])
 
     group_items = []
@@ -322,14 +311,14 @@ def build_summary_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 4) DB 저장 1: fct_run_time_ct (DO NOTHING 유지)
+# 4) DB 저장 1: fct_run_time_ct (ON CONFLICT DO NOTHING)
 # =========================
 def save_run_time_ct(summary_df: pd.DataFrame):
-    log("[4/5] DB 저장(1) fct_run_time_ct 시작...")
-
-    if summary_df is None or len(summary_df) == 0:
-        log("[SKIP] summary_df 비어있음 -> 저장 생략")
+    if summary_df is None or summary_df.empty:
+        log("[SKIP] fct_run_time_ct 저장 생략 (데이터 없음)")
         return
+
+    log("[4/5] DB 저장(1) fct_run_time_ct 시작...")
 
     to_save = summary_df.drop(columns=["id"], errors="ignore").copy()
     to_save = to_save.where(pd.notnull(to_save), None)
@@ -391,8 +380,13 @@ def save_run_time_ct(summary_df: pd.DataFrame):
             cur.execute(create_table_sql)
 
             if rows:
-                execute_values(cur, insert_sql, rows, template=template, page_size=1000)
-
+                execute_values(
+                    cur,
+                    insert_sql,
+                    rows,
+                    template=template,
+                    page_size=1000
+                )
         conn.commit()
         log(f"[OK] fct_run_time_ct 저장 완료 (insert candidates={len(rows)}; 중복키는 PASS)")
     finally:
@@ -435,7 +429,7 @@ def build_upper_outlier_df(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd
     log(f"[5/5] upper outlier 상세 DF 생성 시작... (MP={MAX_WORKERS})")
 
     if df_raw is None or len(df_raw) == 0 or summary_df is None or len(summary_df) == 0:
-        log("[OK] upper outlier 없음(입력 데이터 없음)")
+        log("[SKIP] 입력 데이터 없음 -> upper outlier 생성 생략")
         return pd.DataFrame()
 
     group_map = {}
@@ -475,9 +469,7 @@ def build_upper_outlier_df(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd
             "station", "remark", "barcode_information", "end_day", "end_time",
             "run_time", "month", "upper_threshold"
         ]
-    )
-
-    upper_outlier_df = upper_outlier_df.sort_values(
+    ).sort_values(
         ["station", "remark", "month", "end_day", "end_time"]
     ).reset_index(drop=True)
 
@@ -550,12 +542,17 @@ def save_upper_outlier_df(upper_outlier_df: pd.DataFrame):
 
 
 # =========================
-# 6) 1회 실행(루프 내부)
+# ONE SHOT
 # =========================
-def run_once(engine):
+def main_once():
+    log("=== FCT RunTime CT Pipeline RUN (ONE SHOT) ===")
+    log(f"[INFO] MP workers={MAX_WORKERS} | month={current_yyyymm()} | recent={RECENT_SECONDS}s | stable_buf={STABLE_DATA_SEC}s")
+
+    engine = get_engine(DB_CONFIG)
+
     df_raw = load_source(engine)
     if df_raw is None or len(df_raw) == 0:
-        log("[INFO] 처리 대상 데이터 없음 (이번달/120초/cutoff 조건).")
+        log("[SKIP] 최근 데이터 없음 -> 저장 생략")
         return
 
     summary_df = build_summary_df(df_raw)
@@ -564,57 +561,63 @@ def run_once(engine):
     upper_outlier_df = build_upper_outlier_df(df_raw, summary_df)
     save_upper_outlier_df(upper_outlier_df)
 
-    log("=== 1-cycle DONE ===")
+    log("=== DONE (ONE SHOT) ===")
 
 
 # =========================
-# main (타임윈도우 기반 1초 루프)
+# Realtime loop (윈도우 시간에만)
 # =========================
-def main():
-    try:
-        log("=== FCT RunTime CT Realtime Loop START (Scheduled) ===")
-        log(f"[INFO] MP workers = {MAX_WORKERS} (fixed)")
-        log(f"[INFO] end_day = this month (based on today={date.today()})")
-        log(f"[INFO] realtime window = {REALTIME_WINDOW_SEC}s, cutoff_ts = {CUTOFF_TS}")
-        log(f"[INFO] run_windows = {RUN_WINDOWS}")
+def realtime_loop():
+    log("=== FCT RunTime CT Realtime Loop START ===")
+    log(f"[INFO] windows={[(s.strftime('%H:%M:%S'), e.strftime('%H:%M:%S')) for s,e in WINDOWS]}")
+    log(f"[INFO] LOOP_INTERVAL_SEC={LOOP_INTERVAL_SEC} | workers={MAX_WORKERS}")
 
-        engine = get_engine(DB_CONFIG)
+    loop_count = 0
+    while True:
+        loop_count += 1
+        loop_start = time_mod.perf_counter()
+        now_dt = datetime.now()
 
-        while True:
-            now_t = _now_time()
-
-            # 윈도우 밖이면 대기
-            if not _is_in_run_window(now_t):
-                wait_sec = _seconds_until_next_window(now_t)
-                log(f"[WAIT] now={now_t} -> next window in {wait_sec}s")
-
-                # 시작 시각 정밀하게 맞추기 위해 1초 단위 체크
-                while wait_sec > 0:
-                    time.sleep(1)
-                    wait_sec -= 1
-                    now_t = _now_time()
-                    if _is_in_run_window(now_t):
-                        break
-                continue
-
-            # 윈도우 안: 1초 주기 실행
-            tick = time.time()
-            run_once(engine)
-
-            elapsed = time.time() - tick
+        if not now_in_windows(now_dt):
+            if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
+                log(f"[IDLE] {now_dt:%Y-%m-%d %H:%M:%S} (out of window)")
+            elapsed = time_mod.perf_counter() - loop_start
             sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
             if sleep_sec > 0:
-                time.sleep(sleep_sec)
+                time_mod.sleep(sleep_sec)
+            continue
 
-    except KeyboardInterrupt:
-        log("[STOP] KeyboardInterrupt")
-        sys.exit(0)
-    except Exception as e:
-        log(f"[ERROR] {type(e).__name__}: {e}")
-        sys.exit(1)
+        try:
+            log(f"[RUN] {now_dt:%Y-%m-%d %H:%M:%S} (in window)")
+            main_once()
+        except Exception as e:
+            log(f"[ERROR] {type(e).__name__}: {e}")
+
+        elapsed = time_mod.perf_counter() - loop_start
+        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+        if sleep_sec > 0:
+            time_mod.sleep(sleep_sec)
 
 
+# =========================
+# entry
+# =========================
 if __name__ == "__main__":
-    from multiprocessing import freeze_support
     freeze_support()
-    main()
+
+    exit_code = 0
+    try:
+        realtime_loop()
+    except KeyboardInterrupt:
+        log("\n[ABORT] 사용자 중단(CTRL+C)")
+        exit_code = 130
+    except Exception as e:
+        log(f"\n[ERROR] Unhandled exception: {repr(e)}")
+        exit_code = 1
+    finally:
+        # Nuitka / PyInstaller EXE로 실행된 경우에만 콘솔 유지
+        if getattr(sys, "frozen", False):
+            print("\n[INFO] 프로그램이 종료되었습니다.")
+            input("Press Enter to exit...")
+
+    sys.exit(exit_code)

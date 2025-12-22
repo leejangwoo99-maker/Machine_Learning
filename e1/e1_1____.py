@@ -313,7 +313,10 @@ def _make_boxplot_json_worker(args):
         points="outliers",
         title=None
     )
-    return idx, fig.to_json()
+
+    # ⭐ 핵심 수정
+    return idx, fig.to_json(validate=False)
+
 
 def build_plotly_json_column(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
     log(f"[4/6] plotly_json 생성 시작... (MP 최대={MAX_WORKERS})")
@@ -462,4 +465,21 @@ def main():
 
 if __name__ == "__main__":
     freeze_support()
-    main()
+    exit_code = 0
+
+    try:
+        main()
+
+    except Exception as e:
+        log(f"[ERROR] {type(e).__name__}: {e}")
+        exit_code = 1
+
+    finally:
+        # EXE(Nuitka/pyinstaller) 실행 시에만 콘솔 유지
+        if getattr(sys, "frozen", False):
+            print("\n[INFO] 프로그램이 종료되었습니다.")
+            input("Press Enter to exit...")
+
+    sys.exit(exit_code)
+
+
