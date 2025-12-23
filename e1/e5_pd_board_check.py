@@ -178,44 +178,49 @@ def ensure_tables(engine):
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {OUT_SCHEMA};"))
 
-        # 1) 결과 요약 테이블
+        # ❗ IF NOT EXISTS 제거 + 컬럼 순서 확정
         conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {OUT_SCHEMA}.{OUT_TABLE_CHECK} (
+        CREATE TABLE {OUT_SCHEMA}.{OUT_TABLE_CHECK} (
             station          text        NOT NULL,
             step_description text        NOT NULL,
+            start_day        text,
+            end_day          text,
             last_date        date        NOT NULL,
+
             last_status      text,
             last_score       double precision,
             th_score         double precision,
             last_cos         double precision,
+
             max_score        double precision,
             max_cos          double precision,
             max_streak       integer,
             crit_days        integer,
             warn_days        integer,
+
             window_size      integer,
-            start_day        text,
-            end_day          text,
             updated_at       timestamp   NOT NULL DEFAULT now(),
+
             PRIMARY KEY (station, step_description, last_date)
         );
         """))
 
-        # 2) 그래프 JSON 테이블
         conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {OUT_SCHEMA}.{OUT_TABLE_GRAPH} (
+        CREATE TABLE {OUT_SCHEMA}.{OUT_TABLE_GRAPH} (
             station          text        NOT NULL,
             step_description text        NOT NULL,
-            last_date        date        NOT NULL,
-            plotly_json      jsonb       NOT NULL,
-            window_size      integer,
             start_day        text,
             end_day          text,
+            last_date        date        NOT NULL,
+
+            plotly_json      jsonb       NOT NULL,
+
+            window_size      integer,
             updated_at       timestamp   NOT NULL DEFAULT now(),
+
             PRIMARY KEY (station, step_description, last_date)
         );
         """))
-
 
 # =========================
 # 3) 메인 로직
@@ -467,10 +472,10 @@ def main():
         conn.execute(del_graph, {"step_desc": STEP_DESC, "last_date": last_date_global})
 
         summary_to_save = summary[[
-            "station", "step_description", "last_date",
+            "station", "step_description", "start_day", "end_day", "last_date",
             "last_status", "last_score", "th_score", "last_cos",
             "max_score", "max_cos", "max_streak", "crit_days", "warn_days",
-            "window_size", "start_day", "end_day", "updated_at"
+            "window_size", "updated_at"
         ]].copy()
 
         summary_to_save.to_sql(
@@ -484,9 +489,9 @@ def main():
         )
 
         graph_to_save = graph_rows[[
-            "station", "step_description", "last_date",
+            "station", "step_description", "start_day", "end_day", "last_date",
             "plotly_json",
-            "window_size", "start_day", "end_day", "updated_at"
+            "window_size", "updated_at"
         ]].copy()
 
         graph_to_save.to_sql(
