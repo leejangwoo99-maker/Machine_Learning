@@ -7,7 +7,7 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트 (Realtime)
 - Manual mode 전환 ~ Auto mode 전환 구간에서는 NG 무시
 
 [변경사항/요청사항 통합 반영]
-1) 멀티프로세스 2개 고정
+1) "멀티프로세스" 2개 고정 -> ✅ 스레드 2개 고정(ThreadPoolExecutor)
 2) 1초마다 무한루프 재실행
 3) 유효 날짜: end_day = 오늘(YYYYMMDD)만
 4) 실시간: 현재 시간 기준 60초 이내(ts_filter) 데이터만 "결과로 채택"
@@ -20,7 +20,6 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트 (Realtime)
 [저장 방식]
 - 테이블: d1_machine_log.afa_fail_wasted_time
 - append 저장 + 중복 방지(UNIQUE KEY) + ON CONFLICT DO NOTHING
-  (실시간 루프에서 replace는 누적 데이터가 사라질 수 있어 append가 안전)
 
 [EXE/Nuitka 반영]
 - 콘솔 자동 종료 방지(Enter 대기)
@@ -35,7 +34,7 @@ import time
 import urllib.parse
 from datetime import datetime, timedelta
 from multiprocessing import freeze_support
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed  # ✅ 변경
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -75,12 +74,11 @@ TABLE_SAVE_SCHEMA = "d1_machine_log"
 TABLE_SAVE_NAME = "afa_fail_wasted_time"
 
 # 요청 반영
-MP_WORKERS_FIXED = 2
+MP_WORKERS_FIXED = 2          # ✅ 이제 "스레드 개수" 의미로 사용
 LOOP_INTERVAL_SEC = 1
-TS_WINDOW_SEC = 60           # "확정" 윈도우
-QUERY_LOOKBACK_SEC = 120     # 컨텍스트 확보용(최소 60보다 커야 안전)
+TS_WINDOW_SEC = 60
+QUERY_LOOKBACK_SEC = 120
 
-# 계산 진행 로그 주기(원 코드 유지)
 PROGRESS_EVERY_GROUPS = 50
 
 
@@ -125,11 +123,6 @@ def get_psycopg2_conn(config=DB_CONFIG):
 # 2. 저장 테이블 준비(UNIQUE + append)
 # ============================================
 def ensure_save_table():
-    """
-    실시간 append 저장을 위해:
-    - 테이블이 없으면 생성
-    - 중복 방지 UNIQUE INDEX 생성
-    """
     engine = get_engine(DB_CONFIG)
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (
@@ -154,9 +147,7 @@ def ensure_save_table():
 
 
 # ============================================
-# 3. FCT 로그 로드 (프로세스 단위)
-#    - end_day=오늘, lookback(초) 내 이벤트만
-#    - 핵심값 비정상 row는 SQL 단계에서 1차 배제
+# 3. FCT 로그 로드 (스레드 작업 단위로 사용)
 # ============================================
 def load_fct_log_mp(args):
     table_name, station_label, db_config, schema_name, today_yyyymmdd, cutoff_dt = args
@@ -164,9 +155,6 @@ def load_fct_log_mp(args):
 
     engine = get_engine(db_config)
 
-    # cutoff_dt는 "쿼리 로드 기준" (lookback)
-    # end_time은 텍스트일 가능성이 높아 to_timestamp로 필터링
-    # end_time 형식이 흔히 HH:MM:SS.mmm 또는 HH:MM:SS.mmmmmm 혼재 가능성 → MS로 파싱 시도.
     sql = f"""
         SELECT
             end_day,
@@ -176,9 +164,7 @@ def load_fct_log_mp(args):
         WHERE
             end_day = :today
             AND contents = ANY(:valid_contents)
-            -- end_time 기본 형식 방어(대략): 00:00:00, 00:00:00.000, 00:00:00.000000
             AND end_time ~ '^[0-2][0-9]:[0-5][0-9]:[0-5][0-9](\\.[0-9]{{1,6}})?$'
-            -- to_timestamp 변환이 가능한 것만 최근 lookback 내 로드
             AND to_timestamp(end_day || ' ' || end_time, 'YYYYMMDD HH24:MI:SS.MS') >= :cutoff
         ORDER BY end_day ASC, end_time ASC
     """
@@ -199,15 +185,19 @@ def load_fct_log_mp(args):
 
 
 def load_all_fct_logs_multiprocess(today_yyyymmdd: str, cutoff_dt: datetime) -> pd.DataFrame:
+    """
+    ✅ 기존 함수명을 유지하지만, 내부는 ThreadPoolExecutor로 동작.
+    (호출부 변경 최소화 목적)
+    """
     tasks = [
         (t, s, DB_CONFIG, SCHEMA_MACHINE, today_yyyymmdd, cutoff_dt)
         for t, s in TABLES_FCT
     ]
 
-    log(f"[LOAD] 오늘={today_yyyymmdd} | lookback_cutoff={cutoff_dt:%Y-%m-%d %H:%M:%S} | workers={MP_WORKERS_FIXED}")
+    log(f"[LOAD] 오늘={today_yyyymmdd} | lookback_cutoff={cutoff_dt:%Y-%m-%d %H:%M:%S} | threads={MP_WORKERS_FIXED}")
 
     dfs = []
-    with ProcessPoolExecutor(max_workers=MP_WORKERS_FIXED) as ex:
+    with ThreadPoolExecutor(max_workers=MP_WORKERS_FIXED) as ex:  # ✅ 변경
         futs = [ex.submit(load_fct_log_mp, task) for task in tasks]
 
         done_cnt = 0
@@ -229,9 +219,6 @@ def load_all_fct_logs_multiprocess(today_yyyymmdd: str, cutoff_dt: datetime) -> 
 # 4. 계산 로직(최근 60초 확정 이벤트만 결과로 채택)
 # ============================================
 def _is_valid_row_basic(end_day, end_time, contents) -> bool:
-    """
-    "파일 저장 중(미완성)" 준하는 방어: 핵심값 유효성 체크(파이썬 2차 방어)
-    """
     if end_day is None or end_time is None or contents is None:
         return False
     s_end_day = str(end_day)
@@ -242,16 +229,12 @@ def _is_valid_row_basic(end_day, end_time, contents) -> bool:
         return False
     if s_contents not in VALID_CONTENTS:
         return False
-    if not re.fullmatch(r"[0-2]\d:[0-5]\d:[0-5]\d(\.\d{1,6})?", s_end_time):
+    if not re.fullmatch(r"[0-2]\d:[0-5]\d:[0-5]\d:[0-5]\d(\.\d{1,6})?", s_end_time):
         return False
     return True
 
 
 def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) -> pd.DataFrame:
-    """
-    - df_all: lookback(예: 120초)로 로드된 이벤트들
-    - ts_filter_cutoff: 최근 60초 cutoff (from/to 모두 cutoff 이상인 페어만 저장)
-    """
     if df_all.empty:
         return pd.DataFrame(columns=[
             "end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
@@ -259,7 +242,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
 
     log(f"[CALC] ts_filter_cutoff={ts_filter_cutoff:%Y-%m-%d %H:%M:%S} (최근 {TS_WINDOW_SEC}s 확정 이벤트만 결과)")
 
-    # 이벤트만(이미 contents 제한됨) + 파이썬 2차 방어
     mask_valid = df_all.apply(
         lambda r: _is_valid_row_basic(r["end_day"], r["end_time"], r["contents"]),
         axis=1
@@ -271,7 +253,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
             "end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
         ])
 
-    # 정렬
     df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
 
     result_rows = []
@@ -297,7 +278,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
             if pd.isna(ts):
                 continue
 
-            # Manual/Auto 구간 처리
             if contents == MANUAL_TEXT:
                 in_manual = True
                 continue
@@ -316,7 +296,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
                 from_ts = pending_from_ts
                 to_ts = ts
 
-                # "확정(ts_filter)" 이벤트만 결과로 채택: from/to 모두 cutoff 이상
                 if from_ts < ts_filter_cutoff or to_ts < ts_filter_cutoff:
                     pending_from_ts = None
                     continue
@@ -392,7 +371,7 @@ def run_realtime_loop():
     log(f"[INFO] DB = {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}")
     log(f"[INFO] SOURCE SCHEMA = {SCHEMA_MACHINE}")
     log(f"[INFO] SAVE TABLE    = {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (append + dedup)")
-    log(f"[INFO] MP_WORKERS_FIXED = {MP_WORKERS_FIXED}")
+    log(f"[INFO] THREAD_WORKERS = {MP_WORKERS_FIXED}")
     log(f"[INFO] LOOP_INTERVAL_SEC = {LOOP_INTERVAL_SEC}")
     log(f"[INFO] TS_WINDOW_SEC = {TS_WINDOW_SEC} | QUERY_LOOKBACK_SEC = {QUERY_LOOKBACK_SEC}")
     log("=" * 78)
@@ -402,19 +381,12 @@ def run_realtime_loop():
         now = datetime.now()
         today_yyyymmdd = now.strftime("%Y%m%d")
 
-        # 1) 쿼리 로드 cutoff(lookback)
         query_cutoff_dt = now - timedelta(seconds=QUERY_LOOKBACK_SEC)
-        # 2) 최종 결과 채택 cutoff(확정 60초)
         ts_filter_cutoff = now - timedelta(seconds=TS_WINDOW_SEC)
 
         try:
-            # STEP 1) load
             df_all = load_all_fct_logs_multiprocess(today_yyyymmdd=today_yyyymmdd, cutoff_dt=query_cutoff_dt)
-
-            # STEP 2) calc (최근 60초 확정 이벤트만)
             df_wasted = compute_afa_fail_wasted(df_all, ts_filter_cutoff=ts_filter_cutoff)
-
-            # STEP 3) save
             save_to_db_append_on_conflict(df_wasted)
 
         except Exception as e:
@@ -422,9 +394,8 @@ def run_realtime_loop():
             log(f"  - {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
-            raise  # 상위에서 처리(콘솔 유지 + exit code)
+            raise
 
-        # 1초 주기 유지
         elapsed = time.perf_counter() - loop_t0
         sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
         time.sleep(sleep_sec)
@@ -435,7 +406,7 @@ def main():
 
 
 if __name__ == "__main__":
-    freeze_support()
+    freeze_support()  # 있어도 무방
 
     try:
         main()

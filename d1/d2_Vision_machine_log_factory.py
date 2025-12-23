@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================
-# Vision Machine Log Parser (Realtime + MP2 + Dedup + TodayOnly)
+# Vision Machine Log Parser (Realtime + Thread2 + Dedup + TodayOnly)
 # - 주/야간 로직 제거
 # - dayornight 컬럼 제거
 # - time 컬럼 -> end_time 컬럼으로 변경
@@ -14,7 +14,8 @@ import re
 import time as time_mod
 from pathlib import Path
 from datetime import datetime
-from multiprocessing import Pool, freeze_support
+from multiprocessing import freeze_support
+from concurrent.futures import ThreadPoolExecutor, as_completed  # ✅ 변경
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -42,11 +43,11 @@ TABLE_MAP = {
 }
 
 # =========================
-# 요구사항: 멀티프로세스 2개 고정
+# 요구사항: "멀티프로세스 2개" -> ✅ 스레드 2개 고정
 # =========================
-USE_MULTIPROCESSING = True
-N_PROCESSES = 2
-POOL_CHUNKSIZE = 10
+USE_MULTIPROCESSING = True   # 변수명 유지(호출부 최소 변경)
+N_PROCESSES = 2              # ✅ 이제 스레드 개수 의미
+POOL_CHUNKSIZE = 10          # (스레드에선 직접 chunk 개념 없음, 유지해도 무방)
 
 # =========================
 # 요구사항: 실시간 120초 이내 신규/수정 파일만
@@ -92,7 +93,6 @@ def ensure_schema_tables(engine):
         for st, tbl in TABLE_MAP.items():
             conn.execute(text(ddl_template.format(schema=SCHEMA_NAME, table=tbl)))
 
-            # 중복 방지: (end_day, station, end_time, contents) UNIQUE INDEX
             idx_name = f"ux_{SCHEMA_NAME}_{tbl.lower()}_dedup"
             conn.execute(text(f"""
                 CREATE UNIQUE INDEX IF NOT EXISTS {idx_name}
@@ -111,12 +111,11 @@ FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE
 
 def clean_contents(raw: str, max_len: int = 200):
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    s = " ".join(s.split())  # 연속 공백 정리
+    s = " ".join(s.split())
     return s[:max_len].strip()
 
 
 def _open_text_file(path: Path):
-    # Vision 로그 인코딩 혼재 대응
     try:
         return path.open("r", encoding="utf-8", errors="ignore")
     except Exception:
@@ -125,7 +124,7 @@ def _open_text_file(path: Path):
 
 def parse_machine_log_file(path_str: str):
     """
-    멀티프로세스 워커용 (pickle 가능)
+    스레드 워커용
     한 파일에서 rows(list[dict]) 반환
     - end_day: 파일명 YYYYMMDD 그대로
     - 오늘 파일(YYYYMMDD==오늘)만 반환
@@ -137,12 +136,12 @@ def parse_machine_log_file(path_str: str):
         return []
 
     file_ymd = m.group(1)
-    vision_no = m.group(2)  # '1' or '2'
+    vision_no = m.group(2)
     station = f"Vision{vision_no}"
 
     today_ymd = datetime.now().strftime("%Y%m%d")
     if file_ymd != today_ymd:
-        return []  # 오늘 파일만
+        return []
 
     result = []
     try:
@@ -156,7 +155,6 @@ def parse_machine_log_file(path_str: str):
                 end_time_str = m2.group(1)
                 contents_raw = m2.group(2)
 
-                # 시간 포맷 검증
                 try:
                     _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
                 except ValueError:
@@ -181,7 +179,6 @@ def parse_machine_log_file(path_str: str):
 
 # ============================================
 # 5. "실시간 120초 이내" 신규/수정 파일만 수집
-#    디렉토리 구조: Vision\\YYYY\\MM\\파일명
 # ============================================
 def list_target_files_realtime(base_dir: Path):
     files = []
@@ -208,7 +205,6 @@ def list_target_files_realtime(base_dir: Path):
                 if not m:
                     continue
 
-                # 오늘 파일만
                 file_ymd = m.group(1)
                 if file_ymd != today_ymd:
                     continue
@@ -218,11 +214,9 @@ def list_target_files_realtime(base_dir: Path):
                 except OSError:
                     continue
 
-                # 120초 이내 변경 파일만
                 if mtime < cutoff_ts:
                     continue
 
-                # 새롭게 추가/수정된 파일만 (캐시)
                 fp = str(file_path)
                 prev_mtime = PROCESSED_MTIME.get(fp, 0)
                 if mtime <= prev_mtime:
@@ -242,7 +236,6 @@ def insert_to_db(engine, df: pd.DataFrame):
     if df.empty:
         return
 
-    # 정렬: end_day 오름차순, end_time 오름차순
     df = df.sort_values(["end_day", "end_time"]).reset_index(drop=True)
 
     with engine.begin() as conn:
@@ -284,15 +277,20 @@ def main():
 
             all_records = []
 
+            # ✅ ThreadPoolExecutor로 병렬 파싱
             if USE_MULTIPROCESSING and len(files) >= 2:
-                procs = min(N_PROCESSES, len(files))
-                print(f"[INFO] Using multiprocessing: {procs} processes")
-                with Pool(processes=procs) as pool:
-                    for rows in pool.imap_unordered(parse_machine_log_file, files, chunksize=POOL_CHUNKSIZE):
+                workers = min(N_PROCESSES, len(files))
+                print(f"[INFO] Using threads: {workers}")
+
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = [ex.submit(parse_machine_log_file, fp) for fp in files]
+                    for f in as_completed(futs):
+                        rows = f.result()
                         if rows:
                             all_records.extend(rows)
+
             else:
-                print("[INFO] Multiprocessing disabled (or not enough files).")
+                print("[INFO] Threading disabled (or not enough files).")
                 for fp in files:
                     rows = parse_machine_log_file(fp)
                     if rows:
@@ -315,5 +313,5 @@ def main():
 
 
 if __name__ == "__main__":
-    freeze_support()
+    freeze_support()  # 있어도 무방
     main()
