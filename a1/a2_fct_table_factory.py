@@ -2,18 +2,12 @@
 """
 a2_fct_table_parser_mp_realtime.py (Nuitka/Windows onefile + realtime loop)
 
-추가 사양 반영(통합본)
-- [멀티프로세스] 워커 2개 고정
-- [무한 루프] 1초마다 재실행
-- [윈도우] 유효 날짜 범위: end_day(파일명)이 "현재 날짜(오늘)"만
-- [실시간] 현재 시간 기준 120초 이내 새롭게 추가/수정된 파일만 파싱 (mtime 기준)
-- [미완성 파싱 방지] 저장 중일 가능성이 있는 파일 스킵 + 안정화 체크(크기/mtime 고정) 후 파싱
-  * 폴더 내 lock/tmp/part 등의 "저장중 암시 파일" 존재 시 스킵
-  * 파일명 자체가 임시 파일 패턴이면 스킵(~$, .tmp, .part ...)
-  * mtime 안정(MIN_FILE_AGE_SEC)
-  * 파일 크기 0.2초 간격 2회 동일 + mtime 동일 (연속 동일)
-  * open(rb)로 간단 read 가능 여부 확인
-  * 텍스트 읽기 가능 여부 확인
+[통합 수정 사항]
+- 중복 방지 기준: file_path 단독
+- DB 중복 방지: 오늘(end_day=오늘) 기준으로 fct_table에 이미 저장된 file_path만 SELECT DISTINCT로 로드
+- run 내 중복 방지: file_path 단독
+- 날짜 변경(자정) 감지 시: 캐시 초기화 + 오늘 DB file_path 재로딩
+- ⚠️ fct_table은 파일 1개당 여러 row 구조이므로 file_path UNIQUE 인덱스는 생성하지 않음
 """
 
 from __future__ import annotations
@@ -24,7 +18,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import multiprocessing as mp
 import psycopg2
@@ -62,39 +56,31 @@ TABLE_NAME  = "fct_table"
 # Realtime / Loop 사양
 # =========================
 USE_MULTIPROCESSING = True
-
-# ✅ 워커 2개 고정
 MAX_WORKERS = 2
 
-# 루프 주기(초)
 LOOP_INTERVAL_SEC = 1.0
-
-# ✅ "현재 시간 기준 120초 이내"만 파싱 (mtime 기준)
 RECENT_SECONDS = 120
 
 # ✅ 저장 중(미완성) 파싱 방지 파라미터
-MIN_FILE_AGE_SEC = 2.0          # mtime이 너무 최근이면(2초 이내) 스킵
+MIN_FILE_AGE_SEC = 2.0
+STABILITY_CHECK_SEC = 0.2
+STABILITY_RETRY = 2
 
-# 요청 사양: "파일 크기 0.2초 간격 2회 동일"
-STABILITY_CHECK_SEC = 0.2       # ✅ 0.2초
-STABILITY_RETRY = 2             # ✅ 2회 연속 동일 필요
-
-# ✅ lock/임시파일 패턴 (저장 중 파일 스킵)
 LOCK_GLOB_PATTERNS = [
     "*.lock", "~$*", "*.tmp", "*.part", "*.partial", "*.crdownload"
 ]
 SUSPECT_NAME_SUFFIXES = (".tmp", ".part", ".partial", ".crdownload")
 SUSPECT_NAME_PREFIXES = ("~$",)
 
-# pool 통신 감소(파일 수가 적을 수도 있으니 과도하게 키울 필요 없음)
 POOL_CHUNKSIZE = 500
 
-# INSERT 청크
 FLUSH_ROWS_REALTIME = 20_000
 EXECUTE_VALUES_PAGE_SIZE = 5_000
 
-# 수집/처리 로그
 HEARTBEAT_EVERY_LOOPS = 30  # 30루프(약 30초)마다 상태 로그
+
+# ✅ DB에서 "오늘 end_day" 기준 file_path 재로딩 주기(루프 횟수)
+DB_RELOAD_EVERY_LOOPS = 120  # 약 2분(1초 루프 기준)
 
 
 # =========================
@@ -133,7 +119,6 @@ def is_recent_file(fp: Path, now_ts: float, recent_sec: int) -> bool:
 def has_lock_files_in_dir(dir_path: Path) -> bool:
     """
     폴더 내 lock/tmp/part 등 저장 중을 암시하는 파일이 있으면 True
-    (네트워크 경로에서 glob 에러가 날 수 있어 보수적으로 처리)
     """
     try:
         for pat in LOCK_GLOB_PATTERNS:
@@ -155,21 +140,13 @@ def is_suspect_filename(fp: Path) -> bool:
 
 def is_file_complete(fp: Path, now_ts: float) -> bool:
     """
-    저장 중(미완성) 파일 파싱 방지 (강화 버전):
-    0) 파일명 자체가 임시/저장중 패턴이면 스킵
-    1) 동일 폴더에 lock/tmp/part 파일이 있으면 스킵
-    2) mtime이 너무 최근이면 스킵 (MIN_FILE_AGE_SEC)
-    3) 파일 크기 0.2초 간격 2회 연속 동일 + mtime 동일
-    4) open(rb)로 간단 read 가능 여부 확인
-    5) 텍스트 읽기 가능 여부 확인
+    저장 중(미완성) 파일 파싱 방지 (강화 버전)
     """
-    # 0) 임시/의심 파일명 스킵
     if is_suspect_filename(fp):
         return False
 
     parent = fp.parent
 
-    # 1) 폴더 내 lock/tmp/part 등 존재 시 스킵
     if has_lock_files_in_dir(parent):
         return False
 
@@ -177,18 +154,15 @@ def is_file_complete(fp: Path, now_ts: float) -> bool:
     if st1 is None:
         return False
 
-    # 파일 크기가 0이면 아직 작성 중일 가능성 큼
     if st1.st_size <= 0:
         return False
 
-    # 2) 너무 최근에 수정된 파일은 저장 중일 확률이 높음
     if (now_ts - st1.st_mtime) < MIN_FILE_AGE_SEC:
         return False
 
     size_prev = st1.st_size
     mtime_prev = st1.st_mtime
 
-    # 3) 안정화 체크(크기/mtime 고정) - 0.2초 간격 2회 "연속 동일"
     stable_hits = 0
     for _ in range(STABILITY_RETRY):
         time.sleep(STABILITY_CHECK_SEC)
@@ -197,7 +171,6 @@ def is_file_complete(fp: Path, now_ts: float) -> bool:
         if st2 is None:
             return False
 
-        # 중간에 lock 파일이 생길 수 있으므로 보수적으로 한 번 더 체크
         if has_lock_files_in_dir(parent):
             return False
 
@@ -211,14 +184,12 @@ def is_file_complete(fp: Path, now_ts: float) -> bool:
     if stable_hits < STABILITY_RETRY:
         return False
 
-    # 4) 열기 가능 여부(저장 중/잠금 상태면 예외 날 수 있음)
     try:
         with open(fp, "rb") as f:
             _ = f.read(64)
     except Exception:
         return False
 
-    # 5) 텍스트 읽기 가능 여부(인코딩 다중 시도)
     lines = safe_read_text(fp)
     if lines is None:
         return False
@@ -249,7 +220,7 @@ def parse_filename(file_path: Path) -> Optional[Tuple[str, str, str, str]]:
 
     remark = "Non-PD"
     if len(barcode_information) >= 18:
-        ch = barcode_information[17]  # 18번째(1-indexed)
+        ch = barcode_information[17]
         if ch in ("J", "S"):
             remark = "PD"
 
@@ -263,13 +234,11 @@ def parse_filename(file_path: Path) -> Optional[Tuple[str, str, str, str]]:
 _RUN_TIME_RE = re.compile(r"Run\s*Time\s*:\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 
 def parse_run_time(lines: List[str]) -> str:
-    # 14번째 줄(1-indexed) => index 13
     if len(lines) >= 14:
         m = _RUN_TIME_RE.search(lines[13])
         if m:
             return m.group(1).strip()
 
-    # fallback: 전체 탐색
     for ln in lines:
         m = _RUN_TIME_RE.search(ln)
         if m:
@@ -282,7 +251,6 @@ def parse_test_lines(lines: List[str]) -> List[Tuple[str, str, str, str, str]]:
     if len(lines) < 19:
         return out
 
-    # 19번째 줄(1-indexed)부터 => index 18부터
     for raw in lines[18:]:
         if not raw.strip():
             continue
@@ -307,7 +275,7 @@ def parse_test_lines(lines: List[str]) -> List[Tuple[str, str, str, str, str]]:
 
 
 # =========================
-# 4) 파일 1개 파싱 (✅ 반환을 tuple로 경량화)
+# 4) 파일 1개 파싱 (반환을 tuple로 경량화)
 # =========================
 
 RowTuple = Tuple[str, str, str, str, str, str, str, str, str, str, str, str]
@@ -327,7 +295,6 @@ def parse_one_file(args: Tuple[str, str, str]) -> List[RowTuple]:
         return []
     barcode_information, end_day, end_time, remark = info
 
-    # ✅ 오늘 날짜만
     if end_day != today_str:
         return []
 
@@ -365,19 +332,23 @@ def parse_one_file(args: Tuple[str, str, str]) -> List[RowTuple]:
 
 ProcessedInfo = Tuple[float, int, float]  # (mtime, size, last_seen_ts)
 
-def collect_recent_files(processed: Dict[str, ProcessedInfo]) -> List[Tuple[str, str, str]]:
+def collect_recent_files(
+    processed: Dict[str, ProcessedInfo],
+    already_in_db_paths_today: Set[str],
+    today_str: str,
+) -> List[Tuple[str, str, str]]:
     """
     return [(file_path_str, station, today_str), ...]
     조건:
       - \\...\\TCx\\YYYYMMDD\\{GoodFile,BadFile}\\*.txt
       - YYYYMMDD = 오늘
       - fp.mtime >= now - 120초
-      - fp가 이전에 처리되었더라도 (mtime/size 변경)되면 다시 처리
+      - file_path가 DB에 이미 존재(오늘 end_day)하면 스킵  (✅ file_path 단독 기준)
+      - processed dict는 run-time 중복 방지(변경없으면 스킵)
       - 미완성(저장 중) 파일은 스킵
     """
     jobs: List[Tuple[str, str, str]] = []
     now_ts = time.time()
-    today_str = today_yyyymmdd()
     cutoff_ts = now_ts - RECENT_SECONDS
 
     # 캐시 정리(메모리 폭증 방지): 마지막 관측이 10분 넘은 항목 제거
@@ -396,9 +367,7 @@ def collect_recent_files(processed: Dict[str, ProcessedInfo]) -> List[Tuple[str,
             if not sub_dir.exists():
                 continue
 
-            # 오늘 폴더 내 txt만
             for fp in sub_dir.glob("*.txt"):
-                # 임시/의심 파일명은 즉시 스킵
                 if is_suspect_filename(fp):
                     continue
 
@@ -406,26 +375,28 @@ def collect_recent_files(processed: Dict[str, ProcessedInfo]) -> List[Tuple[str,
                 if st is None:
                     continue
 
-                # 최근 120초 이내 변경 파일만
                 if st.st_mtime < cutoff_ts:
                     continue
 
                 fkey = str(fp)
+
+                # ✅ DB 중복 스킵 (file_path 단독, 오늘 end_day 기준)
+                if fkey in already_in_db_paths_today:
+                    continue
+
                 prev = processed.get(fkey)
 
                 # 변경이 없는 파일은 스킵 (중복 파싱 방지)
                 if prev is not None:
                     prev_mtime, prev_size, _ = prev
                     if prev_mtime == st.st_mtime and prev_size == st.st_size:
-                        processed[fkey] = (prev_mtime, prev_size, now_ts)  # last_seen 갱신
+                        processed[fkey] = (prev_mtime, prev_size, now_ts)
                         continue
 
-                # 저장 중(미완성) 방지(강화)
                 if not is_file_complete(fp, now_ts):
                     processed[fkey] = (st.st_mtime, st.st_size, now_ts)
                     continue
 
-                # 통과 -> 작업 등록 + 캐시 업데이트
                 jobs.append((fkey, station, today_str))
                 processed[fkey] = (st.st_mtime, st.st_size, now_ts)
 
@@ -433,7 +404,7 @@ def collect_recent_files(processed: Dict[str, ProcessedInfo]) -> List[Tuple[str,
 
 
 # =========================
-# 6) DB (DDL + INSERT)
+# 6) DB (DDL + INSERT + 오늘 file_path 로드)
 # =========================
 
 DDL_SQL = f"""
@@ -503,6 +474,26 @@ def flush_rows(cur, buffer_rows: List[RowTuple]) -> int:
     )
     return len(buffer_rows)
 
+def load_db_file_paths_today(conn, end_day_today: str) -> Set[str]:
+    """
+    ✅ 오늘(end_day=오늘) 기준으로 fct_table에 이미 저장된 file_path 목록을 로드 (DISTINCT)
+    - file_path 단독 중복 방지
+    - 메모리 절감을 위해 '오늘'만
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT DISTINCT file_path
+            FROM {SCHEMA_NAME}.{TABLE_NAME}
+            WHERE end_day = %s
+              AND file_path IS NOT NULL
+              AND file_path <> '';
+            """,
+            (end_day_today,)
+        )
+        rows = cur.fetchall()
+    return {r[0] for r in rows if r and r[0]}
+
 
 # =========================
 # 7) 무한루프 메인
@@ -522,6 +513,7 @@ def realtime_loop() -> int:
     log(f"[INFO] TARGET = {SCHEMA_NAME}.{TABLE_NAME}")
     log(f"[INFO] MIN_FILE_AGE_SEC={MIN_FILE_AGE_SEC} | STABILITY_CHECK_SEC={STABILITY_CHECK_SEC} | STABILITY_RETRY={STABILITY_RETRY}")
     log(f"[INFO] LOCK_GLOB_PATTERNS={LOCK_GLOB_PATTERNS}")
+    log(f"[INFO] DB_RELOAD_EVERY_LOOPS={DB_RELOAD_EVERY_LOOPS}")
     log("============================================================")
 
     log("[STEP] Ensure schema/table/index ...")
@@ -531,7 +523,7 @@ def realtime_loop() -> int:
     processed: Dict[str, ProcessedInfo] = {}
     loop_count = 0
 
-    # DB connection은 루프 동안 유지(성능/안정성)
+    # DB connection은 루프 동안 유지
     with get_conn() as conn:
         with conn.cursor() as cur:
             if USE_MULTIPROCESSING:
@@ -540,6 +532,11 @@ def realtime_loop() -> int:
             else:
                 pool = None
 
+            # ✅ 오늘 기준 DB file_path 캐시
+            current_day = today_yyyymmdd()
+            already_in_db_paths_today: Set[str] = load_db_file_paths_today(conn, current_day)
+            log(f"[DB] Loaded DISTINCT file_path for end_day={current_day}: {len(already_in_db_paths_today):,}")
+
             try:
                 while True:
                     loop_count += 1
@@ -547,14 +544,25 @@ def realtime_loop() -> int:
                     now_dt = datetime.now()
                     today_str = now_dt.strftime("%Y%m%d")
 
-                    # 1) 최근 파일 수집
-                    jobs = collect_recent_files(processed)
+                    # ✅ 날짜 변경 감지(자정): 캐시 초기화 + DB file_path 재로딩
+                    if today_str != current_day:
+                        current_day = today_str
+                        processed.clear()
+                        already_in_db_paths_today = load_db_file_paths_today(conn, current_day)
+                        log(f"[DAY-CHANGE] today={current_day} | reset caches | db_paths={len(already_in_db_paths_today):,}")
+
+                    # ✅ 주기적 DB file_path 재로딩(프로그램 재시작/타 프로세스 적재 반영)
+                    if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
+                        already_in_db_paths_today = load_db_file_paths_today(conn, current_day)
+                        log(f"[DB-RELOAD] end_day={current_day} | db_paths={len(already_in_db_paths_today):,}")
+
+                    # 1) 최근 파일 수집 (✅ DB에 이미 있는 file_path는 스킵)
+                    jobs = collect_recent_files(processed, already_in_db_paths_today, current_day)
 
                     if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
-                        log(f"[HEARTBEAT] {now_dt:%Y-%m-%d %H:%M:%S} | jobs={len(jobs):,} | cache={len(processed):,} | today={today_str}")
+                        log(f"[HEARTBEAT] {now_dt:%Y-%m-%d %H:%M:%S} | jobs={len(jobs):,} | cache={len(processed):,} | db_paths={len(already_in_db_paths_today):,} | today={current_day}")
 
                     if not jobs:
-                        # 1초 주기 유지
                         elapsed = time.perf_counter() - loop_start
                         sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
                         if sleep_sec > 0:
@@ -576,6 +584,11 @@ def realtime_loop() -> int:
                                 inserted = flush_rows(cur, buffer)
                                 conn.commit()
                                 rows_inserted += inserted
+
+                                # ✅ 방금 처리된 파일들 file_path를 DB캐시에 즉시 반영(중복 방지 강화)
+                                for r in buffer:
+                                    already_in_db_paths_today.add(r[-1])  # file_path
+
                                 log(f"[FLUSH] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
                                 buffer.clear()
                     else:
@@ -589,6 +602,10 @@ def realtime_loop() -> int:
                                 inserted = flush_rows(cur, buffer)
                                 conn.commit()
                                 rows_inserted += inserted
+
+                                for r in buffer:
+                                    already_in_db_paths_today.add(r[-1])
+
                                 log(f"[FLUSH] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
                                 buffer.clear()
 
@@ -596,6 +613,10 @@ def realtime_loop() -> int:
                         inserted = flush_rows(cur, buffer)
                         conn.commit()
                         rows_inserted += inserted
+
+                        for r in buffer:
+                            already_in_db_paths_today.add(r[-1])
+
                         log(f"[FLUSH-LAST] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
                         buffer.clear()
 
@@ -643,7 +664,7 @@ def hold_console(exit_code: int) -> None:
 
 
 if __name__ == "__main__":
-    mp.freeze_support()  # ✅ Nuitka/Windows spawn 부트스트랩
+    mp.freeze_support()
 
     exit_code = 0
     try:

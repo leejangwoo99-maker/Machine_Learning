@@ -1,49 +1,28 @@
-# c1_fct_detail_loader_realtime.py
-# ============================================
-# FCT Detail TXT Parser -> PostgreSQL 적재 (Realtime Loop)
-#
-# 추가 반영 사항:
-# A) remark는 반드시 'PD' 또는 'Non-PD'만 허용
-#    - 폴더명에 'PD NONE' 포함 -> 'Non-PD'
-#    - 그 외 폴더명에 'PD' 포함 -> 'PD'
-#    - 둘 다 아니면 해당 파일은 "파일 전체 제외"
-#
-# B) test_ct 음수 보정 (자정 넘김 케이스)
-#    - 현재 test_time - 이전 test_time < 0 이면 +86400(초) 보정
-#
-# Scan:
-#   C:\Users\user\Desktop\machinlog\FCT\yyyy\mm\dd\**\*.txt (반드시 yyyy/mm/dd 형식만)
-# filename:
-#   (barcode)_yyyymmdd_(start time).txt
-# line:
-#   [hh:mm:ss.ss] (내용)  (형식 외 라인은 제외)
-#
-# end_time:
-#   마지막 행 시간 반올림 -> hh:mm:ss
-#
-# end_day:
-#   파일명 yyyymmdd (단, end_time < start_time이면 end_day +1)
-#
-# 중복방지:
-#   file_path 이미 존재하면 파일 통째 PASS (in-memory set + insert 후 set 갱신)
-#
-# 추가 요구 사양:
-# - [멀티프로세스] 2개 고정
-# - [무한 루프] 1초마다 재실행
-# - [유효 날짜] end_day == 오늘(date.today()) 인 row만 적재
-# - [실시간] 현재시간 기준 60초 이내로 새로 생성/수정된 파일만 파싱 (mtime)
-# ============================================
+# -*- coding: utf-8 -*-
+"""
+c1_fct_detail_loader_realtime.py
+============================================
+FCT Detail TXT Parser -> PostgreSQL 적재 (Realtime Loop)
+
+중복방지(요청 반영):
+- fct_table 구조상 UNIQUE(file_path)는 불가능하므로,
+  ✅ SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별합니다.
+  (in-memory set + insert 후 set 갱신, 자정/주기적 재로딩)
+
+기타 사양은 기존 그대로 유지:
+- remark strict(PD/Non-PD만), test_ct 자정 음수 보정, yyyy/mm/dd 스캔,
+  end_time 반올림, end_day 보정, MP=2, 1초 loop, mtime 60초, end_day==today만 적재
+"""
 
 import re
 import time as time_mod
 from pathlib import Path
 from datetime import datetime, timedelta, date, time as dt_time
 from multiprocessing import Pool, freeze_support
-
 import urllib.parse
+
 import psycopg2
 from psycopg2.extras import execute_values
-
 
 # =========================
 # 0) 설정
@@ -70,6 +49,9 @@ LOOP_SLEEP_SEC = 1
 # 멀티프로세스 고정
 MP_PROCESSES = 2
 
+# ✅ 오늘 기준 DISTINCT file_path 재로딩 주기(루프 횟수)
+DB_RELOAD_EVERY_LOOPS = 120  # 약 2분(1초 루프)
+
 # 라인 패턴: [hh:mm:ss.ss] 내용
 LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{1,3})\]\s(.+)$")
 
@@ -80,7 +62,6 @@ DAY_RE = re.compile(r"^\d{2}$")
 
 # 파일명: (barcode)_yyyymmdd_(start time).txt
 FNAME_RE = re.compile(r"^(.+?)_(\d{8})_(.+?)\.txt$", re.IGNORECASE)
-
 
 # =========================
 # 1) 유틸
@@ -115,17 +96,30 @@ def _ensure_schema_and_table():
 
     CREATE INDEX IF NOT EXISTS ix_{TABLE_NAME}_file_path
         ON {SCHEMA_NAME}.{TABLE_NAME} (file_path);
+
+    CREATE INDEX IF NOT EXISTS ix_{TABLE_NAME}_end_day
+        ON {SCHEMA_NAME}.{TABLE_NAME} (end_day);
     """
     with _psycopg2_conn(DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
         conn.commit()
 
-def _load_existing_file_paths() -> set:
-    sql = f"SELECT DISTINCT file_path FROM {SCHEMA_NAME}.{TABLE_NAME};"
+def _load_existing_file_paths_today(today: date) -> set:
+    """
+    ✅ fct_table 구조상 UNIQUE(file_path)는 불가능하므로,
+    ✅ SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별합니다.
+    """
+    sql = f"""
+    SELECT DISTINCT file_path
+    FROM {SCHEMA_NAME}.{TABLE_NAME}
+    WHERE end_day = %s
+      AND file_path IS NOT NULL
+      AND file_path <> '';
+    """
     with _psycopg2_conn(DB_CONFIG) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(sql, (today,))
             rows = cur.fetchall()
     return {r[0] for r in rows if r and r[0]}
 
@@ -174,7 +168,6 @@ def _try_parse_start_time_to_seconds(s: str):
     if m2:
         return float(int(m2.group(1)) * 3600 + int(m2.group(2)) * 60 + int(m2.group(3)))
     return None
-
 
 # =========================
 # 2) 파일 파싱 (멀티프로세스 worker)
@@ -262,7 +255,6 @@ def _parse_one_file_only_today(file_path_str: str):
 
     return file_path_str, rows, "OK"
 
-
 # =========================
 # 3) 스캔: yyyy/mm/dd 형식만 + 실시간(mtime 60초)
 # =========================
@@ -286,10 +278,8 @@ def _collect_realtime_files(base: Path, cutoff_ts: float) -> list[str]:
                     if fp.stat().st_mtime >= cutoff_ts:
                         targets.append(str(fp))
                 except Exception:
-                    # 접근 중 삭제/권한 등은 스킵
                     continue
     return targets
-
 
 # =========================
 # 4) DB Insert
@@ -308,7 +298,6 @@ def _insert_rows(rows: list[tuple]) -> int:
         conn.commit()
     return len(rows)
 
-
 # =========================
 # 5) main loop
 # =========================
@@ -317,30 +306,45 @@ def main():
     _ensure_schema_and_table()
     print(f"[INFO] Table ensured: {SCHEMA_NAME}.{TABLE_NAME}")
 
-    # 기동 시 1회만 로딩 (이후 insert될 때 set 갱신)
-    existing = _load_existing_file_paths()
-    print(f"[INFO] existing_files_loaded={len(existing):,}")
+    # ✅ 기동 시: "오늘 end_day" 기준으로만 DISTINCT file_path 로딩
+    current_day = date.today()
+    existing = _load_existing_file_paths_today(current_day)
+    print(f"[INFO] existing_files_loaded_today({current_day})={len(existing):,}")
 
     chunksize = 10
     print(f"[INFO] Multiprocessing fixed: processes={MP_PROCESSES}, chunksize={chunksize}")
     print(f"[INFO] Realtime window: mtime within {MTIME_WINDOW_SEC}s, loop every {LOOP_SLEEP_SEC}s")
     print(f"[INFO] Only insert rows where end_day == today")
+    print(f"[INFO] Dedup by: SELECT DISTINCT file_path WHERE end_day=today (in-memory set cached)")
 
-    # 누적 통계(옵션)
     total_inserted = 0
+    loop_count = 0
 
     while True:
         try:
+            loop_count += 1
+            today = date.today()
+
+            # ✅ 자정 날짜 변경: today 기준으로 existing 재로딩
+            if today != current_day:
+                current_day = today
+                existing = _load_existing_file_paths_today(current_day)
+                print(f"[DAY-CHANGE] reload existing for {current_day} -> {len(existing):,}")
+
+            # ✅ 주기적 재동기화(다른 프로세스 적재/재시작 반영)
+            if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
+                existing = _load_existing_file_paths_today(current_day)
+                print(f"[DB-RELOAD] existing_today({current_day})={len(existing):,}")
+
             now_ts = time_mod.time()
-            cutoff_ts = now_ts - MTIME_WINDOW_SEC  # 실시간 컷오프(요구사항)
+            cutoff_ts = now_ts - MTIME_WINDOW_SEC
 
             candidate_files = _collect_realtime_files(BASE_DIR, cutoff_ts)
 
-            # 중복(이미 적재된 file_path) 제외
+            # ✅ 중복방지: 오늘 end_day 기준으로 이미 적재된 file_path는 제외
             new_files = [f for f in candidate_files if f not in existing]
 
             if not new_files:
-                # 너무 시끄럽지 않게 주기적으로만 출력
                 time_mod.sleep(LOOP_SLEEP_SEC)
                 continue
 
@@ -353,11 +357,15 @@ def main():
             skip_not_today = 0
 
             with Pool(processes=MP_PROCESSES) as pool:
-                for file_path_str, rows, status in pool.imap_unordered(_parse_one_file_only_today, new_files, chunksize=chunksize):
+                for file_path_str, rows, status in pool.imap_unordered(
+                    _parse_one_file_only_today, new_files, chunksize=chunksize
+                ):
                     processed += 1
                     if status == "OK":
                         parsed_rows_all.extend(rows)
-                        # 파일 단위 중복방지 set에 즉시 반영 (동일 loop 내 재처리 방지)
+
+                        # ✅ insert 후 중복방지: file 단위로 set 갱신
+                        # (동일 loop 내 재처리 방지 + 다음 loop에서도 빠르게 스킵)
                         existing.add(file_path_str)
                     else:
                         if status == "SKIP_REMARK":
@@ -368,8 +376,7 @@ def main():
                             skip_badname += 1
                         elif status == "SKIP_NOT_TODAY":
                             skip_not_today += 1
-
-                        # 파싱 실패/스킵 파일은 다음 loop에서 재시도될 수 있으므로 set에 넣지 않음
+                        # 스킵 파일은 다음 루프에서 재시도될 수 있으므로 set에 넣지 않음
 
             inserted = _insert_rows(parsed_rows_all)
             total_inserted += inserted
@@ -377,18 +384,17 @@ def main():
             print(
                 f"[INFO] loop_done | candidates={len(candidate_files):,} new_files={len(new_files):,} "
                 f"processed={processed:,} inserted_rows={inserted:,} total_inserted={total_inserted:,} "
-                f"| skipped: remark={skip_remark:,}, empty={skip_empty:,}, badname={skip_badname:,}, not_today={skip_not_today:,}"
+                f"| skipped: remark={skip_remark:,}, empty={skip_empty:,}, badname={skip_badname:,}, not_today={skip_not_today:,} "
+                f"| existing_today={len(existing):,}"
             )
 
         except KeyboardInterrupt:
             print("[INFO] KeyboardInterrupt. Stop.")
             break
         except Exception as e:
-            # 실시간 루프이므로 죽지 않게
             print(f"[WARN] loop_error: {e}")
 
         time_mod.sleep(LOOP_SLEEP_SEC)
-
 
 if __name__ == "__main__":
     freeze_support()

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from pathlib import Path
 from datetime import datetime
 import time
@@ -9,7 +10,6 @@ from psycopg2.extras import execute_batch
 # ============================================
 # 0. 공장 전용 설정 (고정)
 # ============================================
-# a. 경로 변경 (공장 NAS)
 BASE_LOG_DIR = Path(r"\\192.168.108.101\HistoryLog")
 
 MIDDLE_FOLDERS = ["TC6", "TC7", "TC8", "TC9", "Vision03"]
@@ -22,7 +22,6 @@ FCT_MAP = {
     "TC9": "FCT4",
 }
 
-# b. DB 접속 정보 변경 (공장 DB)
 DB_CONFIG = {
     "host": "192.168.108.162",
     "port": 5432,
@@ -37,10 +36,7 @@ TABLE_HISTORY  = "fct_vision_testlog_txt_processing_history"
 SCHEMA_RESULT = "a1_fct_vision_testlog_txt_processing_result"
 SCHEMA_DETAIL = "a1_fct_vision_testlog_txt_processing_result_detail"
 
-# d. 실시간 120초 이내 파일만 처리
 REALTIME_WINDOW_SEC = 120
-
-# e. 멀티프로세스 2개 고정
 MP_PROCESSES = 2
 
 
@@ -54,7 +50,8 @@ def get_connection():
 def init_db(conn):
     """
     (2)(3) 스키마 삭제
-    (1) history 스키마/테이블 생성 (컬럼 순서 반영)
+    (1) history 스키마/테이블 생성
+    (추가) file_path 단독 중복 방지용 UNIQUE 인덱스 + end_day 조회 인덱스
     """
     cur = conn.cursor()
 
@@ -85,13 +82,23 @@ def init_db(conn):
         """
     )
 
-    # 인덱스
+    # (핵심) file_path 단독 중복 방지: UNIQUE 인덱스(권장)
     cur.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{TABLE_HISTORY}_file_path ON {SCHEMA_HISTORY}.{TABLE_HISTORY}(file_path);"
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_{TABLE_HISTORY}_file_path
+        ON {SCHEMA_HISTORY}.{TABLE_HISTORY}(file_path);
+        """
     )
+
+    # (성능) end_day 필터 조회용 인덱스
     cur.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{TABLE_HISTORY}_filename ON {SCHEMA_HISTORY}.{TABLE_HISTORY}(filename);"
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{TABLE_HISTORY}_end_day
+        ON {SCHEMA_HISTORY}.{TABLE_HISTORY}(end_day);
+        """
     )
+
+    # (옵션) 추가 조회 인덱스(기존 유지 가능)
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_HISTORY}_barcode ON {SCHEMA_HISTORY}.{TABLE_HISTORY}(barcode_information);"
     )
@@ -100,27 +107,30 @@ def init_db(conn):
     cur.close()
 
 
-def load_processed_keys(conn):
+def load_processed_paths_today(conn, end_day_today: str):
     """
-    history에 올라간 file_path / filename set 로드
-    -> 둘 중 하나라도 겹치면 중복 스킵
+    (변경) 오늘(end_day=오늘) 처리 이력의 file_path만 set 로드
+    -> 메모리 사용량 대폭 감소
     """
     cur = conn.cursor()
-    cur.execute(f"SELECT file_path, filename FROM {SCHEMA_HISTORY}.{TABLE_HISTORY};")
+    cur.execute(
+        f"""
+        SELECT file_path
+        FROM {SCHEMA_HISTORY}.{TABLE_HISTORY}
+        WHERE end_day = %s;
+        """,
+        (end_day_today,)
+    )
     rows = cur.fetchall()
     cur.close()
-
-    processed_paths = set()
-    processed_names = set()
-    for fp, fn in rows:
-        if fp:
-            processed_paths.add(fp)
-        if fn:
-            processed_names.add(fn)
-    return processed_paths, processed_names
+    return {fp for (fp,) in rows if fp}
 
 
 def insert_history_rows(conn, rows):
+    """
+    (변경) UNIQUE(file_path) 기준으로 중복 방지
+    - ON CONFLICT DO NOTHING 적용
+    """
     if not rows:
         return 0
 
@@ -133,6 +143,7 @@ def insert_history_rows(conn, rows):
              goodorbad, filename, file_path, processed_at)
         VALUES (%s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s)
+        ON CONFLICT (file_path) DO NOTHING
         """,
         [
             (
@@ -151,6 +162,8 @@ def insert_history_rows(conn, rows):
         ],
         page_size=1000,
     )
+    # rowcount는 execute_batch에서 신뢰도가 떨어질 수 있어, 커밋 후 len(rows) 그대로 반환하지 않습니다.
+    # 여기서는 삽입 시도 건수 반환(로그용)으로 둡니다.
     conn.commit()
     cur.close()
     return len(rows)
@@ -277,23 +290,24 @@ def run_once():
     now_ts = time.time()
     cutoff_ts = now_ts - REALTIME_WINDOW_SEC
 
-    today_yyyymmdd = datetime.now().strftime("%Y%m%d")  # c. 오늘 날짜만
+    today_yyyymmdd = datetime.now().strftime("%Y%m%d")  # 오늘 날짜(end_day)
 
     print("\n==================== run_once 시작 ====================")
-    print(f"시각: {started_at} / today={today_yyyymmdd} / window={REALTIME_WINDOW_SEC}s")
+    print(f"시각: {started_at} / end_day(today)={today_yyyymmdd} / window={REALTIME_WINDOW_SEC}s")
 
     conn = get_connection()
     try:
         init_db(conn)
 
-        processed_paths, processed_names = load_processed_keys(conn)
-        print(f"[이력] 이미 처리된 file_path 수 : {len(processed_paths)}")
-        print(f"[이력] 이미 처리된 filename 수 : {len(processed_names)}")
+        # (변경) 오늘 end_day 기준 file_path만 로드
+        processed_paths = load_processed_paths_today(conn, today_yyyymmdd)
+        print(f"[이력] 오늘(end_day={today_yyyymmdd}) 처리된 file_path 수 : {len(processed_paths)}")
 
         file_infos = []
         total_scanned = 0
+
+        # (변경) 이번 run 내 중복도 file_path만
         seen_paths_this_run = set()
-        seen_names_this_run = set()
 
         for mid in MIDDLE_FOLDERS:
             mid_path = BASE_LOG_DIR / mid
@@ -301,7 +315,7 @@ def run_once():
                 print(f"[SKIP] {mid_path} 없음")
                 continue
 
-            # c. 오늘 날짜 폴더만 직접 접근 (성능상 유리)
+            # 오늘 날짜 폴더만
             date_folder = mid_path / today_yyyymmdd
             if not date_folder.exists() or (not date_folder.is_dir()):
                 continue
@@ -319,29 +333,26 @@ def run_once():
 
                     total_scanned += 1
 
-                    # d. 120초 이내 수정된 파일만 처리
+                    # 120초 이내 수정된 파일만 처리
                     try:
                         mtime = f.stat().st_mtime
                     except Exception:
-                        # stat 실패 시 안전하게 스킵
                         continue
 
                     if mtime < cutoff_ts:
                         continue
 
                     file_path_str = str(f)
-                    filename = f.name
 
-                    # DB 중복 스킵
-                    if (file_path_str in processed_paths) or (filename in processed_names):
+                    # DB 중복 스킵 (file_path 단독)
+                    if file_path_str in processed_paths:
                         continue
 
-                    # 이번 run 내 중복 스킵
-                    if (file_path_str in seen_paths_this_run) or (filename in seen_names_this_run):
+                    # 이번 run 내 중복 스킵 (file_path 단독)
+                    if file_path_str in seen_paths_this_run:
                         continue
 
                     seen_paths_this_run.add(file_path_str)
-                    seen_names_this_run.add(filename)
                     file_infos.append((file_path_str, mid, folder_date, gb))
 
         print(f"[스캔] 전체 스캔 파일 수(오늘 폴더 내): {total_scanned}")
@@ -351,14 +362,13 @@ def run_once():
             print("[정보] 새로 처리할 파일이 없습니다.")
             return
 
-        # e. 멀티프로세스 2개 고정
         print(f"[멀티프로세스] 사용 프로세스 수: {MP_PROCESSES}")
 
         with mp.Pool(processes=MP_PROCESSES) as pool:
             history_rows = pool.map(process_one_file, file_infos)
 
-        n_hist = insert_history_rows(conn, history_rows)
-        print(f"[DB] history 저장 건수 : {n_hist}")
+        n_try = insert_history_rows(conn, history_rows)
+        print(f"[DB] history INSERT 시도 건수 : {n_try} (중복은 DB에서 자동 무시)")
 
     finally:
         conn.close()

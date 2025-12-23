@@ -1,7 +1,7 @@
+# -*- coding: utf-8 -*-
 from pathlib import Path
 import pandas as pd
 import re
-import os
 import time
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
@@ -14,7 +14,6 @@ from psycopg2.extras import execute_values
 # 기본 경로 설정
 # ==========================
 BASE_LOG_DIR = Path(r"\\192.168.108.101\HistoryLog")
-# BASE_LOG_DIR = Path(r"C:\Users\user\Desktop\RAW_LOG")
 VISION_FOLDER_NAME = "Vision03"
 
 # ==========================
@@ -40,22 +39,26 @@ TABLE_NAME  = "vision_table"
 NUM_WORKERS = 2                 # ✅ 멀티프로세스 2개 고정
 REALTIME_WINDOW_SEC = 120       # ✅ 최근 120초 이내 파일만 처리
 USE_FIXED_CUTOFF_TS = False     # ✅ True면 아래 cutoff_ts 값을 "고정"으로 사용
-FIXED_CUTOFF_TS = 1765501841.4473598  # ✅ 요청하신 예시 cutoff_ts
+FIXED_CUTOFF_TS = 1765501841.4473598
+
+# ✅ DB DISTINCT file_path 재로딩 주기(루프 횟수)
+DB_RELOAD_EVERY_LOOPS = 120     # 약 2분(1초 루프 기준)
+
 
 # ==========================
 # DB 유틸
 # ==========================
 def get_connection():
-    conn = psycopg2.connect(**DB_CONFIG)
-    return conn
+    return psycopg2.connect(**DB_CONFIG)
 
 
 def ensure_schema_and_table(conn):
     """
-    - 메인 테이블만 사용
-    - 중복 판정은 vision_table의 DISTINCT file_path로 수행 (FCT 방식)
-    - 성능을 위해 file_path 인덱스는 생성
-    - 추가: run_time 컬럼 (DOUBLE PRECISION)
+    - 메인 테이블은 파일 1개당 여러 step row가 들어가는 구조
+      => UNIQUE(file_path) / ON CONFLICT(file_path) 불가능
+    - 따라서 중복 판정은:
+      ✅ SELECT DISTINCT file_path WHERE end_day=오늘
+    - 성능을 위해 file_path, end_day 인덱스 생성
     """
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};")
@@ -81,6 +84,7 @@ def ensure_schema_and_table(conn):
             """
         )
 
+        # (안전) 이미 존재해도 OK
         cur.execute(
             f"""
             ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME}
@@ -95,7 +99,6 @@ def ensure_schema_and_table(conn):
             """
         )
 
-        # (선택) 오늘 데이터만 계속 볼 거라면 end_day 인덱스도 추가하면 쿼리/필터에 도움됨
         cur.execute(
             f"""
             CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_end_day
@@ -106,28 +109,31 @@ def ensure_schema_and_table(conn):
     conn.commit()
 
 
-def get_processed_file_paths(conn, end_day: str) -> set:
+def get_processed_file_paths_today(conn, end_day: str) -> set:
     """
-    ✅ 오늘(end_day)만 처리하므로, 오늘 데이터의 DISTINCT file_path만 로딩
-    (기존 기능 유지 + 성능 개선)
+    ✅ fct_table과 동일:
+    UNIQUE(file_path)는 불가능하므로,
+    SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별
     """
     with conn.cursor() as cur:
         cur.execute(
             f"""
             SELECT DISTINCT file_path
             FROM {SCHEMA_NAME}.{TABLE_NAME}
-            WHERE end_day = %s;
+            WHERE end_day = %s
+              AND file_path IS NOT NULL
+              AND file_path <> '';
             """,
             (end_day,)
         )
         rows = cur.fetchall()
-    return {r[0] for r in rows}
+    return {r[0] for r in rows if r and r[0]}
 
 
 def insert_main_rows(conn, rows):
     """
-    메인 테이블은 파일당 여러 step row 저장해야 하므로
-    file_path 기준 ON CONFLICT 같은 건 쓰면 안 됨.
+    메인 테이블은 파일당 여러 step row 저장 구조이므로
+    file_path 기준 ON CONFLICT / UNIQUE 같은 건 사용하면 안 됨.
     """
     if not rows:
         return
@@ -303,16 +309,13 @@ def _worker_process_file(file_str: str):
 # ==========================
 # 메인 파싱 로직 (한 번 실행)
 # ==========================
-def run_once():
+def run_once(conn, processed_set: set, today_str: str):
     vision_root = BASE_LOG_DIR / VISION_FOLDER_NAME
     if not vision_root.exists():
         print(f"[ERROR] {VISION_FOLDER_NAME} 폴더가 없음: {vision_root}")
         return
 
-    # ✅ 오늘 날짜(YYYYMMDD)만 처리
-    today_str = datetime.now().strftime("%Y%m%d")
-
-    # ✅ cutoff_ts 결정: (기본) 현재시간-120초, (옵션) 고정 cutoff_ts 사용
+    # cutoff_ts 결정
     if USE_FIXED_CUTOFF_TS:
         cutoff_ts = float(FIXED_CUTOFF_TS)
     else:
@@ -335,7 +338,6 @@ def run_once():
             if not fp.is_file():
                 continue
 
-            # ✅ 실시간 조건: 최근 120초 이내 수정된 파일만
             try:
                 mtime = fp.stat().st_mtime
             except Exception:
@@ -352,85 +354,105 @@ def run_once():
         print("[INFO] 대상 파일 없음.")
         return
 
-    # 2) DB 연결/초기화
-    with get_connection() as conn:
-        ensure_schema_and_table(conn)
+    # ✅ fct_table과 동일: 이미 적재된 file_path(오늘 end_day)면 스킵
+    files_to_process = [f for f in target_files if f not in processed_set]
 
-        # 3) 오늘(end_day=today_str)만 DISTINCT file_path 로드
-        processed_set = get_processed_file_paths(conn, today_str)
+    # (추가) 이번 사이클 내 중복 file_path 제거
+    seen = set()
+    uniq = []
+    for f in files_to_process:
+        if f in seen:
+            continue
+        seen.add(f)
+        uniq.append(f)
+    files_to_process = uniq
 
-        # 4) 이미 처리된 file_path 스킵
-        files_to_process = [f for f in target_files if f not in processed_set]
+    print(f"[INFO] DB DISTINCT file_path(end_day=오늘) 중복 스킵: {total - len(files_to_process)}개")
+    print(f"[INFO] 실제 처리 대상: {len(files_to_process)}개")
 
-        # (추가 안전장치) 이번 사이클 내에서도 중복 file_path 제거
-        seen = set()
-        uniq = []
-        for f in files_to_process:
-            if f in seen:
-                continue
-            seen.add(f)
-            uniq.append(f)
-        files_to_process = uniq
+    if not files_to_process:
+        print("[INFO] 처리할 신규 파일 없음.")
+        return
 
-        print(f"[INFO] DB(file_path) 중복 스킵: {total - len(files_to_process)}개")
-        print(f"[INFO] 실제 처리 대상: {len(files_to_process)}개")
+    # 3) 멀티프로세스 파싱 (2개 고정)
+    max_workers = NUM_WORKERS
+    chunksize = max(20, len(files_to_process) // (max_workers * 8) or 1)
 
-        if not files_to_process:
-            print("[INFO] 처리할 신규 파일 없음.")
-            return
+    all_new_rows = []
 
-        # 5) 멀티프로세스 파싱 (✅ 2개 고정)
-        max_workers = NUM_WORKERS
-        chunksize = max(20, len(files_to_process) // (max_workers * 8) or 1)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        for idx, rows in enumerate(
+            executor.map(_worker_process_file, files_to_process, chunksize=chunksize),
+            start=1,
+        ):
+            if rows:
+                rows = [r for r in rows if r.get("end_day") == today_str]
+                all_new_rows.extend(rows)
 
-        all_new_rows = []
+            if idx % 500 == 0 or idx == len(files_to_process):
+                print(
+                    f"[진행] {idx}/{len(files_to_process)} "
+                    f"(누적 신규 row: {len(all_new_rows)}) "
+                    f"[workers={max_workers}, chunksize={chunksize}]"
+                )
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            for idx, rows in enumerate(
-                executor.map(_worker_process_file, files_to_process, chunksize=chunksize),
-                start=1,
-            ):
-                if rows:
-                    # ✅ 오늘 end_day만 처리한다는 조건을 2중 안전장치로 재확인(예외 경로 방어)
-                    # (worker가 end_day를 path에서 파싱하므로 혹시 다른 날짜가 섞이면 제거)
-                    rows = [r for r in rows if r.get("end_day") == today_str]
-                    all_new_rows.extend(rows)
+    if not all_new_rows:
+        print("[INFO] 신규 파싱된 데이터가 없습니다.")
+        return
 
-                if idx % 500 == 0 or idx == len(files_to_process):
-                    print(
-                        f"[진행] {idx}/{len(files_to_process)} "
-                        f"(누적 신규 row: {len(all_new_rows)}) "
-                        f"[workers={max_workers}, chunksize={chunksize}]"
-                    )
+    # 4) INSERT + COMMIT
+    try:
+        insert_main_rows(conn, all_new_rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
-        if not all_new_rows:
-            print("[INFO] 신규 파싱된 데이터가 없습니다.")
-            return
+    # ✅ 이번에 적재한 file_path는 processed_set에 즉시 반영
+    new_file_paths = {r["file_path"] for r in all_new_rows}
+    processed_set.update(new_file_paths)
 
-        # 6) INSERT + COMMIT
-        try:
-            insert_main_rows(conn, all_new_rows)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-        new_files_cnt = len({r["file_path"] for r in all_new_rows})
-        print(f"[완료] 신규 파일 {new_files_cnt}개, 신규 row {len(all_new_rows)}개 PostgreSQL 파싱 완료.")
+    print(f"[완료] 신규 파일 {len(new_file_paths)}개, 신규 row {len(all_new_rows)}개 PostgreSQL 파싱 완료.")
 
 
 # ==========================
 # 무한 루프 (1초)
 # ==========================
 def main():
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            print("[ERROR] run_once 중 예외 발생:", e)
-        time.sleep(1)
+    mp.freeze_support()
+
+    with get_connection() as conn:
+        ensure_schema_and_table(conn)
+
+        current_day = datetime.now().strftime("%Y%m%d")
+        processed_set = get_processed_file_paths_today(conn, current_day)
+        print(f"[DB] Loaded DISTINCT file_path WHERE end_day={current_day}: {len(processed_set)}")
+
+        loop_count = 0
+
+        while True:
+            loop_count += 1
+            try:
+                today_str = datetime.now().strftime("%Y%m%d")
+
+                # 자정 날짜 변경 감지: 오늘 processed_set 재로딩
+                if today_str != current_day:
+                    current_day = today_str
+                    processed_set = get_processed_file_paths_today(conn, current_day)
+                    print(f"[DAY-CHANGE] end_day={current_day} | reload db_paths={len(processed_set)}")
+
+                # 주기적 DB 재동기화(다른 프로세스 적재 반영)
+                if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
+                    processed_set = get_processed_file_paths_today(conn, current_day)
+                    print(f"[DB-RELOAD] end_day={current_day} | db_paths={len(processed_set)}")
+
+                run_once(conn, processed_set, current_day)
+
+            except Exception as e:
+                print("[ERROR] run_once 중 예외 발생:", e)
+
+            time.sleep(1)
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     main()
