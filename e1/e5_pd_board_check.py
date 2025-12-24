@@ -1,100 +1,185 @@
 # -*- coding: utf-8 -*-
 """
-e5_pd_board_check.py
-
-요구사항(통합본)
-1) summary(DataFrame) -> e4_predictive_maintenance.pd_board_check 저장
-2) 그래프(plotly json) -> e4_predictive_maintenance.pd_board_check_graph 저장
-   - 컬럼 last_date 포함
-   - 컬럼 plotly_json (JSONB) 안에 plotly json 저장
-   - ※ pandas.to_sql + psycopg2에서 dict 직접 저장 시 'can't adapt type dict' 발생
-     -> json.dumps()로 문자열로 변환 후 저장(가장 안정적)
-
-전제
-- a2_fct_table.fct_table: end_day, station, step_description, value 존재
-- e4_predictive_maintenance.predictive_maintenance: euclid_graph(JSONB)로 기준 패턴 저장됨
+Predictive Maintenance - Sliding Window Anomaly Compare
+- Infinite loop: each iteration asks for end_day input (YYYYMMDD)
+- SUMMARY only printed
+- Save SUMMARY into e4_predictive_maintenance.pd_board_check (UPSERT)
+- Add JSONB columns at the end:
+  * cosine_similarity: {mmdd: cos_sim_to_ref, ...} per station
+  * score_from_normal: {mmdd: score_from_normal, ...} per station
 """
 
 import json
+import time
 import urllib.parse
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 from sqlalchemy import create_engine, text
 
 
-# =========================
+# ============================================================
 # 0) 설정
-# =========================
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "dbname": "postgres",
-    "user": "postgres",
-    "password": "leejangwoo1!",
-}
+# ============================================================
 
-SOURCE_SCHEMA = "a2_fct_table"
-SOURCE_TABLE = "fct_table"
+@dataclass(frozen=True)
+class DBConfig:
+    host: str = "100.105.75.47"
+    port: int = 5432
+    dbname: str = "postgres"
+    user: str = "postgres"
+    password: str = "leejangwoo1!"
 
+
+# Source
+SCHEMA = "a2_fct_table"
+TABLE = "fct_table"
+
+# Reference Pattern Table (정상/이상 패턴 로드용)
 REF_SCHEMA = "e4_predictive_maintenance"
 REF_TABLE = "predictive_maintenance"
 
-OUT_SCHEMA = "e4_predictive_maintenance"
-OUT_TABLE_CHECK = "pd_board_check"
-OUT_TABLE_GRAPH = "pd_board_check_graph"
+# Save Target
+SAVE_SCHEMA = "e4_predictive_maintenance"
+SAVE_TABLE = "pd_board_check"
 
 # 분석 대상
 STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]
 STEP_DESC = "1.34_Test_VUSB_Type-C_A(ELoad2=1.35A)vol"
 
-# raw 조회 범위(일자평균 산출용)
-RAW_START_DAY = "20251117"
-RAW_END_DAY = "20251218"
-
-# 분석 기간(슬라이딩 윈도우 적용 구간)
-START_DAY = "20251121"
-END_DAY = "20251218"
-
-BASE_YEAR = "2025"
+# 슬라이딩 윈도우
 WINDOW = 5
+
+# cosine 임계값
 COS_TH = 0.70
 
-# robust threshold
+# robust threshold 파라미터
 K_MAD = 4.0
 MIN_SAMPLES_FOR_ROBUST = 8
 
+# 최근 "존재하는 end_day" 최대 몇 개를 사용할지 (최대 7일치)
+MAX_DAYS = 7
 
-# =========================
-# 1) 공용 함수
-# =========================
-def get_engine(cfg=DB_CONFIG):
-    user = cfg["user"]
-    password = urllib.parse.quote_plus(cfg["password"])
-    host = cfg["host"]
-    port = cfg["port"]
-    dbname = cfg["dbname"]
-    conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+
+# ============================================================
+# 1) DB 유틸
+# ============================================================
+
+def get_engine(cfg: DBConfig):
+    password = urllib.parse.quote_plus(cfg.password)
+    conn_str = f"postgresql+psycopg2://{cfg.user}:{password}@{cfg.host}:{cfg.port}/{cfg.dbname}"
     return create_engine(conn_str, pool_pre_ping=True)
 
 
-def window_vector_from_values(values):
-    """일자 평균 시계열 → 5차원 특성 벡터"""
+def ensure_save_table(engine):
+    """
+    e4_predictive_maintenance.pd_board_check 없으면 생성
+    PK: (station, end_day)
+    """
+    q_schema = text(f"CREATE SCHEMA IF NOT EXISTS {SAVE_SCHEMA}")
+    q_table = text(f"""
+        CREATE TABLE IF NOT EXISTS {SAVE_SCHEMA}.{SAVE_TABLE} (
+            station            text NOT NULL,
+            start_day          text NOT NULL,
+            last_date          date,
+            end_day            text NOT NULL,
+
+            last_status        text,
+            last_score         double precision,
+            th_score           double precision,
+            last_cos           double precision,
+            max_score          double precision,
+            max_cos            double precision,
+            max_streak         integer,
+            crit_days          integer,
+            warn_days          integer,
+
+            cosine_similarity  jsonb,
+            score_from_normal  jsonb,
+
+            updated_at         timestamptz NOT NULL DEFAULT now(),
+
+            PRIMARY KEY (station, end_day)
+        )
+    """)
+    with engine.begin() as conn:
+        conn.execute(q_schema)
+        conn.execute(q_table)
+
+
+def upsert_summary_rows(engine, df_summary: pd.DataFrame):
+    """
+    df_summary를 station,end_day PK 기준 UPSERT
+    """
+    q = text(f"""
+        INSERT INTO {SAVE_SCHEMA}.{SAVE_TABLE} (
+            station, start_day, end_day,
+            last_status, last_score, th_score, last_cos,
+            max_score, max_cos, max_streak,
+            crit_days, warn_days, last_date,
+            cosine_similarity, score_from_normal
+        ) VALUES (
+            :station, :start_day, :end_day,
+            :last_status, :last_score, :th_score, :last_cos,
+            :max_score, :max_cos, :max_streak,
+            :crit_days, :warn_days, :last_date,
+            CAST(:cosine_similarity AS jsonb),
+            CAST(:score_from_normal AS jsonb)
+        )
+        ON CONFLICT (station, end_day)
+        DO UPDATE SET
+            start_day = EXCLUDED.start_day,
+            last_status = EXCLUDED.last_status,
+            last_score = EXCLUDED.last_score,
+            th_score = EXCLUDED.th_score,
+            last_cos = EXCLUDED.last_cos,
+            max_score = EXCLUDED.max_score,
+            max_cos = EXCLUDED.max_cos,
+            max_streak = EXCLUDED.max_streak,
+            crit_days = EXCLUDED.crit_days,
+            warn_days = EXCLUDED.warn_days,
+            last_date = EXCLUDED.last_date,
+            cosine_similarity = EXCLUDED.cosine_similarity,
+            score_from_normal = EXCLUDED.score_from_normal,
+            updated_at = now()
+    """)
+
+    # psycopg2는 dict/list를 바로 jsonb로 캐스팅하기 애매해서 문자열로 넣습니다.
+    rows = []
+    for _, r in df_summary.iterrows():
+        rows.append({
+            "station": str(r["station"]),
+            "start_day": str(r["start_day"]),
+            "end_day": str(r["end_day"]),
+            "last_status": None if pd.isna(r["last_status"]) else str(r["last_status"]),
+            "last_score": None if pd.isna(r["last_score"]) else float(r["last_score"]),
+            "th_score": None if pd.isna(r["th_score"]) else float(r["th_score"]),
+            "last_cos": None if pd.isna(r["last_cos"]) else float(r["last_cos"]),
+            "max_score": None if pd.isna(r["max_score"]) else float(r["max_score"]),
+            "max_cos": None if pd.isna(r["max_cos"]) else float(r["max_cos"]),
+            "max_streak": None if pd.isna(r["max_streak"]) else int(r["max_streak"]),
+            "crit_days": None if pd.isna(r["crit_days"]) else int(r["crit_days"]),
+            "warn_days": None if pd.isna(r["warn_days"]) else int(r["warn_days"]),
+            "last_date": None if pd.isna(r["last_date"]) else pd.to_datetime(r["last_date"]).date(),
+            "cosine_similarity": json.dumps(r["cosine_similarity"], ensure_ascii=False) if isinstance(r["cosine_similarity"], dict) else json.dumps({}, ensure_ascii=False),
+            "score_from_normal": json.dumps(r["score_from_normal"], ensure_ascii=False) if isinstance(r["score_from_normal"], dict) else json.dumps({}, ensure_ascii=False),
+        })
+
+    with engine.begin() as conn:
+        conn.execute(q, rows)
+
+
+# ============================================================
+# 2) 분석 유틸
+# ============================================================
+
+def window_vector_from_values(values) -> Dict[str, float]:
     values = np.asarray(values, dtype=float)
-
     if len(values) < 2:
-        return {
-            "mean": np.nan,
-            "std": np.nan,
-            "amplitude": np.nan,
-            "diff_mean": np.nan,
-            "diff_std": np.nan,
-        }
-
+        return {"mean": np.nan, "std": np.nan, "amplitude": np.nan, "diff_mean": np.nan, "diff_std": np.nan}
     diffs = np.diff(values)
-
     return {
         "mean": float(np.mean(values)),
         "std": float(np.std(values, ddof=0)),
@@ -104,32 +189,12 @@ def window_vector_from_values(values):
     }
 
 
-def cosine_sim(a, b, eps=1e-12):
+def cosine_sim(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> float:
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
     if na < eps or nb < eps:
         return np.nan
     return float(np.dot(a, b) / (na * nb))
-
-
-def mmdd_to_date(mmdd: str, base_year: str = "2025") -> pd.Timestamp:
-    mmdd = str(mmdd)
-    if len(mmdd) == 8:
-        return pd.to_datetime(mmdd, format="%Y%m%d")
-    if len(mmdd) == 4:
-        return pd.to_datetime(base_year + mmdd, format="%Y%m%d")
-    raise ValueError(f"[ERROR] Invalid mmdd format: {mmdd}")
-
-
-def sanitize_for_json(obj):
-    """JSONB 저장용: NaN/Inf -> None"""
-    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
-        return None
-    if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [sanitize_for_json(v) for v in obj]
-    return obj
 
 
 def mad(x: pd.Series) -> float:
@@ -140,14 +205,13 @@ def mad(x: pd.Series) -> float:
     return float(np.median(np.abs(x - med)))
 
 
-def robust_threshold(x: pd.Series, k=K_MAD):
+def robust_threshold(x: pd.Series, k: float = K_MAD) -> float:
     x = x.dropna().astype(float)
     if len(x) < MIN_SAMPLES_FOR_ROBUST:
         if len(x) == 0:
             return np.nan
         p90 = float(np.percentile(x, 90))
         return p90 * 1.10 if np.isfinite(p90) else np.nan
-
     med = float(np.median(x))
     m = mad(x)
     if not np.isfinite(m) or m == 0:
@@ -155,7 +219,31 @@ def robust_threshold(x: pd.Series, k=K_MAD):
     return med + k * m
 
 
-def load_pattern(engine, station, step_desc, pattern_name):
+def classify_status(is_cos_like: bool, is_score_high: bool) -> str:
+    if is_cos_like and is_score_high:
+        return "CRITICAL"
+    if is_cos_like and (not is_score_high):
+        return "WARNING"
+    if (not is_cos_like) and is_score_high:
+        return "WATCH"
+    return "OK"
+
+
+def add_consecutive_alerts(df_station: pd.DataFrame, alert_levels: set) -> pd.DataFrame:
+    df_station = df_station.sort_values("date").copy()
+    consec = 0
+    out = []
+    for _, r in df_station.iterrows():
+        if r["status"] in alert_levels:
+            consec += 1
+        else:
+            consec = 0
+        out.append(consec)
+    df_station["alert_streak"] = out
+    return df_station
+
+
+def load_pattern(engine, station: str, step_desc: str, pattern_name: str) -> Dict[str, Any]:
     q = text(f"""
         SELECT euclid_graph
         FROM {REF_SCHEMA}.{REF_TABLE}
@@ -171,86 +259,67 @@ def load_pattern(engine, station, step_desc, pattern_name):
     return g
 
 
-# =========================
-# 2) DB 테이블 생성
-# =========================
-def ensure_tables(engine):
+def build_input_range(end_day_input: str) -> Dict[str, str]:
+    end_dt = pd.to_datetime(end_day_input, format="%Y%m%d")
+    start_dt = end_dt - pd.Timedelta(days=7)
+    return {"start_day_input": start_dt.strftime("%Y%m%d"), "end_day_input": end_dt.strftime("%Y%m%d")}
+
+
+def resolve_available_days(engine, stations: List[str], step_desc: str, user_end_day: str, max_days: int = MAX_DAYS) -> Dict[str, str]:
+    q = text(f"""
+        SELECT DISTINCT replace(CAST(end_day AS text), '-', '') AS yyyymmdd
+        FROM {SCHEMA}.{TABLE}
+        WHERE station = ANY(:stations)
+          AND step_description = :step_desc
+          AND replace(CAST(end_day AS text), '-', '') <= :user_end_day
+        ORDER BY yyyymmdd
+    """)
     with engine.begin() as conn:
-        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {OUT_SCHEMA};"))
+        days_df = pd.read_sql(q, conn, params={"stations": stations, "step_desc": step_desc, "user_end_day": user_end_day})
+    if days_df.empty:
+        raise ValueError(f"[ERROR] No available end_day <= {user_end_day} for given stations/step_desc")
+    end_effective = str(days_df["yyyymmdd"].iloc[-1])
+    tail_days = days_df["yyyymmdd"].tail(max_days).tolist()
+    start_effective = str(tail_days[0])
+    base_year = end_effective[:4]
+    return {"RAW_START_DAY": start_effective, "RAW_END_DAY": end_effective, "BASE_YEAR": base_year}
 
-        # ❗ IF NOT EXISTS 제거 + 컬럼 순서 확정
-        conn.execute(text(f"""
-        CREATE TABLE {OUT_SCHEMA}.{OUT_TABLE_CHECK} (
-            station          text        NOT NULL,
-            step_description text        NOT NULL,
-            start_day        text,
-            end_day          text,
-            last_date        date        NOT NULL,
 
-            last_status      text,
-            last_score       double precision,
-            th_score         double precision,
-            last_cos         double precision,
+# ============================================================
+# 3) 1회 실행: SUMMARY 생성 + JSON 컬럼 추가 + DB 저장 + 출력
+# ============================================================
 
-            max_score        double precision,
-            max_cos          double precision,
-            max_streak       integer,
-            crit_days        integer,
-            warn_days        integer,
+def run_once(engine, end_day_input: str) -> pd.DataFrame:
+    # (1) 입력 기반 start/end (저장/표기용)
+    input_range = build_input_range(end_day_input)
+    start_day_input = input_range["start_day_input"]
+    end_day_input = input_range["end_day_input"]  # 정규화
 
-            window_size      integer,
-            updated_at       timestamp   NOT NULL DEFAULT now(),
+    # (2) 분석용 effective 범위(존재일자 기반)
+    day_cfg = resolve_available_days(engine, STATIONS, STEP_DESC, end_day_input, max_days=MAX_DAYS)
+    RAW_START_DAY = day_cfg["RAW_START_DAY"]
+    RAW_END_DAY = day_cfg["RAW_END_DAY"]
+    BASE_YEAR_FOR_MMDD = day_cfg["BASE_YEAR"]
 
-            PRIMARY KEY (station, step_description, last_date)
-        );
-        """))
-
-        conn.execute(text(f"""
-        CREATE TABLE {OUT_SCHEMA}.{OUT_TABLE_GRAPH} (
-            station          text        NOT NULL,
-            step_description text        NOT NULL,
-            start_day        text,
-            end_day          text,
-            last_date        date        NOT NULL,
-
-            plotly_json      jsonb       NOT NULL,
-
-            window_size      integer,
-            updated_at       timestamp   NOT NULL DEFAULT now(),
-
-            PRIMARY KEY (station, step_description, last_date)
-        );
-        """))
-
-# =========================
-# 3) 메인 로직
-# =========================
-def main():
-    engine = get_engine()
-    ensure_tables(engine)
-    print("[OK] engine / tables ready")
-
-    # -----------------------------
-    # (A) 원본 조회 → 일자 평균
-    # -----------------------------
-    sql_src = text(f"""
+    # (3) Raw 로드 + 일자 평균
+    sql_q = text(f"""
         SELECT
           replace(CAST(end_day AS text), '-', '') AS end_day_yyyymmdd,
           station,
           value
-        FROM {SOURCE_SCHEMA}.{SOURCE_TABLE}
+        FROM {SCHEMA}.{TABLE}
         WHERE station = ANY(:stations)
           AND replace(CAST(end_day AS text), '-', '') BETWEEN :start_day AND :end_day
           AND step_description = :step_desc
         ORDER BY station, end_day_yyyymmdd
     """)
-
     with engine.begin() as conn:
-        raw = pd.read_sql(
-            sql_src,
-            conn,
-            params={"stations": STATIONS, "start_day": RAW_START_DAY, "end_day": RAW_END_DAY, "step_desc": STEP_DESC},
-        )
+        raw = pd.read_sql(sql_q, conn, params={
+            "stations": STATIONS,
+            "start_day": RAW_START_DAY,
+            "end_day": RAW_END_DAY,
+            "step_desc": STEP_DESC
+        })
 
     raw["value_num"] = pd.to_numeric(raw["value"], errors="coerce")
     raw = raw.dropna(subset=["value_num"]).copy()
@@ -262,40 +331,23 @@ def main():
            .sort_values(["station", "mmdd"])
     )
     avg_df_all["value_avg"] = avg_df_all["value_avg"].round(2)
-    print("[OK] avg_df_all built:", avg_df_all.shape)
+    avg_df_all["date"] = pd.to_datetime(BASE_YEAR_FOR_MMDD + avg_df_all["mmdd"], format="%Y%m%d", errors="coerce")
+    avg_df_all = avg_df_all.dropna(subset=["date"]).reset_index(drop=True)
 
-    # -----------------------------
-    # (B) 분석 기간 필터
-    # -----------------------------
-    START_DT = pd.to_datetime(START_DAY, format="%Y%m%d")
-    END_DT = pd.to_datetime(END_DAY, format="%Y%m%d")
-
-    avg_df_all = avg_df_all.copy()
-    avg_df_all["date"] = avg_df_all["mmdd"].apply(lambda x: mmdd_to_date(x, base_year=BASE_YEAR))
-    avg_df_all = avg_df_all[(avg_df_all["date"] >= START_DT) & (avg_df_all["date"] <= END_DT)].reset_index(drop=True)
-    print(f"[OK] avg_df_all filtered rows = {len(avg_df_all):,}")
-
-    # -----------------------------
-    # (C) 기준 패턴 로드 (FCT2 기준)
-    # -----------------------------
+    # (4) 패턴 로드
     g_normal = load_pattern(engine, "FCT2", STEP_DESC, "pd_board_normal_ref")
     g_abn = load_pattern(engine, "FCT2", STEP_DESC, "pd_board_degradation_ref")
 
-    FEATURES = g_normal["features"]
-    V_normal = np.array([g_normal["reference_pattern"][k] for k in FEATURES], dtype=float)
-    A_ref = np.array([g_abn["reference_pattern"][k] for k in FEATURES], dtype=float)
+    features: List[str] = g_normal["features"]
+    v_normal = np.array([g_normal["reference_pattern"][k] for k in features], dtype=float)
+    a_ref = np.array([g_abn["reference_pattern"][k] for k in features], dtype=float)
 
-    print("[OK] FEATURES =", FEATURES)
-
-    # -----------------------------
-    # (D) Sliding window → compare_df
-    # -----------------------------
+    # (5) compare_df 생성
     rows = []
     for st in STATIONS:
         df_st = avg_df_all[avg_df_all["station"] == st].copy()
         if len(df_st) < WINDOW:
             continue
-
         df_st = df_st.sort_values("date").reset_index(drop=True)
 
         for i in range(len(df_st) - WINDOW + 1):
@@ -303,29 +355,28 @@ def main():
             mmdd_end = chunk["mmdd"].iloc[-1]
 
             v = window_vector_from_values(chunk["value_avg"].values)
-            V_t = np.array([v[k] for k in FEATURES], dtype=float)
-            A_t = V_t - V_normal
+            v_t = np.array([v[k] for k in features], dtype=float)
+            a_t = v_t - v_normal
 
             rows.append({
                 "station": st,
                 "mmdd": mmdd_end,
-                "date": pd.to_datetime(chunk["date"].iloc[-1]).to_pydatetime(),
-                "score_from_normal": float(np.linalg.norm(A_t)),
-                "cos_sim_to_ref": cosine_sim(A_t, A_ref),
-                "dist_to_ref": float(np.linalg.norm(A_t - A_ref)),
+                "score_from_normal": float(np.linalg.norm(a_t)),
+                "cos_sim_to_ref": cosine_sim(a_t, a_ref),
+                "dist_to_ref": float(np.linalg.norm(a_t - a_ref)),
             })
 
-    compare_df = pd.DataFrame(rows).sort_values(["station", "date"]).reset_index(drop=True)
+    compare_df = pd.DataFrame(rows).sort_values(["station", "mmdd"]).reset_index(drop=True)
+    if compare_df.empty:
+        # SUMMARY 테이블에는 최소한 “입력값 기반” 기록을 남길지 여부가 애매하므로, 여기서는 저장하지 않고 경고만 출력
+        print(f"\n[SUMMARY]\n(empty)  (not enough data for WINDOW={WINDOW})\n")
+        return compare_df
 
     compare_df["score_from_normal"] = compare_df["score_from_normal"].round(2)
     compare_df["cos_sim_to_ref"] = compare_df["cos_sim_to_ref"].round(3)
     compare_df["dist_to_ref"] = compare_df["dist_to_ref"].round(2)
 
-    print("[OK] compare_df built:", compare_df.shape)
-
-    # -----------------------------
-    # (E) Threshold → status → summary
-    # -----------------------------
+    # (6) threshold + status + streak
     th_df = (
         compare_df.groupby("station")["score_from_normal"]
         .apply(lambda s: robust_threshold(s, k=K_MAD))
@@ -333,179 +384,125 @@ def main():
     )
 
     dfi = compare_df.merge(th_df, on="station", how="left").copy()
+    dfi["date"] = pd.to_datetime(BASE_YEAR_FOR_MMDD + dfi["mmdd"], format="%Y%m%d")
+
     dfi["is_cos_like"] = dfi["cos_sim_to_ref"] >= COS_TH
     dfi["is_score_high"] = dfi["score_from_normal"] >= dfi["th_score"]
+    dfi["status"] = dfi.apply(lambda r: classify_status(bool(r["is_cos_like"]), bool(r["is_score_high"])), axis=1)
 
-    def classify(row):
-        if row["is_cos_like"] and row["is_score_high"]:
-            return "CRITICAL"
-        if row["is_cos_like"] and (not row["is_score_high"]):
-            return "WARNING"
-        if (not row["is_cos_like"]) and row["is_score_high"]:
-            return "WATCH"
-        return "OK"
+    alert_levels = {"WARNING", "CRITICAL"}
+    dfi = (
+        dfi.groupby("station", as_index=True, group_keys=True)
+           .apply(lambda g: add_consecutive_alerts(g, alert_levels), include_groups=False)
+           .reset_index(level=0)
+           .reset_index(drop=True)
+    )
 
-    dfi["status"] = dfi.apply(classify, axis=1)
-
-    ALERT_LEVELS = {"WARNING", "CRITICAL"}
-
-    def add_consecutive_alerts(df_station: pd.DataFrame) -> pd.DataFrame:
-        df_station = df_station.sort_values("date").copy()
-        consec = 0
-        out = []
-        for _, r in df_station.iterrows():
-            if r["status"] in ALERT_LEVELS:
-                consec += 1
-            else:
-                consec = 0
-            out.append(consec)
-        df_station["alert_streak"] = out
-        return df_station
-
-    # include_groups=False 는 pandas 버전에 따라 없을 수 있어 안전 처리
-    try:
-        dfi = (
-            dfi.groupby("station", as_index=True, group_keys=True)
-               .apply(add_consecutive_alerts, include_groups=False)
-               .reset_index(level=0)
-               .reset_index(drop=True)
-        )
-    except TypeError:
-        dfi = (
-            dfi.groupby("station", as_index=True, group_keys=True)
-               .apply(add_consecutive_alerts)
-               .reset_index(level=0)
-               .reset_index(drop=True)
-        )
-
+    # (7) SUMMARY 생성
     summary = (
         dfi.sort_values(["station", "date"])
            .groupby("station")
            .agg(
-                last_date=("date", "max"),
-                last_status=("status", "last"),
-                last_score=("score_from_normal", "last"),
-                th_score=("th_score", "last"),
-                last_cos=("cos_sim_to_ref", "last"),
-                max_score=("score_from_normal", "max"),
-                max_cos=("cos_sim_to_ref", "max"),
-                max_streak=("alert_streak", "max"),
-                crit_days=("status", lambda s: int((s == "CRITICAL").sum())),
-                warn_days=("status", lambda s: int((s == "WARNING").sum())),
+               last_date=("date", "max"),
+               last_status=("status", "last"),
+               last_score=("score_from_normal", "last"),
+               th_score=("th_score", "last"),
+               last_cos=("cos_sim_to_ref", "last"),
+               max_score=("score_from_normal", "max"),
+               max_cos=("cos_sim_to_ref", "max"),
+               max_streak=("alert_streak", "max"),
+               crit_days=("status", lambda s: int((s == "CRITICAL").sum())),
+               warn_days=("status", lambda s: int((s == "WARNING").sum())),
            )
            .reset_index()
     )
 
-    summary["step_description"] = STEP_DESC
-    summary["window_size"] = WINDOW
-    summary["start_day"] = START_DAY
-    summary["end_day"] = END_DAY
-    summary["updated_at"] = datetime.now()
+    # (8) start_day / end_day 컬럼 (last_date 기준)
+    summary["end_day"] = end_day_input
 
-    # -----------------------------
-    # (F) Plotly 그래프 → JSON 문자열 (to_sql 안전)
-    # -----------------------------
-    viz_df = compare_df.copy().sort_values(["station", "date"]).reset_index(drop=True)
+    summary["start_day"] = (
+            pd.to_datetime(summary["last_date"]) - pd.Timedelta(days=7)
+    ).dt.strftime("%Y%m%d")
 
-    fig_cos = px.line(
-        viz_df,
-        x="date",
-        y="cos_sim_to_ref",
-        color="station",
-        markers=True,
-        title=f"Cosine Similarity to Abnormal Reference (COS_TH={COS_TH})",
-    )
-    fig_cos.add_hline(y=COS_TH, line_dash="dash", annotation_text="COS_TH", annotation_position="top left")
-    fig_cos.update_xaxes(tickformat="%m%d", title_text="mmdd")
+    # (9) JSON 컬럼 2개 추가: station별 시계열(dict)
+    cos_dict_by_station = {}
+    score_dict_by_station = {}
 
-    fig_score = px.line(
-        viz_df,
-        x="date",
-        y="score_from_normal",
-        color="station",
-        markers=True,
-        title="Score from Normal Baseline (||A_t||)",
-    )
-    fig_score.update_xaxes(tickformat="%m%d", title_text="mmdd")
+    for st in STATIONS:
+        sdf = compare_df[compare_df["station"] == st].copy()
+        if sdf.empty:
+            cos_dict_by_station[st] = {}
+            score_dict_by_station[st] = {}
+            continue
 
-    # ✅ dict -> JSON 문자열
-    plotly_json_obj = sanitize_for_json({
-        "fig_cos": json.loads(fig_cos.to_json()),
-        "fig_score": json.loads(fig_score.to_json()),
-        "meta": {
-            "step_description": STEP_DESC,
-            "window_size": WINDOW,
-            "start_day": START_DAY,
-            "end_day": END_DAY,
-            "cos_th": COS_TH,
-        }
-    })
-    plotly_json_str = json.dumps(plotly_json_obj, ensure_ascii=False)
+        # mmdd를 key로 저장 (요청: json 형식 속성값)
+        cos_map = dict(zip(sdf["mmdd"].astype(str), sdf["cos_sim_to_ref"].astype(float)))
+        score_map = dict(zip(sdf["mmdd"].astype(str), sdf["score_from_normal"].astype(float)))
 
-    # -----------------------------
-    # (F-2) 그래프 저장용 DF
-    # -----------------------------
-    graph_rows = summary[["station", "last_date"]].copy()
-    graph_rows["step_description"] = STEP_DESC
-    graph_rows["plotly_json"] = [plotly_json_str] * len(graph_rows)  # ✅ 문자열
-    graph_rows["window_size"] = WINDOW
-    graph_rows["start_day"] = START_DAY
-    graph_rows["end_day"] = END_DAY
-    graph_rows["updated_at"] = datetime.now()
+        cos_dict_by_station[st] = cos_map
+        score_dict_by_station[st] = score_map
 
-    # -----------------------------
-    # (G) DB 저장 (PK(last_date) 단위 delete 후 insert)
-    # -----------------------------
-    last_date_global = pd.to_datetime(summary["last_date"].max()).date()
+    summary["cosine_similarity"] = summary["station"].map(lambda st: cos_dict_by_station.get(st, {}))
+    summary["score_from_normal"] = summary["station"].map(lambda st: score_dict_by_station.get(st, {}))
 
-    del_check = text(f"""
-        DELETE FROM {OUT_SCHEMA}.{OUT_TABLE_CHECK}
-        WHERE step_description = :step_desc AND last_date = :last_date
-    """)
-    del_graph = text(f"""
-        DELETE FROM {OUT_SCHEMA}.{OUT_TABLE_GRAPH}
-        WHERE step_description = :step_desc AND last_date = :last_date
-    """)
+    # (10) 요청: SUMMARY 컬럼 순서 고정 + 마지막에 JSON 2컬럼
+    summary = summary[[
+        "station",
+        "start_day",
+        "last_date",
+        "end_day",
+        "last_status",
+        "last_score",
+        "th_score",
+        "last_cos",
+        "max_score",
+        "max_cos",
+        "max_streak",
+        "crit_days",
+        "warn_days",
+        "cosine_similarity",
+        "score_from_normal",
+    ]]
 
-    with engine.begin() as conn:
-        conn.execute(del_check, {"step_desc": STEP_DESC, "last_date": last_date_global})
-        conn.execute(del_graph, {"step_desc": STEP_DESC, "last_date": last_date_global})
+    # (11) DB 저장 (UPSERT)
+    ensure_save_table(engine)
+    upsert_summary_rows(engine, summary)
 
-        summary_to_save = summary[[
-            "station", "step_description", "start_day", "end_day", "last_date",
-            "last_status", "last_score", "th_score", "last_cos",
-            "max_score", "max_cos", "max_streak", "crit_days", "warn_days",
-            "window_size", "updated_at"
-        ]].copy()
+    # (12) SUMMARY만 출력
+    print("\n[SUMMARY]")
+    print(summary.to_string(index=False))
 
-        summary_to_save.to_sql(
-            OUT_TABLE_CHECK,
-            conn,
-            schema=OUT_SCHEMA,
-            if_exists="append",
-            index=False,
-            method="multi",
-            chunksize=2000,
-        )
+    return summary
 
-        graph_to_save = graph_rows[[
-            "station", "step_description", "start_day", "end_day", "last_date",
-            "plotly_json",
-            "window_size", "updated_at"
-        ]].copy()
 
-        graph_to_save.to_sql(
-            OUT_TABLE_GRAPH,
-            conn,
-            schema=OUT_SCHEMA,
-            if_exists="append",
-            index=False,
-            method="multi",
-            chunksize=2000,
-        )
+# ============================================================
+# 4) 무한 루프: 매번 end_day 입력
+# ============================================================
 
-    print(f"[OK] Saved summary -> {OUT_SCHEMA}.{OUT_TABLE_CHECK} (last_date={last_date_global})")
-    print(f"[OK] Saved graphs  -> {OUT_SCHEMA}.{OUT_TABLE_GRAPH} (last_date={last_date_global})")
+def main():
+    print("[OK] window_vector_from_values loaded")
+    engine = get_engine(DBConfig())
+    print("[OK] SQLAlchemy engine created")
+
+    print("\n[INFO] Infinite loop mode: each iteration asks for end_day (Ctrl+C to stop)\n")
+
+    while True:
+        try:
+            end_day_input = input("기준 날짜 입력 (YYYYMMDD, 예: 20251223): ").strip()
+            if not (end_day_input.isdigit() and len(end_day_input) == 8):
+                print(f"[WARN] Invalid format: {end_day_input}  (must be YYYYMMDD)")
+                continue
+
+            run_once(engine, end_day_input)
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Stopped by user (Ctrl+C).")
+            break
+        except Exception as e:
+            print(f"[ERROR] {type(e).__name__}: {e}")
+
+        # 입력 기반 반복이므로, 너무 빠른 재질의 방지용(원치 않으면 0)
+        time.sleep(0.1)
 
 
 if __name__ == "__main__":

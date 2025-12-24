@@ -1,32 +1,38 @@
 # -*- coding: utf-8 -*-
 # ============================================
-# Vision Machine Log Parser (Realtime + Thread2 + Dedup + TodayOnly)
-# - 주/야간 로직 제거
-# - dayornight 컬럼 제거
-# - time 컬럼 -> end_time 컬럼으로 변경
-# - end_day는 파일명(YYYYMMDD) 기준으로만 저장
-# - 오늘 파일(YYYYMMDD==오늘)만 처리
-# - (end_day, station, end_time, contents) 중복 방지 (UNIQUE INDEX + ON CONFLICT DO NOTHING)
-# - 현재시간 기준 120초 이내 새롭게 추가/수정된 파일만 처리(mtime 기준)
+# d2_Vision_machine_log_factory.py
+# Vision Machine Log Parser (Realtime + Thread2 + TodayOnly) - OPTION A (DB가 중복 영구 차단)
+#
+# 전제(사용자 수행 완료):
+# - 아래 UNIQUE INDEX를 DB에 이미 생성함
+#   ux_vision1_machine_log_dedup on d1_machine_log."Vision1_machine_log"(end_day, station, end_time, contents)
+#   ux_vision2_machine_log_dedup on d1_machine_log."Vision2_machine_log"(end_day, station, end_time, contents)
+#
+# 동작:
+# - 오늘 파일만 파싱
+# - 실시간 120초 내 새로 변경된 파일만 파싱
+# - INSERT는 ON CONFLICT DO NOTHING => 중복은 무조건 "조용히 무시"
+# - 어떤 상황에서도 프로세스가 멈추지 않도록(예외는 로그만 찍고 continue)
 # ============================================
 
 import re
+import sys
 import time as time_mod
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import freeze_support
-from concurrent.futures import ThreadPoolExecutor, as_completed  # ✅ 변경
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 import urllib.parse
 
 
 # ============================================
-# 1. 기본 설정
+# 1) 기본 설정
 # ============================================
 BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log")
-VISION_DIR_NAME = "Vision"  # 루트 하위 Vision 폴더를 탐색
 
 DB_CONFIG = {
     "host": "192.168.108.162",
@@ -42,25 +48,36 @@ TABLE_MAP = {
     "Vision2": "Vision2_machine_log",
 }
 
-# =========================
-# 요구사항: "멀티프로세스 2개" -> ✅ 스레드 2개 고정
-# =========================
-USE_MULTIPROCESSING = True   # 변수명 유지(호출부 최소 변경)
-N_PROCESSES = 2              # ✅ 이제 스레드 개수 의미
-POOL_CHUNKSIZE = 10          # (스레드에선 직접 chunk 개념 없음, 유지해도 무방)
+# 스레드 2개 고정
+THREAD_WORKERS = 2
 
-# =========================
-# 요구사항: 실시간 120초 이내 신규/수정 파일만
-# =========================
+# 실시간 120초 이내 신규/수정 파일만
 REALTIME_WINDOW_SEC = 120
 SLEEP_SEC = 1
 
 # 처리 캐시: path -> last_mtime
 PROCESSED_MTIME = {}
 
+# 콘솔 로그 주기(너무 많은 출력 방지)
+LOG_EVERY_LOOP = 10  # 10회(=약 10초)마다 한번 요약 로그
+
 
 # ============================================
-# 2. DB 엔진 생성
+# 2) 공용 로그/콘솔 유지
+# ============================================
+def log(msg: str):
+    print(msg, flush=True)
+
+
+def pause_console():
+    try:
+        input("\n[END] 작업이 종료되었습니다. 콘솔을 닫으려면 Enter를 누르세요...")
+    except Exception:
+        pass
+
+
+# ============================================
+# 3) DB 엔진
 # ============================================
 def get_engine(config=DB_CONFIG):
     user = config["user"]
@@ -68,42 +85,47 @@ def get_engine(config=DB_CONFIG):
     host = config["host"]
     port = config["port"]
     dbname = config["dbname"]
-    conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
-    print("[INFO] Connection String:", conn_str)
-    return create_engine(conn_str)
+
+    conn_str = (
+        f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+        "?connect_timeout=5"
+    )
+    log(f"[INFO] DB={host}:{port}/{dbname}")
+
+    return create_engine(
+        conn_str,
+        pool_pre_ping=True,
+        pool_size=3,
+        max_overflow=3,
+        pool_recycle=300,
+    )
 
 
-# ============================================
-# 3. 스키마 및 테이블 생성 + UNIQUE INDEX(중복방지)
-# ============================================
 def ensure_schema_tables(engine):
+    """
+    - 스키마/테이블만 보장
+    - UNIQUE INDEX는 사용자가 이미 만들었으므로 여기서는 만들지 않음
+      (만들어도 되지만, 인덱스 생성은 중복 상태에 따라 실패할 수 있어
+       운영 중엔 '이미 생성됨' 전제를 두고 단순화하는 게 안정적)
+    """
     ddl_template = """
     CREATE TABLE IF NOT EXISTS {schema}."{table}" (
-        id          BIGSERIAL PRIMARY KEY,
         end_day     VARCHAR(8),     -- yyyymmdd (파일명 기준)
         station     VARCHAR(10),    -- Vision1 / Vision2
-        end_time    VARCHAR(12),    -- hh:mi:ss.ss
+        end_time    VARCHAR(12),    -- hh:mi:ss.xx (문자열)
         contents    VARCHAR(200)
     );
     """
-
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"))
-
-        for st, tbl in TABLE_MAP.items():
+        for _, tbl in TABLE_MAP.items():
             conn.execute(text(ddl_template.format(schema=SCHEMA_NAME, table=tbl)))
 
-            idx_name = f"ux_{SCHEMA_NAME}_{tbl.lower()}_dedup"
-            conn.execute(text(f"""
-                CREATE UNIQUE INDEX IF NOT EXISTS {idx_name}
-                ON {SCHEMA_NAME}."{tbl}" (end_day, station, end_time, contents)
-            """))
-
-    print("[INFO] Schema, tables, unique indexes ready")
+    log("[INFO] Schema/tables ready.")
 
 
 # ============================================
-# 4. 파일 파싱 유틸
+# 4) 파일 파싱 유틸
 # ============================================
 LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
 FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
@@ -122,12 +144,9 @@ def _open_text_file(path: Path):
         return path.open("r", encoding="cp949", errors="ignore")
 
 
-def parse_machine_log_file(path_str: str):
+def parse_machine_log_file(path_str: str, today_ymd: str):
     """
-    스레드 워커용
-    한 파일에서 rows(list[dict]) 반환
-    - end_day: 파일명 YYYYMMDD 그대로
-    - 오늘 파일(YYYYMMDD==오늘)만 반환
+    오늘 파일만 파싱하여 records(list[dict]) 반환
     """
     file_path = Path(path_str)
 
@@ -139,7 +158,6 @@ def parse_machine_log_file(path_str: str):
     vision_no = m.group(2)
     station = f"Vision{vision_no}"
 
-    today_ymd = datetime.now().strftime("%Y%m%d")
     if file_ymd != today_ymd:
         return []
 
@@ -155,6 +173,7 @@ def parse_machine_log_file(path_str: str):
                 end_time_str = m2.group(1)
                 contents_raw = m2.group(2)
 
+                # 시간 포맷 검증(완화)
                 try:
                     _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
                 except ValueError:
@@ -171,23 +190,22 @@ def parse_machine_log_file(path_str: str):
                     }
                 )
     except Exception as e:
-        print(f"[WARN] Failed to read: {file_path} / {e}")
+        log(f"[WARN] Failed to read: {file_path} / {e}")
         return []
 
     return result
 
 
 # ============================================
-# 5. "실시간 120초 이내" 신규/수정 파일만 수집
+# 5) 실시간(120초) 신규/수정 파일만 수집
 # ============================================
-def list_target_files_realtime(base_dir: Path):
+def list_target_files_realtime(base_dir: Path, today_ymd: str):
     files = []
     if not base_dir.exists():
-        print("[WARN] BASE_DIR not found:", base_dir)
+        log(f"[WARN] BASE_DIR not found: {base_dir}")
         return files
 
     cutoff_ts = time_mod.time() - REALTIME_WINDOW_SEC
-    today_ymd = datetime.now().strftime("%Y%m%d")
 
     for year_dir in sorted(base_dir.iterdir()):
         if not (year_dir.is_dir() and year_dir.name.isdigit() and len(year_dir.name) == 4):
@@ -224,20 +242,19 @@ def list_target_files_realtime(base_dir: Path):
 
                 files.append(fp)
 
-    if files:
-        print(f"[INFO] Realtime target files: {len(files)} (window={REALTIME_WINDOW_SEC}s)")
     return files
 
 
 # ============================================
-# 6. DB Insert (중복은 DB에서 회피)
+# 6) DB Insert (중복은 무조건 무시)
 # ============================================
 def insert_to_db(engine, df: pd.DataFrame):
-    if df.empty:
-        return
+    if df is None or df.empty:
+        return 0
 
     df = df.sort_values(["end_day", "end_time"]).reset_index(drop=True)
 
+    inserted_attempt = 0
     with engine.begin() as conn:
         for st, tbl in TABLE_MAP.items():
             sub = df[df["station"] == st]
@@ -247,71 +264,124 @@ def insert_to_db(engine, df: pd.DataFrame):
             insert_sql = text(f"""
                 INSERT INTO {SCHEMA_NAME}."{tbl}" (end_day, station, end_time, contents)
                 VALUES (:end_day, :station, :end_time, :contents)
-                ON CONFLICT (end_day, station, end_time, contents) DO NOTHING
+                ON CONFLICT (end_day, station, end_time, contents)
+                DO NOTHING
             """)
+            records = sub.to_dict(orient="records")
+            conn.execute(insert_sql, records)
 
-            conn.execute(insert_sql, sub.to_dict(orient="records"))
-            print(f"[DB] Insert attempted {len(sub)} rows into {SCHEMA_NAME}.{tbl} (duplicates ignored)")
+            inserted_attempt += len(records)
+
+    return inserted_attempt
 
 
 # ============================================
-# 7. main (1초 무한루프)
+# 7) main loop
 # ============================================
 def main():
-    engine = get_engine()
-    ensure_schema_tables(engine)
+    log("### BUILD: d2 Vision parser OPTION-A v2025-12-23-01 ###")
 
+    engine = get_engine()
+
+    # INIT(스키마/테이블) - 실패해도 재시도
     while True:
         try:
-            files = list_target_files_realtime(BASE_DIR)
+            ensure_schema_tables(engine)
+            break
+        except Exception as e:
+            log(f"[FATAL-INIT] ensure_schema_tables failed: {e}")
+            time_mod.sleep(3)
+
+    log("=" * 78)
+    log("[START] d2 Vision machine log realtime parser")
+    log(f"[INFO] BASE_DIR={BASE_DIR}")
+    log(f"[INFO] WINDOW={REALTIME_WINDOW_SEC}s | THREADS={THREAD_WORKERS} | SLEEP={SLEEP_SEC}s")
+    log("[INFO] DEDUP POLICY = DB UNIQUE INDEX + ON CONFLICT DO NOTHING")
+    log("=" * 78)
+
+    loop_i = 0
+    last_day = datetime.now().strftime("%Y%m%d")
+
+    while True:
+        loop_i += 1
+        loop_t0 = time_mod.perf_counter()
+
+        try:
+            today_ymd = datetime.now().strftime("%Y%m%d")
+
+            # 날짜 변경 시: 캐시 초기화(오늘만 보니까 과감히 리셋)
+            if today_ymd != last_day:
+                log(f"[INFO] Day changed {last_day} -> {today_ymd} | reset processed cache")
+                last_day = today_ymd
+                PROCESSED_MTIME.clear()
+
+            files = list_target_files_realtime(BASE_DIR, today_ymd=today_ymd)
             if not files:
+                if loop_i % LOG_EVERY_LOOP == 0:
+                    log(f"[LOOP] no files (today={today_ymd})")
                 time_mod.sleep(SLEEP_SEC)
                 continue
 
-            # 캐시 먼저 갱신(루프 중복 방지)
+            # 캐시 갱신(파일이 삭제/권한 오류여도 안전)
             for fp in files:
                 try:
                     PROCESSED_MTIME[fp] = Path(fp).stat().st_mtime
                 except OSError:
                     PROCESSED_MTIME[fp] = time_mod.time()
 
+            # 파싱
             all_records = []
-
-            # ✅ ThreadPoolExecutor로 병렬 파싱
-            if USE_MULTIPROCESSING and len(files) >= 2:
-                workers = min(N_PROCESSES, len(files))
-                print(f"[INFO] Using threads: {workers}")
-
+            if len(files) >= 2:
+                workers = min(THREAD_WORKERS, len(files))
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = [ex.submit(parse_machine_log_file, fp) for fp in files]
+                    futs = [ex.submit(parse_machine_log_file, fp, today_ymd) for fp in files]
                     for f in as_completed(futs):
                         rows = f.result()
                         if rows:
                             all_records.extend(rows)
-
             else:
-                print("[INFO] Threading disabled (or not enough files).")
-                for fp in files:
-                    rows = parse_machine_log_file(fp)
-                    if rows:
-                        all_records.extend(rows)
+                all_records.extend(parse_machine_log_file(files[0], today_ymd))
 
             if not all_records:
+                if loop_i % LOG_EVERY_LOOP == 0:
+                    log(f"[LOOP] parsed=0 | files={len(files)}")
                 time_mod.sleep(SLEEP_SEC)
                 continue
 
             df = pd.DataFrame(all_records)
-            insert_to_db(engine, df)
+
+            # DB insert (중복 무시)
+            try:
+                attempted = insert_to_db(engine, df)
+                if loop_i % LOG_EVERY_LOOP == 0 or attempted > 0:
+                    log(f"[DB] attempted={attempted:,} | files={len(files)} | parsed={len(df):,}")
+            except SQLAlchemyError as e:
+                # DB 이슈가 있어도 프로세스는 멈추지 않게: 로그만 찍고 다음 루프로
+                log(f"[WARN] DB insert error (ignored, continue): {type(e).__name__}: {e}")
 
         except KeyboardInterrupt:
-            print("\n[STOP] Interrupted by user.")
+            log("\n[STOP] Interrupted by user.")
             break
         except Exception as e:
-            print(f"[ERROR] Loop error: {e}")
+            # 어떤 예외든 멈추지 않게: 로그만 찍고 continue
+            log(f"[ERROR] Loop error (continue): {type(e).__name__}: {e}")
 
-        time_mod.sleep(SLEEP_SEC)
+        # loop pacing
+        elapsed = time_mod.perf_counter() - loop_t0
+        time_mod.sleep(max(0.0, SLEEP_SEC - elapsed))
 
 
 if __name__ == "__main__":
-    freeze_support()  # 있어도 무방
-    main()
+    freeze_support()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("\n[STOP] 사용자 중단(Ctrl+C).")
+        pause_console()
+    except Exception as e:
+        log("\n[UNHANDLED] 치명 오류가 발생했습니다.")
+        log(f"  - {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        pause_console()
+        sys.exit(1)

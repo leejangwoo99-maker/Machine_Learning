@@ -1,50 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트 (Realtime)
+AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트 (Realtime) - HARDENED (Nuitka/EXE Safe)
+
+목표: EXE/Nuitka 환경 포함, DB/드라이버/버전 차이에도 "안 깨지게" 보수 설계
 
 - 대상: d1_machine_log.FCT1~4_machine_log
 - 이벤트: NG_TEXT(제품 감지 NG) -> OFF_TEXT(제품 검사 투입요구 ON)
 - Manual mode 전환 ~ Auto mode 전환 구간에서는 NG 무시
 
-[변경사항/요청사항 통합 반영]
-1) "멀티프로세스" 2개 고정 -> ✅ 스레드 2개 고정(ThreadPoolExecutor)
+[요구사항]
+1) 스레드 2개 고정(ThreadPoolExecutor)
 2) 1초마다 무한루프 재실행
 3) 유효 날짜: end_day = 오늘(YYYYMMDD)만
-4) 실시간: 현재 시간 기준 60초 이내(ts_filter) 데이터만 "결과로 채택"
-   - 쿼리 단계에서는 컨텍스트 확보를 위해 lookback(기본 120초) 로드
-   - 최종 결과는 from/to 모두 cutoff(최근 60초) 이상인 페어만 저장
-5) "파일 저장 중(미완성) 파싱 방지" 준하는 보호 로직:
-   - DB 레코드에서 end_time/contents 등 핵심값 비정상 row 제외(쿼리 + 파이썬 이중 방어)
-   - ts_filter로 확정된 이벤트만 계산/저장
+4) 실시간: 현재 시간 기준 60초 이내(ts_filter) 페어만 저장
+   - 쿼리: lookback(기본 120초) 로드
+   - 저장: from/to 모두 cutoff(최근 60초) 이상인 페어만 저장
+5) 미완성/비정상 row 방어(쿼리 + 파이썬 이중)
 
-[저장 방식]
+[저장]
 - 테이블: d1_machine_log.afa_fail_wasted_time
-- append 저장 + 중복 방지(UNIQUE KEY) + ON CONFLICT DO NOTHING
-
-[EXE/Nuitka 반영]
-- 콘솔 자동 종료 방지(Enter 대기)
-- 단계별 진행상태 출력(실시간 flush)
-- 예외 발생 시 traceback 출력 후 콘솔 유지 + exit code 1
+- append + UNIQUE INDEX + ON CONFLICT DO NOTHING
 """
 
-import os
 import re
 import sys
 import time
 import urllib.parse
 from datetime import datetime, timedelta
 from multiprocessing import freeze_support
-from concurrent.futures import ThreadPoolExecutor, as_completed  # ✅ 변경
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text as sa_text
 import psycopg2
 from psycopg2.extras import execute_values
 
 pd.options.mode.chained_assignment = "raise"
 
 # ============================================
-# 0. DB / 상수 설정
+# 0) DB / 상수
 # ============================================
 DB_CONFIG = {
     "host": "192.168.108.162",
@@ -73,17 +67,19 @@ VALID_CONTENTS = (NG_TEXT, OFF_TEXT, MANUAL_TEXT, AUTO_TEXT)
 TABLE_SAVE_SCHEMA = "d1_machine_log"
 TABLE_SAVE_NAME = "afa_fail_wasted_time"
 
-# 요청 반영
-MP_WORKERS_FIXED = 2          # ✅ 이제 "스레드 개수" 의미로 사용
+THREAD_WORKERS = 2
 LOOP_INTERVAL_SEC = 1
 TS_WINDOW_SEC = 60
 QUERY_LOOKBACK_SEC = 120
 
 PROGRESS_EVERY_GROUPS = 50
 
+# end_time 정규식 (쿼리/파이썬 공용): HH:MM:SS(.1~6)
+END_TIME_REGEX = r"^[0-2][0-9]:[0-5][0-9]:[0-5][0-9](\.[0-9]{1,6})?$"
+
 
 # ============================================
-# 공용: 로그/콘솔 대기
+# 공용: 로그/콘솔 유지
 # ============================================
 def log(msg: str):
     print(msg, flush=True)
@@ -97,7 +93,7 @@ def pause_console():
 
 
 # ============================================
-# 1. DB 유틸
+# 1) DB 유틸 (안정화 옵션 포함)
 # ============================================
 def get_engine(config=DB_CONFIG):
     user = config["user"]
@@ -105,8 +101,19 @@ def get_engine(config=DB_CONFIG):
     host = config["host"]
     port = config["port"]
     dbname = config["dbname"]
-    conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
-    return create_engine(conn_str, pool_pre_ping=True)
+
+    conn_str = (
+        f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+        "?connect_timeout=5"
+    )
+
+    return create_engine(
+        conn_str,
+        pool_pre_ping=True,
+        pool_size=3,
+        max_overflow=3,
+        pool_recycle=300,
+    )
 
 
 def get_psycopg2_conn(config=DB_CONFIG):
@@ -116,25 +123,26 @@ def get_psycopg2_conn(config=DB_CONFIG):
         dbname=config["dbname"],
         user=config["user"],
         password=config["password"],
+        connect_timeout=5,
     )
 
 
 # ============================================
-# 2. 저장 테이블 준비(UNIQUE + append)
+# 2) 저장 테이블 준비
 # ============================================
 def ensure_save_table():
     engine = get_engine(DB_CONFIG)
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (
-        id           BIGSERIAL PRIMARY KEY,
-        end_day      TEXT NOT NULL,
-        station      TEXT NOT NULL,
+        id            BIGSERIAL PRIMARY KEY,
+        end_day       TEXT NOT NULL,
+        station       TEXT NOT NULL,
         from_contents TEXT NOT NULL,
-        from_time    TEXT NOT NULL,
-        to_contents  TEXT NOT NULL,
-        to_time      TEXT NOT NULL,
-        wasted_time  NUMERIC(10,2) NOT NULL,
-        created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+        from_time     TEXT NOT NULL,
+        to_contents   TEXT NOT NULL,
+        to_time       TEXT NOT NULL,
+        wasted_time   NUMERIC(10,2) NOT NULL,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     """
     uniq_sql = f"""
@@ -142,20 +150,25 @@ def ensure_save_table():
     ON {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (end_day, station, from_time, to_time, from_contents, to_contents);
     """
     with engine.begin() as conn:
-        conn.execute(text(create_sql))
-        conn.execute(text(uniq_sql))
+        conn.execute(sa_text(create_sql))
+        conn.execute(sa_text(uniq_sql))
 
 
 # ============================================
-# 3. FCT 로그 로드 (스레드 작업 단위로 사용)
+# 3) FCT 로그 로드 (스레드)
 # ============================================
-def load_fct_log_mp(args):
+def load_fct_log_thread(args):
+    """
+    ✅ Nuitka/EXE에서 발생하던
+    ValueError: cannot set a frame with no defined index and a scalar
+    방지 포함 버전
+    """
     table_name, station_label, db_config, schema_name, today_yyyymmdd, cutoff_dt = args
     t0 = time.perf_counter()
 
     engine = get_engine(db_config)
 
-    sql = f"""
+    stmt = sa_text(f"""
         SELECT
             end_day,
             end_time,
@@ -163,43 +176,58 @@ def load_fct_log_mp(args):
         FROM {schema_name}."{table_name}"
         WHERE
             end_day = :today
-            AND contents = ANY(:valid_contents)
-            AND end_time ~ '^[0-2][0-9]:[0-5][0-9]:[0-5][0-9](\\.[0-9]{{1,6}})?$'
-            AND to_timestamp(end_day || ' ' || end_time, 'YYYYMMDD HH24:MI:SS.MS') >= :cutoff
+            AND contents = ANY(CAST(:valid_contents AS TEXT[]))
+            AND end_time ~ :time_re
+            AND to_timestamp(end_day || ' ' || end_time, 'YYYYMMDD HH24:MI:SS.US') >= CAST(:cutoff AS timestamp)
         ORDER BY end_day ASC, end_time ASC
-    """
+    """)
+
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
 
     df = pd.read_sql(
-        sql,
+        stmt,
         engine,
         params={
             "today": today_yyyymmdd,
             "valid_contents": list(VALID_CONTENTS),
-            "cutoff": cutoff_dt,
+            "time_re": END_TIME_REGEX,
+            "cutoff": cutoff_str,
         },
-    ).copy()
+    )
 
-    df.loc[:, "station"] = station_label
+    # ============================
+    # ✅ HARDENING (핵심)
+    # ============================
+    # 어떤 환경에서는 read_sql 결과가 "컬럼 정보 없는 완전 빈 DF"로 나올 수 있음
+    # -> df.loc[:, "station"]=scalar 에서 ValueError 발생
+    if df is None or not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(columns=["end_day", "end_time", "contents"])
+
+    if df.columns is None or len(df.columns) == 0:
+        df = pd.DataFrame(columns=["end_day", "end_time", "contents"])
+
+    # 컬럼이 일부만 있을 경우도 대비
+    needed = ["end_day", "end_time", "contents"]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = pd.Series(dtype="object")
+
+    # ✅ .loc 대입 금지(빈 DF에서 터짐) -> [] 대입은 안전
+    df["station"] = station_label
+    df = df.copy()
+
     elapsed = time.perf_counter() - t0
     return station_label, len(df), elapsed, df
 
 
-def load_all_fct_logs_multiprocess(today_yyyymmdd: str, cutoff_dt: datetime) -> pd.DataFrame:
-    """
-    ✅ 기존 함수명을 유지하지만, 내부는 ThreadPoolExecutor로 동작.
-    (호출부 변경 최소화 목적)
-    """
-    tasks = [
-        (t, s, DB_CONFIG, SCHEMA_MACHINE, today_yyyymmdd, cutoff_dt)
-        for t, s in TABLES_FCT
-    ]
+def load_all_fct_logs(today_yyyymmdd: str, cutoff_dt: datetime) -> pd.DataFrame:
+    tasks = [(t, s, DB_CONFIG, SCHEMA_MACHINE, today_yyyymmdd, cutoff_dt) for t, s in TABLES_FCT]
 
-    log(f"[LOAD] 오늘={today_yyyymmdd} | lookback_cutoff={cutoff_dt:%Y-%m-%d %H:%M:%S} | threads={MP_WORKERS_FIXED}")
+    log(f"[LOAD] 오늘={today_yyyymmdd} | lookback_cutoff={cutoff_dt:%Y-%m-%d %H:%M:%S} | threads={THREAD_WORKERS}")
 
     dfs = []
-    with ThreadPoolExecutor(max_workers=MP_WORKERS_FIXED) as ex:  # ✅ 변경
-        futs = [ex.submit(load_fct_log_mp, task) for task in tasks]
-
+    with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as ex:
+        futs = [ex.submit(load_fct_log_thread, task) for task in tasks]
         done_cnt = 0
         for f in as_completed(futs):
             station_label, nrows, elapsed, df = f.result()
@@ -207,20 +235,29 @@ def load_all_fct_logs_multiprocess(today_yyyymmdd: str, cutoff_dt: datetime) -> 
             done_cnt += 1
             log(f"  - [{done_cnt}/{len(tasks)}] {station_label} 로드: rows={nrows:,} | {elapsed:.2f}s")
 
+    # 안전장치
+    dfs = [d for d in dfs if isinstance(d, pd.DataFrame)]
     if not dfs:
         return pd.DataFrame(columns=["end_day", "end_time", "contents", "station"])
 
     df_all = pd.concat(dfs, ignore_index=True)
+
+    # 컬럼 보정
+    for c in ["end_day", "end_time", "contents", "station"]:
+        if c not in df_all.columns:
+            df_all[c] = pd.Series(dtype="object")
+
     log(f"[LOAD] 합계 rows={len(df_all):,}")
     return df_all
 
 
 # ============================================
-# 4. 계산 로직(최근 60초 확정 이벤트만 결과로 채택)
+# 4) 계산 로직
 # ============================================
 def _is_valid_row_basic(end_day, end_time, contents) -> bool:
     if end_day is None or end_time is None or contents is None:
         return False
+
     s_end_day = str(end_day)
     s_end_time = str(end_time)
     s_contents = str(contents)
@@ -229,8 +266,9 @@ def _is_valid_row_basic(end_day, end_time, contents) -> bool:
         return False
     if s_contents not in VALID_CONTENTS:
         return False
-    if not re.fullmatch(r"[0-2]\d:[0-5]\d:[0-5]\d:[0-5]\d(\.\d{1,6})?", s_end_time):
+    if not re.fullmatch(r"[0-2]\d:[0-5]\d:[0-5]\d(\.\d{1,6})?", s_end_time):
         return False
+
     return True
 
 
@@ -242,11 +280,13 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
 
     log(f"[CALC] ts_filter_cutoff={ts_filter_cutoff:%Y-%m-%d %H:%M:%S} (최근 {TS_WINDOW_SEC}s 확정 이벤트만 결과)")
 
+    # apply는 느리지만, 안정성을 우선(Realtime 120초 구간이라 부담 적음)
     mask_valid = df_all.apply(
         lambda r: _is_valid_row_basic(r["end_day"], r["end_time"], r["contents"]),
         axis=1
     )
     df_evt = df_all.loc[mask_valid].copy()
+
     if df_evt.empty:
         log("[CALC] 유효 이벤트가 없습니다(비정상 row 제거 후).")
         return pd.DataFrame(columns=[
@@ -256,7 +296,6 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
     df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
 
     result_rows = []
-
     groups = list(df_evt.groupby(["end_day", "station"], sort=False))
     total_groups = len(groups)
     log(f"[CALC] 그룹 수(end_day x station): {total_groups:,}")
@@ -296,10 +335,12 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
                 from_ts = pending_from_ts
                 to_ts = ts
 
+                # 최근 60초 이내 페어만 저장
                 if from_ts < ts_filter_cutoff or to_ts < ts_filter_cutoff:
                     pending_from_ts = None
                     continue
 
+                # 표시 포맷(소수점 2자리 수준으로 절삭)
                 from_str = from_ts.strftime("%H:%M:%S.%f")[:-4]
                 to_str = to_ts.strftime("%H:%M:%S.%f")[:-4]
                 wasted = round(abs((to_ts - from_ts).total_seconds()), 2)
@@ -319,7 +360,9 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
     df_wasted = pd.DataFrame(result_rows)
     if df_wasted.empty:
         log("[CALC] 생성된 결과가 없습니다(최근 60초 조건 또는 이벤트 페어 미충족).")
-        return df_wasted
+        return pd.DataFrame(columns=[
+            "end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
+        ])
 
     df_wasted = df_wasted.sort_values(["end_day", "station", "from_time"]).reset_index(drop=True)
     log(f"[CALC] 결과 rows={len(df_wasted):,}")
@@ -327,7 +370,7 @@ def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) ->
 
 
 # ============================================
-# 5. DB 저장(append + ON CONFLICT DO NOTHING)
+# 5) 저장
 # ============================================
 def save_to_db_append_on_conflict(df_wasted: pd.DataFrame):
     if df_wasted is None or df_wasted.empty:
@@ -361,7 +404,7 @@ def save_to_db_append_on_conflict(df_wasted: pd.DataFrame):
 
 
 # ============================================
-# 6. main loop
+# 6) main loop
 # ============================================
 def run_realtime_loop():
     ensure_save_table()
@@ -371,13 +414,14 @@ def run_realtime_loop():
     log(f"[INFO] DB = {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}")
     log(f"[INFO] SOURCE SCHEMA = {SCHEMA_MACHINE}")
     log(f"[INFO] SAVE TABLE    = {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (append + dedup)")
-    log(f"[INFO] THREAD_WORKERS = {MP_WORKERS_FIXED}")
+    log(f"[INFO] THREAD_WORKERS = {THREAD_WORKERS}")
     log(f"[INFO] LOOP_INTERVAL_SEC = {LOOP_INTERVAL_SEC}")
     log(f"[INFO] TS_WINDOW_SEC = {TS_WINDOW_SEC} | QUERY_LOOKBACK_SEC = {QUERY_LOOKBACK_SEC}")
     log("=" * 78)
 
     while True:
         loop_t0 = time.perf_counter()
+
         now = datetime.now()
         today_yyyymmdd = now.strftime("%Y%m%d")
 
@@ -385,7 +429,7 @@ def run_realtime_loop():
         ts_filter_cutoff = now - timedelta(seconds=TS_WINDOW_SEC)
 
         try:
-            df_all = load_all_fct_logs_multiprocess(today_yyyymmdd=today_yyyymmdd, cutoff_dt=query_cutoff_dt)
+            df_all = load_all_fct_logs(today_yyyymmdd=today_yyyymmdd, cutoff_dt=query_cutoff_dt)
             df_wasted = compute_afa_fail_wasted(df_all, ts_filter_cutoff=ts_filter_cutoff)
             save_to_db_append_on_conflict(df_wasted)
 
@@ -397,8 +441,7 @@ def run_realtime_loop():
             raise
 
         elapsed = time.perf_counter() - loop_t0
-        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-        time.sleep(sleep_sec)
+        time.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
 
 
 def main():
@@ -406,8 +449,7 @@ def main():
 
 
 if __name__ == "__main__":
-    freeze_support()  # 있어도 무방
-
+    freeze_support()
     try:
         main()
     except KeyboardInterrupt:
