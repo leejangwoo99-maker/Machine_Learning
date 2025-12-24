@@ -44,7 +44,7 @@ from sqlalchemy import create_engine, text
 
 @dataclass(frozen=True)
 class DBConfig:
-    host: str = "100.105.75.47"
+    host: str = "192.168.108.162"
     port: int = 5432
     dbname: str = "postgres"
     user: str = "postgres"
