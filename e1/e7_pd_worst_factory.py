@@ -11,6 +11,12 @@ pd_worst.py
 - 실행 시작/종료/총 실행시간(초) 콘솔 출력 + (가능하면) DB 컬럼(run_start_ts, run_end_ts, run_seconds) 저장
   * 단, 기존 테이블에 run_* 컬럼이 없으면 자동 제외(에러 방지)
 
+추가 조건(스케줄러)
+1) 무한 루프 기능 : 1초마다 재실행
+2) 매일 하루 2번 실행
+   - 08:27:00 시작 ~ 08:29:59 종료 (윈도우 안에서는 1초 간격 반복 실행)
+   - 20:27:00 시작 ~ 20:29:59 종료 (윈도우 안에서는 1초 간격 반복 실행)
+
 주의:
 - end_day 입력: TARGET_END_DAY_TEXT = '20251219' (a2_fct_table.fct_table의 TEXT end_day 기준)
 - c1_fct_detail.fct_detail은 end_day가 date 타입이라고 가정
@@ -45,6 +51,16 @@ TEST_CONTENTS_KEY = "1.36_dark_curr_check"  # pd_cal_test_ct_summary에서 upper
 # 저장 테이블
 TARGET_SCHEMA = "e4_predictive_maintenance"
 TARGET_TABLE = "pd_worst"
+
+# ============================
+# 스케줄 윈도우(매일)
+# ============================
+# - (start_h, start_m, start_s) ~ (end_h, end_m, end_s) inclusive
+RUN_WINDOWS = [
+    ((8, 27, 0), (8, 29, 59)),
+    ((20, 27, 0), (20, 29, 59)),
+]
+SLEEP_SECONDS = 1.0  # 1초마다 재실행(윈도우 밖에서도 1초로 폴링)
 
 
 # =========================
@@ -115,10 +131,28 @@ def build_dynamic_upsert_sql(full_name: str, pk_cols: List[str], save_cols: List
     """)
 
 
+def _in_window(now_dt: datetime, start_hms, end_hms) -> bool:
+    sh, sm, ss = start_hms
+    eh, em, es = end_hms
+    start_sec = sh * 3600 + sm * 60 + ss
+    end_sec   = eh * 3600 + em * 60 + es
+    now_sec   = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+    return start_sec <= now_sec <= end_sec
+
+
+def is_run_time(now_dt: Optional[datetime] = None) -> bool:
+    if now_dt is None:
+        now_dt = datetime.now()
+    for w in RUN_WINDOWS:
+        if _in_window(now_dt, w[0], w[1]):
+            return True
+    return False
+
+
 # =========================
-# 3) 메인
+# 3) 1회 실행 로직(기존 main 내용을 함수로)
 # =========================
-def main():
+def run_once():
     # 실행시간
     run_start_dt = datetime.now()
     run_start_perf = time.perf_counter()
@@ -378,6 +412,7 @@ def main():
     want_problem_cols = ["problem1","problem2","problem3","problem4"]
     use_problem_cols = [c for c in want_problem_cols if c in present_problem_cols]
 
+    # end_day 컬럼 존재를 가정하고, 해당 day가 없으면 latest로 fallback
     SQL_HAS_DAY = text("""
     SELECT COUNT(*) AS n
     FROM e4_predictive_maintenance.pd_cal_test_ct_summary
@@ -508,13 +543,9 @@ def main():
 
     # -----------------------------
     # Cell X10) DB 저장 (DDL + 동적 UPSERT + 실행시간 컬럼)
+    #  - run_* 컬럼은 DF에 넣되, DB에 없으면 자동 제외(에러 방지)
     # -----------------------------
-    run_end_dt = datetime.now()
-    run_seconds = round(time.perf_counter() - run_start_perf, 3)
-
-    print(f"[RUN] end_ts={run_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[RUN] run_seconds={run_seconds:.3f}")
-
+    FULL_NAME = f"{TARGET_SCHEMA}.{TARGET_TABLE}"
     df_save = df_spike_fp.copy()
 
     # group -> group_no
@@ -523,13 +554,14 @@ def main():
     elif "group_no" not in df_save.columns:
         df_save["group_no"] = pd.NA
 
-    # 실행시간 컬럼(DF에 생성)
+    # (DF) 실행시간 컬럼 생성(저장 시 DB에 없으면 자동 제외됨)
     df_save["run_start_ts"] = run_start_dt
-    df_save["run_end_ts"] = run_end_dt
-    df_save["run_seconds"] = float(run_seconds)
+    df_save["run_end_ts"] = pd.NaT
+    df_save["run_seconds"] = pd.NA
+
+    pk_cols = ["barcode_information","end_day","end_time","test_contents","okng_seq"]
 
     # 타입 정리
-    pk_cols = ["barcode_information","end_day","end_time","test_contents","okng_seq"]
     df_save["barcode_information"] = df_save["barcode_information"].astype(str).str.strip()
     df_save["end_day"] = pd.to_datetime(df_save["end_day"], errors="coerce").dt.date
     df_save["end_time"] = df_save["end_time"].astype(str).str.strip()
@@ -546,12 +578,11 @@ def main():
     if "file_path" not in df_save.columns:
         df_save["file_path"] = pd.NA
 
-    full_name = f"{TARGET_SCHEMA}.{TARGET_TABLE}"
-
+    # 테이블 없으면 생성(신규 생성 시에는 run_* 컬럼 포함)
     DDL = text(f"""
     CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA};
 
-    CREATE TABLE IF NOT EXISTS {full_name} (
+    CREATE TABLE IF NOT EXISTS {FULL_NAME} (
         group_no            integer,
         barcode_information text NOT NULL,
         station             text,
@@ -581,61 +612,114 @@ def main():
     );
     """)
 
-    SQL_EXISTING_COLS = text("""
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = :schema
-      AND table_name   = :table
-    """)
+    # ✅ 고정 UPSERT를 여기서 만들지 않고,
+    #    실행 종료 시점에 "DB 실제 컬럼" 확인 후 동적으로 생성
+    payload_for_save = {
+        "DDL": DDL,
+        "pk_cols": pk_cols,
+        "df_save": df_save,
+        "full_name": FULL_NAME,
+        "schema": TARGET_SCHEMA,
+        "table": TARGET_TABLE,
+        "engine": engine,
+        "run_start_dt": run_start_dt,
+        "run_start_perf": run_start_perf,
+    }
 
-    candidate_cols = [
-        "group_no",
-        "barcode_information","station","remark","end_day","end_time",
-        "run_time","boundary_run_time",
-        "okng_seq","test_contents","test_time",
-        "from_to_test_ct","boundary_test_ct","diff_ct",
-        "problem1","problem2","problem3","problem4",
-        "file_path",
-        "run_start_ts","run_end_ts","run_seconds"
-    ]
+    # ---- 여기서 try는 끝, finally에서 종료 시간 찍고 저장 ----
+    try:
+        return
+    finally:
+        run_end_dt = datetime.now()
+        run_seconds = round(time.perf_counter() - run_start_perf, 3)
 
-    with engine.begin() as conn:
-        conn.execute(DDL)
+        print(f"[RUN] end_ts={run_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[RUN] run_seconds={run_seconds:.3f}")
 
-        existing_cols = set(
-            pd.read_sql(
-                SQL_EXISTING_COLS,
-                conn,
-                params={"schema": TARGET_SCHEMA, "table": TARGET_TABLE}
-            )["column_name"].astype(str).tolist()
-        )
+        df_save2 = payload_for_save["df_save"].copy()
+        df_save2["run_end_ts"] = run_end_dt
+        df_save2["run_seconds"] = float(run_seconds)
 
-        save_cols = [c for c in candidate_cols if (c in df_save.columns and c in existing_cols)]
+        SQL_EXISTING_COLS = text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = :schema
+          AND table_name   = :table
+        """)
 
-        # PK 필수 체크
-        for c in pk_cols:
-            if c not in existing_cols:
-                raise RuntimeError(f"[ERROR] DB 테이블에 PK 컬럼 '{c}' 가 없습니다. 테이블 스키마를 확인하세요.")
-            if c not in save_cols:
-                save_cols.append(c)
+        candidate_cols = [
+            "group_no",
+            "barcode_information","station","remark","end_day","end_time",
+            "run_time","boundary_run_time",
+            "okng_seq","test_contents","test_time",
+            "from_to_test_ct","boundary_test_ct","diff_ct",
+            "problem1","problem2","problem3","problem4",
+            "file_path",
+            "run_start_ts","run_end_ts","run_seconds"
+        ]
 
-        # run_* 컬럼이 테이블에 없으면 경고만 출력 (저장 자동 제외)
-        for c in ["run_start_ts","run_end_ts","run_seconds"]:
-            if c not in existing_cols:
-                print(f"[WARN] DB column missing -> will skip save: {c}")
+        with engine.begin() as conn:
+            conn.execute(payload_for_save["DDL"])
 
-        UPSERT_SQL = build_dynamic_upsert_sql(full_name, pk_cols, save_cols)
+            existing_cols = set(
+                pd.read_sql(
+                    SQL_EXISTING_COLS,
+                    conn,
+                    params={"schema": payload_for_save["schema"], "table": payload_for_save["table"]}
+                )["column_name"].astype(str).tolist()
+            )
 
-        rows = df_save[save_cols].to_dict(orient="records")
-        for r in rows:
-            for k, v in list(r.items()):
-                if pd.isna(v):
-                    r[k] = None
+            save_cols = [c for c in candidate_cols if (c in df_save2.columns and c in existing_cols)]
 
-        conn.execute(UPSERT_SQL, rows)
+            # PK 필수 체크
+            for c in pk_cols:
+                if c not in existing_cols:
+                    raise RuntimeError(f"[ERROR] DB 테이블에 PK 컬럼 '{c}' 가 없습니다. 테이블 스키마를 확인하세요.")
+                if c not in save_cols:
+                    save_cols.append(c)
 
-    print(f"[OK] Saved to {full_name} (rows={len(df_save)}) / used_cols={len(save_cols)}")
+            UPSERT_SQL = build_dynamic_upsert_sql(payload_for_save["full_name"], pk_cols, save_cols)
+
+            rows = df_save2[save_cols].to_dict(orient="records")
+            for r in rows:
+                for k, v in list(r.items()):
+                    if pd.isna(v):
+                        r[k] = None
+
+            conn.execute(UPSERT_SQL, rows)
+
+        print(f"[OK] Saved to {payload_for_save['full_name']} (rows={len(df_save2)}) / used_cols={len(save_cols)}")
+
+
+# ============================
+# 4) 스케줄러: 무한 루프(1초 폴링) + 하루 2회 윈도우 실행
+# ============================
+def scheduler_loop():
+    last_state = None  # "RUN" / "WAIT" 상태 로그 중복 방지용
+
+    while True:
+        now_dt = datetime.now()
+
+        if is_run_time(now_dt):
+            if last_state != "RUN":
+                print(f"[SCHED] enter RUN window @ {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                last_state = "RUN"
+
+            try:
+                run_once()
+            except Exception as e:
+                # 윈도우 안에서 계속 돌려야 하므로 예외는 로그만 찍고 다음 tick에서 재시도
+                print(f"[ERROR] run_once failed: {repr(e)}")
+
+            time.sleep(SLEEP_SECONDS)
+
+        else:
+            if last_state != "WAIT":
+                print(f"[SCHED] WAIT (outside windows) @ {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                last_state = "WAIT"
+
+            time.sleep(SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
-    main()
+    scheduler_loop()

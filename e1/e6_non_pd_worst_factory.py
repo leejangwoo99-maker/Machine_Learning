@@ -6,6 +6,12 @@ non_pd_worst.py
 - 실행 시작/종료 시간 기록
 - 총 실행시간(초) 계산
 - DB 저장 테이블에 run_start_ts, run_end_ts, run_seconds 컬럼 추가 및 UPSERT 저장
+
+추가 조건(스케줄러)
+1) 무한 루프 기능 : 1초마다 재실행
+2) 매일 하루 2번 실행
+   - 08:27:00 시작 ~ 08:29:59 종료 (윈도우 안에서는 1초 간격 반복 실행)
+   - 20:27:00 시작 ~ 20:29:59 종료 (윈도우 안에서는 1초 간격 반복 실행)
 """
 
 import os
@@ -40,6 +46,17 @@ TARGET_TABLE  = "non_pd_worst"
 SAVE_HTML_REPORT = True
 REPORT_DIR = "./report_non_pd_worst"
 MAX_PREVIEW_ROWS = 300
+
+# ============================
+# 스케줄 윈도우(매일)
+# ============================
+# - (start_h, start_m, start_s) ~ (end_h, end_m, end_s) inclusive
+RUN_WINDOWS = [
+    ((8, 27, 0), (8, 29, 59)),
+    ((20, 27, 0), (20, 29, 59)),
+]
+
+SLEEP_SECONDS = 1.0  # 1초마다 재실행(윈도우 밖에서도 1초로 폴링)
 
 
 # ============================
@@ -144,11 +161,29 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _in_window(now_dt: datetime, start_hms, end_hms) -> bool:
+    sh, sm, ss = start_hms
+    eh, em, es = end_hms
+    start_sec = sh * 3600 + sm * 60 + ss
+    end_sec   = eh * 3600 + em * 60 + es
+    now_sec   = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+    return start_sec <= now_sec <= end_sec
+
+
+def is_run_time(now_dt: Optional[datetime] = None) -> bool:
+    if now_dt is None:
+        now_dt = datetime.now()
+    for w in RUN_WINDOWS:
+        if _in_window(now_dt, w[0], w[1]):
+            return True
+    return False
+
+
 # ============================
-# 3) 메인 로직
+# 3) 1회 실행 로직(기존 main 내용을 함수로)
 # ============================
 
-def main():
+def run_once():
     # -----------------------------
     # 실행 시작/종료/시간 측정
     # -----------------------------
@@ -583,8 +618,7 @@ def main():
         )
 
         # --------------------------------
-        # Cell X10) 저장 준비 (CREATE는 실행하되, INSERT/UPSERT는 "DB에 존재하는 컬럼만"으로 동적 생성)
-        #  - 테이블이 이미 존재하면 run_* 컬럼이 없을 수 있으므로, info_schema로 컬럼 확인 후 자동 제외
+        # Cell X10) 저장 준비 (DDL 실행 + 컬럼 동적 UPSERT)
         # --------------------------------
         FULL_NAME = f"{TARGET_SCHEMA}.{TARGET_TABLE}"
         df_save = df_top_fp.copy()
@@ -656,7 +690,6 @@ def main():
         );
         """)
 
-        # ✅ 고정 UPSERT를 여기서 만들지 않고, finally에서 "DB 실제 컬럼" 확인 후 동적으로 생성
         payload_for_save = {
             "DDL": DDL,
             "pk_cols": pk_cols,
@@ -666,9 +699,7 @@ def main():
             "table": TARGET_TABLE,
         }
 
-
     except Exception:
-        # 예외는 finally에서 종료시간 찍고 다시 raise
         raise
 
     finally:
@@ -726,7 +757,6 @@ def main():
                     if c not in existing_cols:
                         raise RuntimeError(f"[ERROR] DB 테이블에 PK 컬럼 '{c}' 가 없습니다. 테이블 스키마를 확인하세요.")
                     if c not in save_cols:
-                        # save_cols에도 포함되어야 UPSERT가 성립
                         save_cols.append(c)
 
                 # INSERT/UPSERT SQL 동적 구성
@@ -750,6 +780,7 @@ def main():
                         if pd.isna(v):
                             r[k] = None
 
+                # executemany
                 conn.execute(UPSERT_SQL, rows)
 
             print(f"[OK] Saved to {payload_for_save['full_name']} (rows={len(df_save2)}) / used_cols={len(save_cols)}")
@@ -758,5 +789,36 @@ def main():
             print(f"[OK] HTML report saved: {os.path.abspath(REPORT_DIR)}")
 
 
+# ============================
+# 4) 스케줄러: 무한 루프(1초 폴링) + 하루 2회 윈도우 실행
+# ============================
+
+def scheduler_loop():
+    last_state = None  # "RUN" / "WAIT" 상태 로그 중복 방지용
+
+    while True:
+        now_dt = datetime.now()
+
+        if is_run_time(now_dt):
+            if last_state != "RUN":
+                print(f"[SCHED] enter RUN window @ {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                last_state = "RUN"
+
+            try:
+                run_once()
+            except Exception as e:
+                # 윈도우 안에서 계속 돌려야 하므로 예외는 로그만 찍고 다음 tick에서 재시도
+                print(f"[ERROR] run_once failed: {repr(e)}")
+
+            time.sleep(SLEEP_SECONDS)
+
+        else:
+            if last_state != "WAIT":
+                print(f"[SCHED] WAIT (outside windows) @ {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                last_state = "WAIT"
+
+            time.sleep(SLEEP_SECONDS)
+
+
 if __name__ == "__main__":
-    main()
+    scheduler_loop()
