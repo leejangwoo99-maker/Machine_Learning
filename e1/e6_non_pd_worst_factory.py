@@ -16,6 +16,10 @@ non_pd_worst.py
 Nuitka 안정화(중요)
 - list/dict/set comprehension 최대한 제거
 - f-string 내 복잡식/inline comp 제거
+
+[추가 통합 반영]
+1) TARGET_END_DAY를 "현재 날짜(YYYYMMDD)" 기준으로 자동 선택
+2) 만약 현재 날짜 데이터가 없으면, remark 기준 가장 최신 end_day로 fallback
 """
 
 import os
@@ -40,7 +44,10 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
-TARGET_END_DAY = "20251219"   # a2_fct_table.fct_table 의 end_day (TEXT)
+# ✅ 오늘 날짜 자동 + 없으면 최신일 fallback
+AUTO_PICK_END_DAY = True
+TARGET_END_DAY = None  # AUTO_PICK_END_DAY=False일 때만 직접 넣어서 사용
+
 TARGET_REMARK  = "Non-PD"     # a2_fct_table.fct_table 의 remark
 TEST_CONTENTS_KEY = "1.32_dark_curr_check"  # boundary source
 
@@ -263,6 +270,39 @@ def run_once():
 
     engine = get_engine(DB_CONFIG)
 
+    # ✅ end_day 자동 선택(오늘 → 없으면 최신)
+    if AUTO_PICK_END_DAY:
+        today_text = datetime.now().strftime("%Y%m%d")
+
+        SQL_CHECK_TODAY = text("""
+        SELECT 1
+        FROM a2_fct_table.fct_table
+        WHERE end_day = :today
+          AND remark  = :remark
+        LIMIT 1
+        """)
+        chk = pd.read_sql(SQL_CHECK_TODAY, engine, params={
+            "today": today_text,
+            "remark": TARGET_REMARK
+        })
+
+        if not chk.empty:
+            use_end_day = today_text
+            print("[AUTO] Using TODAY end_day = {}".format(use_end_day))
+        else:
+            SQL_LATEST = text("""
+            SELECT MAX(end_day) AS max_day
+            FROM a2_fct_table.fct_table
+            WHERE remark = :remark
+            """)
+            latest = pd.read_sql(SQL_LATEST, engine, params={"remark": TARGET_REMARK})
+            if latest.empty or pd.isna(latest.iloc[0]["max_day"]):
+                raise RuntimeError("[ERROR] a2_fct_table.fct_table 에 유효한 end_day 가 없습니다.")
+            use_end_day = str(latest.iloc[0]["max_day"]).strip()
+            print("[AUTO] TODAY not found → fallback to latest end_day = {}".format(use_end_day))
+    else:
+        use_end_day = TARGET_END_DAY
+
     if SAVE_HTML_REPORT:
         ensure_dir(REPORT_DIR)
 
@@ -303,9 +343,9 @@ def run_once():
         WHERE end_day = :end_day
           AND remark  = :remark
         """)
-        df = pd.read_sql(SQL_DATA, engine, params={"end_day": TARGET_END_DAY, "remark": TARGET_REMARK})
+        df = pd.read_sql(SQL_DATA, engine, params={"end_day": use_end_day, "remark": TARGET_REMARK})
         if df.empty:
-            raise RuntimeError("[ERROR] a2_fct_table.fct_table 조회 결과가 비어있습니다. end_day={}, remark={}".format(TARGET_END_DAY, TARGET_REMARK))
+            raise RuntimeError("[ERROR] a2_fct_table.fct_table 조회 결과가 비어있습니다. end_day={}, remark={}".format(use_end_day, TARGET_REMARK))
 
         df["run_time"] = pd.to_numeric(df["run_time"], errors="coerce")
         df["boundary_run_time"] = boundary_run_time

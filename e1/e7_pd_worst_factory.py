@@ -17,9 +17,16 @@ pd_worst.py
    - 08:27:00 시작 ~ 08:29:59 종료 (윈도우 안에서는 1초 간격 반복 실행)
    - 20:27:00 시작 ~ 20:29:59 종료 (윈도우 안에서는 1초 간격 반복 실행)
 
+[추가 통합 반영]
+1) TARGET_END_DAY_TEXT를 "현재 날짜(YYYYMMDD)" 기준으로 자동 선택
+2) 만약 현재 날짜 데이터가 없으면, remark 기준 가장 최신 end_day로 fallback
+
 주의:
-- end_day 입력: TARGET_END_DAY_TEXT = '20251219' (a2_fct_table.fct_table의 TEXT end_day 기준)
 - c1_fct_detail.fct_detail은 end_day가 date 타입이라고 가정
+
+Nuitka 안정화(중요)
+- list/dict/set comprehension 최대한 제거
+- f-string 내 복잡식/inline comp 제거 (가능한 범위 내)
 """
 
 import math
@@ -43,8 +50,10 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
-# 입력 조건
-TARGET_END_DAY_TEXT = "20251219"   # a2_fct_table.fct_table의 end_day (TEXT)
+# ✅ 오늘 날짜 자동 + 없으면 최신일 fallback
+AUTO_PICK_END_DAY = True
+TARGET_END_DAY_TEXT = None   # AUTO_PICK_END_DAY=False일 때만 직접 넣어서 사용
+
 TARGET_REMARK = "PD"
 TEST_CONTENTS_KEY = "1.36_dark_curr_check"  # pd_cal_test_ct_summary에서 upper_outlier를 가져올 key
 
@@ -72,10 +81,11 @@ def get_engine(cfg: Dict[str, Any]):
     host = cfg["host"]
     port = cfg["port"]
     db = cfg["dbname"]
-    return create_engine(
-        f"postgresql+psycopg2://{user}:{pw}@{host}:{port}/{db}?connect_timeout=5",
-        pool_pre_ping=True
+    conn_str = (
+        "postgresql+psycopg2://{u}:{p}@{h}:{pt}/{d}?connect_timeout=5"
+        .format(u=user, p=pw, h=host, pt=port, d=db)
     )
+    return create_engine(conn_str, pool_pre_ping=True)
 
 
 # =========================
@@ -84,8 +94,14 @@ def get_engine(cfg: Dict[str, Any]):
 def norm_end_day(x) -> str:
     s = str(x).strip()
     if s.isdigit() and len(s) == 8:
-        return pd.to_datetime(s, format="%Y%m%d", errors="coerce").strftime("%Y-%m-%d")
-    return pd.to_datetime(s, errors="coerce").strftime("%Y-%m-%d")
+        dt = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+        if pd.isna(dt):
+            return ""
+        return dt.strftime("%Y-%m-%d")
+    dt = pd.to_datetime(s, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return dt.strftime("%Y-%m-%d")
 
 
 def norm_end_time(x) -> Optional[str]:
@@ -108,7 +124,8 @@ def parse_test_time_to_ts(end_day_str: str, t) -> pd.Timestamp:
     s = str(t).strip()
     if s == "" or s.lower() == "none":
         return pd.NaT
-    return pd.to_datetime(f"{end_day_str} {s}", errors="coerce")
+    combo = "{} {}".format(end_day_str, s)
+    return pd.to_datetime(combo, errors="coerce")
 
 
 def build_dynamic_upsert_sql(full_name: str, pk_cols: List[str], save_cols: List[str]) -> text:
@@ -117,18 +134,33 @@ def build_dynamic_upsert_sql(full_name: str, pk_cols: List[str], save_cols: List
     pk_cols: PK 컬럼 목록
     """
     insert_cols_sql = ", ".join(save_cols)
-    values_sql = ", ".join([f":{c}" for c in save_cols])
+
+    value_parts: List[str] = []
+    for c in save_cols:
+        value_parts.append(":{}".format(c))
+    values_sql = ", ".join(value_parts)
 
     conflict_cols = "barcode_information, end_day, end_time, test_contents, okng_seq"
-    set_cols = [c for c in save_cols if c not in pk_cols]
-    set_sql = ", ".join([f"{c} = EXCLUDED.{c}" for c in set_cols] + ["updated_at = now()"])
 
-    return text(f"""
-    INSERT INTO {full_name} ({insert_cols_sql})
-    VALUES ({values_sql})
-    ON CONFLICT ({conflict_cols})
+    set_cols: List[str] = []
+    for c in save_cols:
+        if c not in pk_cols:
+            set_cols.append(c)
+
+    set_parts: List[str] = []
+    for c in set_cols:
+        set_parts.append("{} = EXCLUDED.{}".format(c, c))
+    set_parts.append("updated_at = now()")
+    set_sql = ", ".join(set_parts)
+
+    sql_txt = """
+    INSERT INTO {full} ({cols})
+    VALUES ({vals})
+    ON CONFLICT ({conflict})
     DO UPDATE SET {set_sql};
-    """)
+    """.format(full=full_name, cols=insert_cols_sql, vals=values_sql, conflict=conflict_cols, set_sql=set_sql)
+
+    return text(sql_txt)
 
 
 def _in_window(now_dt: datetime, start_hms, end_hms) -> bool:
@@ -149,16 +181,65 @@ def is_run_time(now_dt: Optional[datetime] = None) -> bool:
     return False
 
 
+def fetch_existing_cols(conn, schema: str, table: str) -> List[str]:
+    SQL_EXISTING_COLS = text("""
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = :schema
+      AND table_name   = :table
+    """)
+    df_cols = pd.read_sql(SQL_EXISTING_COLS, conn, params={"schema": schema, "table": table})
+    cols: List[str] = []
+    if "column_name" in df_cols.columns:
+        for v in df_cols["column_name"].tolist():
+            if isinstance(v, str):
+                cols.append(v)
+    return cols
+
+
 # =========================
-# 3) 1회 실행 로직(기존 main 내용을 함수로)
+# 3) 1회 실행 로직
 # =========================
 def run_once():
     # 실행시간
     run_start_dt = datetime.now()
     run_start_perf = time.perf_counter()
-    print(f"[RUN] start_ts={run_start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("[RUN] start_ts={}".format(run_start_dt.strftime("%Y-%m-%d %H:%M:%S")))
 
     engine = get_engine(DB_CONFIG)
+
+    # ✅ end_day 자동 선택(오늘 → 없으면 최신)
+    if AUTO_PICK_END_DAY:
+        today_text = datetime.now().strftime("%Y%m%d")
+
+        SQL_CHECK_TODAY = text("""
+        SELECT 1
+        FROM a2_fct_table.fct_table
+        WHERE end_day = :today
+          AND remark  = :remark
+        LIMIT 1
+        """)
+        chk = pd.read_sql(SQL_CHECK_TODAY, engine, params={
+            "today": today_text,
+            "remark": TARGET_REMARK
+        })
+
+        if not chk.empty:
+            use_end_day_text = today_text
+            print("[AUTO] Using TODAY end_day = {}".format(use_end_day_text))
+        else:
+            SQL_LATEST = text("""
+            SELECT MAX(end_day) AS max_day
+            FROM a2_fct_table.fct_table
+            WHERE remark = :remark
+            """)
+            latest = pd.read_sql(SQL_LATEST, engine, params={"remark": TARGET_REMARK})
+            if latest.empty or pd.isna(latest.iloc[0]["max_day"]):
+                raise RuntimeError("[ERROR] a2_fct_table.fct_table 에 유효한 end_day 가 없습니다.")
+            use_end_day_text = str(latest.iloc[0]["max_day"]).strip()
+            print("[AUTO] TODAY not found → fallback to latest end_day = {}".format(use_end_day_text))
+    else:
+        use_end_day_text = TARGET_END_DAY_TEXT
 
     # -----------------------------
     # Cell A) boundary_run_time 로드
@@ -174,11 +255,11 @@ def run_once():
 
     b = pd.read_sql(SQL_BOUNDARY, engine, params={"tc": TEST_CONTENTS_KEY})
     if b.empty:
-        raise RuntimeError(f"[ERROR] pd_cal_test_ct_summary에서 {TEST_CONTENTS_KEY} upper_outlier를 찾지 못했습니다.")
+        raise RuntimeError("[ERROR] pd_cal_test_ct_summary에서 {} upper_outlier를 찾지 못했습니다.".format(TEST_CONTENTS_KEY))
 
     boundary_run_time = float(b.loc[0, "upper_outlier"])
     boundary_src_day = str(b.loc[0, "end_day"])
-    print(f"[OK] boundary_run_time={boundary_run_time} (source end_day={boundary_src_day})")
+    print("[OK] boundary_run_time={} (source end_day={})".format(boundary_run_time, boundary_src_day))
 
     # -----------------------------
     # Cell B) run_time TOP 5% (df_top)
@@ -196,11 +277,16 @@ def run_once():
       AND remark  = :remark
     """)
 
-    df = pd.read_sql(SQL_DATA, engine, params={"end_day": TARGET_END_DAY_TEXT, "remark": TARGET_REMARK})
+    df = pd.read_sql(SQL_DATA, engine, params={"end_day": use_end_day_text, "remark": TARGET_REMARK})
+    if df.empty:
+        raise RuntimeError("[ERROR] a2_fct_table.fct_table 조회 결과가 비어있습니다. end_day={}, remark={}".format(use_end_day_text, TARGET_REMARK))
+
     df["run_time"] = pd.to_numeric(df["run_time"], errors="coerce")
     df["boundary_run_time"] = boundary_run_time
 
     df = df[df["run_time"] > df["boundary_run_time"]].copy()
+    if df.empty:
+        raise RuntimeError("[ERROR] boundary_run_time 초과 데이터가 없습니다. boundary_run_time={}".format(boundary_run_time))
 
     df = (
         df.sort_values(["barcode_information", "end_time"])
@@ -223,7 +309,7 @@ def run_once():
         "barcode_information", "remark", "station", "end_day", "end_time", "boundary_run_time", "run_time"
     ]]
 
-    print(f"[OK] boundary={boundary_run_time} / TOP5% cut={cut:.2f} / rows={len(df_top)}")
+    print("[OK] boundary={} / TOP5% cut={:.2f} / rows={}".format(boundary_run_time, float(cut), len(df_top)))
 
     if len(df_top) == 0:
         raise RuntimeError("[ERROR] df_top이 비어있습니다. (run_time TOP5% 결과 없음)")
@@ -232,9 +318,9 @@ def run_once():
     # Cell X1) fct_detail 조회 + meta merge
     # -----------------------------
     barcodes = df_top["barcode_information"].dropna().astype(str).drop_duplicates().tolist()
-    print(f"[OK] Top barcodes = {len(barcodes)}")
+    print("[OK] Top barcodes = {}".format(len(barcodes)))
 
-    target_end_day_date = pd.to_datetime(TARGET_END_DAY_TEXT, format="%Y%m%d", errors="raise").strftime("%Y-%m-%d")
+    target_end_day_date = pd.to_datetime(use_end_day_text, format="%Y%m%d", errors="raise").strftime("%Y-%m-%d")
 
     SQL_FCT_DETAIL = text("""
     SELECT
@@ -256,6 +342,8 @@ def run_once():
         engine,
         params={"end_day": target_end_day_date, "remark": TARGET_REMARK, "barcodes": barcodes}
     )
+    if df_detail.empty:
+        raise RuntimeError("[ERROR] c1_fct_detail.fct_detail 조회 결과가 비어있습니다. end_day={}, remark={}".format(target_end_day_date, TARGET_REMARK))
 
     df_meta = df_top[["barcode_information", "station", "run_time", "boundary_run_time"]].copy()
     df_meta["barcode_information"] = df_meta["barcode_information"].astype(str)
@@ -264,12 +352,20 @@ def run_once():
     df_detail["barcode_information"] = df_detail["barcode_information"].astype(str)
     df_detail = df_detail.merge(df_meta, on="barcode_information", how="left")
 
+    # 컬럼 방어 (merge 실패시)
+    if "station" not in df_detail.columns:
+        df_detail["station"] = pd.NA
+    if "run_time" not in df_detail.columns:
+        df_detail["run_time"] = pd.NA
+    if "boundary_run_time" not in df_detail.columns:
+        df_detail["boundary_run_time"] = boundary_run_time
+
     df_detail = df_detail[[
         "barcode_information", "station", "remark", "end_day", "end_time",
         "run_time", "boundary_run_time", "contents", "test_ct", "test_time"
     ]].copy()
 
-    print(f"[OK] df_detail rows={len(df_detail)}")
+    print("[OK] df_detail rows={}".format(len(df_detail)))
 
     # -----------------------------
     # Cell X2) group 생성 + 제외 규칙 적용
@@ -281,7 +377,10 @@ def run_once():
     df2["end_day"] = pd.to_datetime(df2["end_day"], errors="coerce").dt.strftime("%Y-%m-%d")
     df2["end_time"] = df2["end_time"].astype(str)
 
-    df2["_test_ts"] = [parse_test_time_to_ts(d, t) for d, t in zip(df2["end_day"], df2["test_time"])]
+    # ✅ Nuitka 안정화: listcomp 제거 → apply + axis=1
+    def _mk_ts(row):
+        return parse_test_time_to_ts(row["end_day"], row["test_time"])
+    df2["_test_ts"] = df2.apply(_mk_ts, axis=1)
 
     df2["group_key"] = df2["barcode_information"] + "|" + df2["end_day"] + "|" + df2["end_time"]
     df2["group"] = pd.factorize(df2["group_key"], sort=False)[0] + 1
@@ -319,7 +418,7 @@ def run_once():
     df2 = df2.sort_values(["group", "_is_first_3_null", "_test_ts"], ascending=[True, False, True]).reset_index(drop=True)
     df2.drop(columns=["group_key"], inplace=True, errors="ignore")
 
-    print(f"[OK] df2 rows={len(df2)} / groups={df2['group'].nunique()}")
+    print("[OK] df2 rows={} / groups={}".format(len(df2), int(df2["group"].nunique())))
 
     # -----------------------------
     # Cell X3) from_to_test_ct (OK/NG만)
@@ -333,7 +432,7 @@ def run_once():
     mask = is_okng & df3["_test_ts"].notna() & df3["_base_ts"].notna()
     df3.loc[mask, "from_to_test_ct"] = (df3.loc[mask, "_test_ts"] - df3.loc[mask, "_base_ts"]).dt.total_seconds()
 
-    print(f"[OK] from_to_test_ct filled rows={df3['from_to_test_ct'].notna().sum()}")
+    print("[OK] from_to_test_ct filled rows={}".format(int(df3["from_to_test_ct"].notna().sum())))
 
     # -----------------------------
     # Cell X4) okng_seq + test_contents 매핑
@@ -383,7 +482,7 @@ def run_once():
         "test_contents", "test_ct", "from_to_test_ct", "okng_seq"
     ]].copy()
 
-    print(f"[OK] df_final rows={len(df_final)} / groups={df_final['group'].nunique()}")
+    print("[OK] df_final rows={} / groups={}".format(len(df_final), int(df_final["group"].nunique())))
 
     # -----------------------------
     # Cell X5) df15 (test_contents NA 제외)
@@ -407,12 +506,20 @@ def run_once():
       AND column_name IN ('problem1','problem2','problem3','problem4')
     ORDER BY column_name
     """)
-    present_problem_cols = pd.read_sql(SQL_PROBLEM_COLS, engine)["column_name"].tolist()
-    present_problem_cols = [c.strip() for c in present_problem_cols if isinstance(c, str)]
-    want_problem_cols = ["problem1","problem2","problem3","problem4"]
-    use_problem_cols = [c for c in want_problem_cols if c in present_problem_cols]
+    tmp_cols = pd.read_sql(SQL_PROBLEM_COLS, engine)
+    present_problem_cols: List[str] = []
+    if "column_name" in tmp_cols.columns:
+        for v in tmp_cols["column_name"].tolist():
+            if isinstance(v, str):
+                present_problem_cols.append(v.strip())
 
-    # end_day 컬럼 존재를 가정하고, 해당 day가 없으면 latest로 fallback
+    want_problem_cols = ["problem1","problem2","problem3","problem4"]
+    use_problem_cols: List[str] = []
+    for c in want_problem_cols:
+        if c in present_problem_cols:
+            use_problem_cols.append(c)
+
+    # end_day 해당이 없으면 latest로 fallback
     SQL_HAS_DAY = text("""
     SELECT COUNT(*) AS n
     FROM e4_predictive_maintenance.pd_cal_test_ct_summary
@@ -432,12 +539,16 @@ def run_once():
             raise RuntimeError("[ERROR] pd_cal_test_ct_summary 테이블이 비어있습니다.")
         summary_day = str(summary_day).strip()
 
-    select_cols = ["test_contents", "upper_outlier"] + use_problem_cols
-    SQL_BOUNDARY2 = text(f"""
-    SELECT {", ".join(select_cols)}
+    select_cols = ["test_contents", "upper_outlier"]
+    for c in use_problem_cols:
+        select_cols.append(c)
+
+    SQL_BOUNDARY2 = text("""
+    SELECT {cols}
     FROM e4_predictive_maintenance.pd_cal_test_ct_summary
     WHERE end_day = :end_day
-    """)
+    """.format(cols=", ".join(select_cols)))
+
     df_boundary = pd.read_sql(SQL_BOUNDARY2, engine, params={"end_day": summary_day})
     df_boundary["test_contents"] = df_boundary["test_contents"].astype(str).str.strip()
     df_boundary["upper_outlier"] = pd.to_numeric(df_boundary["upper_outlier"], errors="coerce")
@@ -447,7 +558,10 @@ def run_once():
     df15_out = df15.copy()
     df15_out["test_contents"] = df15_out["test_contents"].astype(str).str.strip()
 
-    join_cols = ["test_contents", "upper_outlier"] + use_problem_cols
+    join_cols = ["test_contents", "upper_outlier"]
+    for c in use_problem_cols:
+        join_cols.append(c)
+
     df15_out = df15_out.merge(df_boundary[join_cols], on="test_contents", how="left")
     df15_out = df15_out.rename(columns={"upper_outlier": "boundary_test_ct"})
 
@@ -478,7 +592,10 @@ def run_once():
     dfw = dfw.dropna(subset=["barcode_information","diff_ct","okng_seq"]).copy()
 
     n_all = len(dfw)
-    top_n = math.ceil(n_all * 0.05)
+    top_n = int(math.ceil(n_all * 0.05))
+    if top_n < 1:
+        top_n = 1
+
     df_top_raw = dfw.sort_values("diff_ct", ascending=False).head(top_n).copy()
 
     df_top_raw["min_okng"] = df_top_raw.groupby("barcode_information")["okng_seq"].transform("min")
@@ -490,7 +607,7 @@ def run_once():
         .reset_index(drop=True)
     )
 
-    print(f"[OK] diff_ct worst: 원본={n_all} → TOP5% raw={len(df_top_raw)} → 최종 rows={len(df_spike)}")
+    print("[OK] diff_ct worst: 원본={} → TOP5% raw={} → 최종 rows={}".format(n_all, len(df_top_raw), len(df_spike)))
 
     # -----------------------------
     # Cell X9) file_path 매칭
@@ -517,17 +634,21 @@ def run_once():
     """)
 
     df_fp = pd.read_sql(SQL_FILEPATH, engine, params={"barcodes": barcodes2, "days": days2})
-    df_fp["barcode_information"] = df_fp["barcode_information"].astype(str).str.strip()
-    df_fp["end_day"] = pd.to_datetime(df_fp["end_day"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df_fp["end_time"] = df_fp["end_time"].apply(norm_end_time)
-    df_fp["file_path"] = df_fp["file_path"].astype(str)
 
-    df_fp = (
-        df_fp.dropna(subset=["barcode_information","end_day","end_time"])
-             .sort_values(["barcode_information","end_day","end_time"])
-             .drop_duplicates(["barcode_information","end_day","end_time"], keep="first")
-             .reset_index(drop=True)
-    )
+    if not df_fp.empty:
+        df_fp["barcode_information"] = df_fp["barcode_information"].astype(str).str.strip()
+        df_fp["end_day"] = pd.to_datetime(df_fp["end_day"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df_fp["end_time"] = df_fp["end_time"].apply(norm_end_time)
+        df_fp["file_path"] = df_fp["file_path"].astype(str)
+
+        df_fp = (
+            df_fp.dropna(subset=["barcode_information","end_day","end_time"])
+                 .sort_values(["barcode_information","end_day","end_time"])
+                 .drop_duplicates(["barcode_information","end_day","end_time"], keep="first")
+                 .reset_index(drop=True)
+        )
+    else:
+        df_fp = pd.DataFrame(columns=["barcode_information","end_day","end_time","file_path"])
 
     df_spike_fp = df_spike.copy()
     df_spike_fp["barcode_information"] = df_spike_fp["barcode_information"].astype(str).str.strip()
@@ -539,13 +660,13 @@ def run_once():
         on=["barcode_information","end_day","end_time"],
         how="left"
     )
-    print(f"[OK] file_path filled={df_spike_fp['file_path'].notna().sum()} / rows={len(df_spike_fp)}")
+    print("[OK] file_path filled={} / rows={}".format(int(df_spike_fp["file_path"].notna().sum()), len(df_spike_fp)))
 
     # -----------------------------
     # Cell X10) DB 저장 (DDL + 동적 UPSERT + 실행시간 컬럼)
     #  - run_* 컬럼은 DF에 넣되, DB에 없으면 자동 제외(에러 방지)
     # -----------------------------
-    FULL_NAME = f"{TARGET_SCHEMA}.{TARGET_TABLE}"
+    FULL_NAME = "{}.{}".format(TARGET_SCHEMA, TARGET_TABLE)
     df_save = df_spike_fp.copy()
 
     # group -> group_no
@@ -554,7 +675,7 @@ def run_once():
     elif "group_no" not in df_save.columns:
         df_save["group_no"] = pd.NA
 
-    # (DF) 실행시간 컬럼 생성(저장 시 DB에 없으면 자동 제외됨)
+    # 실행시간 컬럼(저장 시 DB에 없으면 자동 제외됨)
     df_save["run_start_ts"] = run_start_dt
     df_save["run_end_ts"] = pd.NaT
     df_save["run_seconds"] = pd.NA
@@ -579,10 +700,10 @@ def run_once():
         df_save["file_path"] = pd.NA
 
     # 테이블 없으면 생성(신규 생성 시에는 run_* 컬럼 포함)
-    DDL = text(f"""
-    CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA};
+    DDL = text("""
+    CREATE SCHEMA IF NOT EXISTS {schema};
 
-    CREATE TABLE IF NOT EXISTS {FULL_NAME} (
+    CREATE TABLE IF NOT EXISTS {full} (
         group_no            integer,
         barcode_information text NOT NULL,
         station             text,
@@ -610,10 +731,8 @@ def run_once():
         updated_at          timestamp without time zone DEFAULT now(),
         PRIMARY KEY (barcode_information, end_day, end_time, test_contents, okng_seq)
     );
-    """)
+    """.format(schema=TARGET_SCHEMA, full=FULL_NAME))
 
-    # ✅ 고정 UPSERT를 여기서 만들지 않고,
-    #    실행 종료 시점에 "DB 실제 컬럼" 확인 후 동적으로 생성
     payload_for_save = {
         "DDL": DDL,
         "pk_cols": pk_cols,
@@ -626,26 +745,18 @@ def run_once():
         "run_start_perf": run_start_perf,
     }
 
-    # ---- 여기서 try는 끝, finally에서 종료 시간 찍고 저장 ----
     try:
         return
     finally:
         run_end_dt = datetime.now()
         run_seconds = round(time.perf_counter() - run_start_perf, 3)
 
-        print(f"[RUN] end_ts={run_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"[RUN] run_seconds={run_seconds:.3f}")
+        print("[RUN] end_ts={}".format(run_end_dt.strftime("%Y-%m-%d %H:%M:%S")))
+        print("[RUN] run_seconds={:.3f}".format(float(run_seconds)))
 
         df_save2 = payload_for_save["df_save"].copy()
         df_save2["run_end_ts"] = run_end_dt
         df_save2["run_seconds"] = float(run_seconds)
-
-        SQL_EXISTING_COLS = text("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = :schema
-          AND table_name   = :table
-        """)
 
         candidate_cols = [
             "group_no",
@@ -661,20 +772,19 @@ def run_once():
         with engine.begin() as conn:
             conn.execute(payload_for_save["DDL"])
 
-            existing_cols = set(
-                pd.read_sql(
-                    SQL_EXISTING_COLS,
-                    conn,
-                    params={"schema": payload_for_save["schema"], "table": payload_for_save["table"]}
-                )["column_name"].astype(str).tolist()
-            )
+            existing_cols_list = fetch_existing_cols(conn, payload_for_save["schema"], payload_for_save["table"])
+            existing_cols = set(existing_cols_list)
 
-            save_cols = [c for c in candidate_cols if (c in df_save2.columns and c in existing_cols)]
+            save_cols: List[str] = []
+            for c in candidate_cols:
+                if (c in df_save2.columns) and (c in existing_cols):
+                    save_cols.append(c)
 
             # PK 필수 체크
+            pk_cols = payload_for_save["pk_cols"]
             for c in pk_cols:
                 if c not in existing_cols:
-                    raise RuntimeError(f"[ERROR] DB 테이블에 PK 컬럼 '{c}' 가 없습니다. 테이블 스키마를 확인하세요.")
+                    raise RuntimeError("[ERROR] DB 테이블에 PK 컬럼 '{}' 가 없습니다. 테이블 스키마를 확인하세요.".format(c))
                 if c not in save_cols:
                     save_cols.append(c)
 
@@ -688,7 +798,7 @@ def run_once():
 
             conn.execute(UPSERT_SQL, rows)
 
-        print(f"[OK] Saved to {payload_for_save['full_name']} (rows={len(df_save2)}) / used_cols={len(save_cols)}")
+        print("[OK] Saved to {} (rows={}) / used_cols={}".format(payload_for_save["full_name"], len(df_save2), len(save_cols)))
 
 
 # ============================
@@ -702,20 +812,20 @@ def scheduler_loop():
 
         if is_run_time(now_dt):
             if last_state != "RUN":
-                print(f"[SCHED] enter RUN window @ {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("[SCHED] enter RUN window @ {}".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
                 last_state = "RUN"
 
             try:
                 run_once()
             except Exception as e:
                 # 윈도우 안에서 계속 돌려야 하므로 예외는 로그만 찍고 다음 tick에서 재시도
-                print(f"[ERROR] run_once failed: {repr(e)}")
+                print("[ERROR] run_once failed: {}".format(repr(e)))
 
             time.sleep(SLEEP_SECONDS)
 
         else:
             if last_state != "WAIT":
-                print(f"[SCHED] WAIT (outside windows) @ {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("[SCHED] WAIT (outside windows) @ {}".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
                 last_state = "WAIT"
 
             time.sleep(SLEEP_SECONDS)
