@@ -20,6 +20,11 @@ Nuitka 안정화(중요)
 [추가 통합 반영]
 1) TARGET_END_DAY를 "현재 날짜(YYYYMMDD)" 기준으로 자동 선택
 2) 만약 현재 날짜 데이터가 없으면, remark 기준 가장 최신 end_day로 fallback
+
+[추가 통합 반영 2]
+- updated_at은 "이 스크립트가 DB에 UPSERT를 실행한 시각(= DB 서버 now())" 로 저장
+  * INSERT 시에도 updated_at=now()
+  * UPDATE 시에도 updated_at=now()
 """
 
 import os
@@ -48,11 +53,11 @@ DB_CONFIG = {
 AUTO_PICK_END_DAY = True
 TARGET_END_DAY = None  # AUTO_PICK_END_DAY=False일 때만 직접 넣어서 사용
 
-TARGET_REMARK  = "Non-PD"     # a2_fct_table.fct_table 의 remark
+TARGET_REMARK = "Non-PD"  # a2_fct_table.fct_table 의 remark
 TEST_CONTENTS_KEY = "1.32_dark_curr_check"  # boundary source
 
 TARGET_SCHEMA = "e4_predictive_maintenance"
-TARGET_TABLE  = "non_pd_worst"
+TARGET_TABLE = "non_pd_worst"
 
 SAVE_HTML_REPORT = True
 REPORT_DIR = "./report_non_pd_worst"
@@ -61,7 +66,6 @@ MAX_PREVIEW_ROWS = 300
 # ============================
 # 스케줄 윈도우(매일)
 # ============================
-# - (start_h, start_m, start_s) ~ (end_h, end_m, end_s) inclusive
 RUN_WINDOWS = [
     ((8, 27, 0), (8, 29, 59)),
     ((20, 27, 0), (20, 29, 59)),
@@ -172,8 +176,8 @@ def _in_window(now_dt: datetime, start_hms, end_hms) -> bool:
     sh, sm, ss = start_hms
     eh, em, es = end_hms
     start_sec = sh * 3600 + sm * 60 + ss
-    end_sec   = eh * 3600 + em * 60 + es
-    now_sec   = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+    end_sec = eh * 3600 + em * 60 + es
+    now_sec = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
     return start_sec <= now_sec <= end_sec
 
 
@@ -197,11 +201,7 @@ def build_test_ts_series(end_day_series: pd.Series, test_time_series: pd.Series)
         return pd.Series([], dtype="datetime64[ns]")
 
     ed = end_day_series.astype(str)
-
-    # apply는 내부적으로 루프지만 listcomp를 만들지 않음
     tt = test_time_series.apply(norm_end_time)
-
-    # None -> <NA> 처리 후 결합
     tt2 = tt.astype("string")
     combo = ed + " " + tt2
     ts = pd.to_datetime(combo, errors="coerce")
@@ -257,6 +257,15 @@ def fetch_existing_cols(conn, schema: str, table: str) -> List[str]:
             if isinstance(v, str):
                 cols.append(v)
     return cols
+
+
+def filter_cols_excluding(cols: List[str], exclude: str) -> List[str]:
+    """Nuitka listcomp 회피용: cols에서 exclude를 뺀 리스트 생성"""
+    out: List[str] = []
+    for c in cols:
+        if c != exclude:
+            out.append(c)
+    return out
 
 
 # ============================
@@ -372,15 +381,9 @@ def run_once():
         df_top = df[df["run_time"] >= cut].copy()
         df_top = df_top.sort_values("run_time", ascending=False).reset_index(drop=True)
 
-        df_top = df_top[[
-            "barcode_information",
-            "remark",
-            "station",
-            "end_day",
-            "end_time",
-            "boundary_run_time",
-            "run_time"
-        ]]
+        df_top = df_top[
+            ["barcode_information", "remark", "station", "end_day", "end_time", "boundary_run_time", "run_time"]
+        ].copy()
 
         print("[OK] boundary={} / TOP5% cut={:.2f} / rows={}".format(boundary_run_time, float(cut), len(df_top)))
 
@@ -400,7 +403,9 @@ def run_once():
         TARGET_END_DAY_TEXT = str(df_top["end_day"].iloc[0]).strip()  # YYYYMMDD
         TARGET_END_DAY_DATE = pd.to_datetime(TARGET_END_DAY_TEXT, format="%Y%m%d", errors="raise").strftime("%Y-%m-%d")
         TARGET_REMARK2 = str(df_top["remark"].iloc[0]).strip() if "remark" in df_top.columns else TARGET_REMARK
-        print("[OK] TARGET_END_DAY_TEXT={} / TARGET_END_DAY_DATE={} / REMARK={}".format(TARGET_END_DAY_TEXT, TARGET_END_DAY_DATE, TARGET_REMARK2))
+        print("[OK] TARGET_END_DAY_TEXT={} / TARGET_END_DAY_DATE={} / REMARK={}".format(
+            TARGET_END_DAY_TEXT, TARGET_END_DAY_DATE, TARGET_REMARK2
+        ))
 
         SQL_FCT_DETAIL = text("""
         SELECT
@@ -434,7 +439,7 @@ def run_once():
         df_detail["barcode_information"] = df_detail["barcode_information"].astype(str)
         df_detail = df_detail.merge(df_meta, on="barcode_information", how="left")
 
-        # 컬럼 방어: station merge 실패시에도 에러 안 나도록
+        # 컬럼 방어
         if "station" not in df_detail.columns:
             df_detail["station"] = pd.NA
         if "run_time" not in df_detail.columns:
@@ -442,18 +447,10 @@ def run_once():
         if "boundary_run_time" not in df_detail.columns:
             df_detail["boundary_run_time"] = boundary_run_time
 
-        df_detail = df_detail[[
-            "barcode_information",
-            "station",
-            "remark",
-            "end_day",
-            "end_time",
-            "run_time",
-            "boundary_run_time",
-            "contents",
-            "test_ct",
-            "test_time"
-        ]].copy()
+        df_detail = df_detail[
+            ["barcode_information", "station", "remark", "end_day", "end_time", "run_time", "boundary_run_time",
+             "contents", "test_ct", "test_time"]
+        ].copy()
 
         print("[OK] df_detail rows={}".format(len(df_detail)))
 
@@ -533,25 +530,25 @@ def run_once():
         df4 = df3.copy()
 
         MAP_1_67 = {
-            1:"0.00_d_sig_val_090_set", 2:"0.00_load_a_cc_set", 3:"0.00_dmm_c_rng_set", 4:"0.00_load_c_cc_set",
-            5:"0.00_dmm_c_rng_set", 6:"0.00_dmm_regi_set", 7:"0.00_dmm_regi_ac_0.6_set",
-            8:"1.00_mini_b_short_check", 9:"1.01_usb_a_short_check", 10:"1.02_usb_c_short_check",
-            11:"1.03_d_sig_val_000_set", 12:"1.03_dmm_regi_set", 13:"1.03_dmm_regi_ac_0.6_set",
-            14:"1.03_pin12_short_check", 15:"1.04_pin23_short_check", 16:"1.05_pin34_short_check",
-            17:"1.06_dmm_dc_v_set", 18:"1.06_dmm_ac_0.6_set", 19:"1.06_dmm_c_set",
-            20:"1.06_load_a_sensing_on", 21:"1.06_load_c_sensing_on",
-            22:"1.06_ps_16.5v_set", 23:"1.06_ps_on", 24:"1.06_dmm_ac_0.6_set", 25:"1.06_input_16.5v",
-            26:"1.07_idle_c_check", 27:"1.08_fw_ver_check", 28:"1.09_chip_id_check",
-            29:"1.10_dmm_3c_rng_set", 30:"1.10_load_a_5.5c_set", 31:"1.10_load_a_on", 32:"1.10_usb_a_v_check",
-            33:"1.11_usb_a_c_check", 34:"1.12_usb_c_v_check", 35:"1.13_load_a_off", 36:"1.13_load_c_5.5c_set",
-            37:"1.13_load_c_on", 38:"1.13_overcurr_usb_c_v", 39:"1.14_overcurr_usb_c_c", 40:"1.15_usb_a_v",
-            41:"1.16_load_c_off", 42:"1.16_dut_reset", 43:"1.16_cc_aside_check", 44:"1.17_cc_bside_check",
-            45:"1.18_load_a_2.4c_set", 46:"1.18_load_c_3c_set", 47:"1.18_load_a_on", 48:"1.18_load_c_on",
-            49:"1.18_usb_a_v_check", 50:"1.19_usb_a_c_check", 51:"1.20_usb_c_v_check", 52:"1.21_usb_c_c_check",
-            53:"1.22_load_a_off", 54:"1.22_load_c_off", 55:"1.22_usb_c_carplay", 56:"1.23_usb_a_carplay",
-            57:"1.24_usb_c_pm1", 58:"1.25_usb_c_pm2", 59:"1.26_usb_c_pm3", 60:"1.27_usb_c_pm4",
-            61:"1.28_usb_a_pm1", 62:"1.29_usb_a_pm2", 63:"1.30_usb_a_pm3", 64:"1.31_usb_a_pm4",
-            65:"1.32_dmm_ac_0.6_set", 66:"1.32_dmm_c_rng_set", 67:"1.32_dark_curr_check"
+            1: "0.00_d_sig_val_090_set", 2: "0.00_load_a_cc_set", 3: "0.00_dmm_c_rng_set", 4: "0.00_load_c_cc_set",
+            5: "0.00_dmm_c_rng_set", 6: "0.00_dmm_regi_set", 7: "0.00_dmm_regi_ac_0.6_set",
+            8: "1.00_mini_b_short_check", 9: "1.01_usb_a_short_check", 10: "1.02_usb_c_short_check",
+            11: "1.03_d_sig_val_000_set", 12: "1.03_dmm_regi_set", 13: "1.03_dmm_regi_ac_0.6_set",
+            14: "1.03_pin12_short_check", 15: "1.04_pin23_short_check", 16: "1.05_pin34_short_check",
+            17: "1.06_dmm_dc_v_set", 18: "1.06_dmm_ac_0.6_set", 19: "1.06_dmm_c_set",
+            20: "1.06_load_a_sensing_on", 21: "1.06_load_c_sensing_on",
+            22: "1.06_ps_16.5v_set", 23: "1.06_ps_on", 24: "1.06_dmm_ac_0.6_set", 25: "1.06_input_16.5v",
+            26: "1.07_idle_c_check", 27: "1.08_fw_ver_check", 28: "1.09_chip_id_check",
+            29: "1.10_dmm_3c_rng_set", 30: "1.10_load_a_5.5c_set", 31: "1.10_load_a_on", 32: "1.10_usb_a_v_check",
+            33: "1.11_usb_a_c_check", 34: "1.12_usb_c_v_check", 35: "1.13_load_a_off", 36: "1.13_load_c_5.5c_set",
+            37: "1.13_load_c_on", 38: "1.13_overcurr_usb_c_v", 39: "1.14_overcurr_usb_c_c", 40: "1.15_usb_a_v",
+            41: "1.16_load_c_off", 42: "1.16_dut_reset", 43: "1.16_cc_aside_check", 44: "1.17_cc_bside_check",
+            45: "1.18_load_a_2.4c_set", 46: "1.18_load_c_3c_set", 47: "1.18_load_a_on", 48: "1.18_load_c_on",
+            49: "1.18_usb_a_v_check", 50: "1.19_usb_a_c_check", 51: "1.20_usb_c_v_check", 52: "1.21_usb_c_c_check",
+            53: "1.22_load_a_off", 54: "1.22_load_c_off", 55: "1.22_usb_c_carplay", 56: "1.23_usb_a_carplay",
+            57: "1.24_usb_c_pm1", 58: "1.25_usb_c_pm2", 59: "1.26_usb_c_pm3", 60: "1.27_usb_c_pm4",
+            61: "1.28_usb_a_pm1", 62: "1.29_usb_a_pm2", 63: "1.30_usb_a_pm3", 64: "1.31_usb_a_pm4",
+            65: "1.32_dmm_ac_0.6_set", 66: "1.32_dmm_c_rng_set", 67: "1.32_dark_curr_check"
         }
 
         is_okng2 = df4["contents"].astype(str).isin(["테스트 결과 : OK", "테스트 결과 : NG"])
@@ -567,19 +564,19 @@ def run_once():
         df4["test_contents"] = pd.NA
         df4.loc[is_okng2, "test_contents"] = df4.loc[is_okng2, "okng_seq"].map(MAP_1_67)
 
-        df_final = df4[[
-            "group","barcode_information","station","remark","end_day","end_time","run_time","boundary_run_time",
-            "test_time","contents","test_contents","test_ct","from_to_test_ct","okng_seq"
-        ]].copy()
+        df_final = df4[
+            ["group", "barcode_information", "station", "remark", "end_day", "end_time", "run_time", "boundary_run_time",
+             "test_time", "contents", "test_contents", "test_ct", "from_to_test_ct", "okng_seq"]
+        ].copy()
 
         # --------------------------------
         # Cell X5) df15
         # --------------------------------
         df15 = df_final.dropna(subset=["test_contents"]).copy()
-        df15 = df15[[
-            "group","barcode_information","station","remark","end_day","end_time","run_time","boundary_run_time",
-            "test_time","test_contents","from_to_test_ct","okng_seq"
-        ]].reset_index(drop=True)
+        df15 = df15[
+            ["group", "barcode_information", "station", "remark", "end_day", "end_time", "run_time", "boundary_run_time",
+             "test_time", "test_contents", "from_to_test_ct", "okng_seq"]
+        ].reset_index(drop=True)
 
         # --------------------------------
         # Cell X6) boundary_test_ct + problem1~4 JOIN
@@ -587,7 +584,7 @@ def run_once():
         TARGET_END_DAY_X6 = str(df15["end_day"].dropna().iloc[0]).strip()
 
         present_problem_cols = get_present_problem_cols(engine)
-        want_problem_cols = ["problem1","problem2","problem3","problem4"]
+        want_problem_cols = ["problem1", "problem2", "problem3", "problem4"]
         use_problem_cols: List[str] = []
         for c in want_problem_cols:
             if c in present_problem_cols:
@@ -642,7 +639,7 @@ def run_once():
             if c not in df15_out.columns:
                 df15_out[c] = pd.NA
 
-        for c in ["run_time","boundary_run_time","from_to_test_ct","boundary_test_ct"]:
+        for c in ["run_time", "boundary_run_time", "from_to_test_ct", "boundary_test_ct"]:
             if c in df15_out.columns:
                 df15_out[c] = pd.to_numeric(df15_out[c], errors="coerce").round(2)
 
@@ -650,20 +647,20 @@ def run_once():
         # Cell X7) diff_ct
         # --------------------------------
         df15_out["boundary_test_ct"] = pd.to_numeric(df15_out["boundary_test_ct"], errors="coerce")
-        df15_out["from_to_test_ct"]  = pd.to_numeric(df15_out["from_to_test_ct"], errors="coerce")
+        df15_out["from_to_test_ct"] = pd.to_numeric(df15_out["from_to_test_ct"], errors="coerce")
         df15_out["diff_ct"] = df15_out["from_to_test_ct"] - df15_out["boundary_test_ct"]
 
-        df15_out2 = df15_out[[
-            "group","barcode_information","station","remark","end_day","end_time","run_time","boundary_run_time",
-            "okng_seq","test_contents","test_time","from_to_test_ct",
-            "boundary_test_ct","diff_ct","problem1","problem2","problem3","problem4"
-        ]].copy()
+        df15_out2 = df15_out[
+            ["group", "barcode_information", "station", "remark", "end_day", "end_time", "run_time", "boundary_run_time",
+             "okng_seq", "test_contents", "test_time", "from_to_test_ct",
+             "boundary_test_ct", "diff_ct", "problem1", "problem2", "problem3", "problem4"]
+        ].copy()
 
         # --------------------------------
         # Cell X8) 바코드 대표행 기준 diff_ct TOP5%
         # --------------------------------
         df_spike = df15_out2.copy()
-        df_spike["diff_ct"]  = pd.to_numeric(df_spike["diff_ct"], errors="coerce")
+        df_spike["diff_ct"] = pd.to_numeric(df_spike["diff_ct"], errors="coerce")
         df_spike["run_time"] = pd.to_numeric(df_spike["run_time"], errors="coerce")
         df_spike["okng_seq"] = pd.to_numeric(df_spike["okng_seq"], errors="coerce")
         df_spike = df_spike.dropna(subset=["barcode_information", "okng_seq", "diff_ct"]).copy()
@@ -753,6 +750,7 @@ def run_once():
         df_save["run_start_ts"] = run_start_dt
         df_save["run_end_ts"] = pd.NaT
         df_save["run_seconds"] = pd.NA
+        # ✅ updated_at은 DB now()로 주입 (PC시간 혼입 방지)
 
         pk_cols = ["barcode_information", "end_day", "end_time", "test_contents", "okng_seq"]
         missing_pk = []
@@ -769,12 +767,12 @@ def run_once():
         df_save["test_contents"] = df_save["test_contents"].astype(str).str.strip()
         df_save["okng_seq"] = pd.to_numeric(df_save["okng_seq"], errors="coerce").astype("Int64")
 
-        num_cols = ["run_time","boundary_run_time","from_to_test_ct","boundary_test_ct","diff_ct","run_seconds"]
+        num_cols = ["run_time", "boundary_run_time", "from_to_test_ct", "boundary_test_ct", "diff_ct", "run_seconds"]
         for c in num_cols:
             if c in df_save.columns:
                 df_save[c] = pd.to_numeric(df_save[c], errors="coerce")
 
-        prob_cols = ["problem1","problem2","problem3","problem4"]
+        prob_cols = ["problem1", "problem2", "problem3", "problem4"]
         for c in prob_cols:
             if c not in df_save.columns:
                 df_save[c] = pd.NA
@@ -824,8 +822,6 @@ def run_once():
             "table": TARGET_TABLE,
         }
 
-        payload_for_save = payload_for_save
-
     finally:
         run_end_dt = datetime.now()
         run_seconds = round(time.perf_counter() - run_start_perf, 3)
@@ -859,13 +855,18 @@ def run_once():
                 "from_to_test_ct", "boundary_test_ct", "diff_ct",
                 "problem1", "problem2", "problem3", "problem4",
                 "file_path",
-                "run_start_ts", "run_end_ts", "run_seconds"
+                "run_start_ts", "run_end_ts", "run_seconds",
+                "updated_at",
             ]
 
             save_cols: List[str] = []
             for c in candidate_cols:
-                if (c in df_save2.columns) and (c in existing_cols):
-                    save_cols.append(c)
+                if c == "updated_at":
+                    if c in existing_cols:
+                        save_cols.append(c)
+                else:
+                    if (c in df_save2.columns) and (c in existing_cols):
+                        save_cols.append(c)
 
             pk_cols = payload_for_save["pk_cols"]
             for c in pk_cols:
@@ -876,9 +877,13 @@ def run_once():
 
             insert_cols_sql = ", ".join(save_cols)
 
+            # ✅ values에서 updated_at만 DB now()로 강제 (파라미터 바인딩 아님)
             values_parts: List[str] = []
             for c in save_cols:
-                values_parts.append(":{}".format(c))
+                if c == "updated_at":
+                    values_parts.append("now()")
+                else:
+                    values_parts.append(":{}".format(c))
             values_sql = ", ".join(values_parts)
 
             conflict_cols = "barcode_information, end_day, end_time, test_contents, okng_seq"
@@ -890,8 +895,14 @@ def run_once():
 
             set_parts: List[str] = []
             for c in set_cols:
-                set_parts.append("{} = EXCLUDED.{}".format(c, c))
-            set_parts.append("updated_at = now()")
+                if c == "updated_at":
+                    set_parts.append("updated_at = now()")
+                else:
+                    set_parts.append("{c} = EXCLUDED.{c}".format(c=c))
+
+            if "updated_at" not in save_cols:
+                set_parts.append("updated_at = now()")
+
             set_sql = ", ".join(set_parts)
 
             UPSERT_SQL = text("""
@@ -907,7 +918,12 @@ def run_once():
                 set_sql=set_sql
             ))
 
-            rows = df_save2[save_cols].to_dict(orient="records")
+            # ============================
+            # ✅ 여기가 핵심 수정: listcomp 제거
+            # ============================
+            cols_wo_updated = filter_cols_excluding(save_cols, "updated_at")
+            rows = df_save2[cols_wo_updated].to_dict(orient="records")
+
             # NaN -> None
             for r in rows:
                 for k, v in list(r.items()):
@@ -916,7 +932,9 @@ def run_once():
 
             conn.execute(UPSERT_SQL, rows)
 
-        print("[OK] Saved to {} (rows={}) / used_cols={}".format(payload_for_save["full_name"], len(df_save2), len(save_cols)))
+        print("[OK] Saved to {} (rows={}) / used_cols={}".format(
+            payload_for_save["full_name"], len(df_save2), len(save_cols)
+        ))
 
         if SAVE_HTML_REPORT:
             print("[OK] HTML report saved: {}".format(os.path.abspath(REPORT_DIR)))
@@ -940,7 +958,6 @@ def scheduler_loop():
             try:
                 run_once()
             except Exception as e:
-                # 윈도우 안에서 계속 돌려야 하므로 예외는 로그만 찍고 다음 tick에서 재시도
                 print("[ERROR] run_once failed: {}".format(repr(e)))
 
             time.sleep(SLEEP_SECONDS)

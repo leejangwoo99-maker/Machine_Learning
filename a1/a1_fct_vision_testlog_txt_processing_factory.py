@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
+import os
+
+# ✅ (중요) psycopg2/libpq가 뿜는 에러 메시지 인코딩 때문에 EXE에서 UnicodeDecodeError가 나는 경우 방지
+# - DB 연결이 실패할 때(접속불가/인증실패/방화벽 등) 실제 원인 메시지를 UTF-8로 안전하게 출력하도록 강제
+os.environ.setdefault("PGCLIENTENCODING", "UTF8")
+os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
+
 from pathlib import Path
 from datetime import datetime
 import time
 import multiprocessing as mp
+import traceback
 
 import psycopg2
 from psycopg2.extras import execute_batch
+
 
 # ============================================
 # 0. 공장 전용 설정 (고정)
@@ -38,6 +47,52 @@ SCHEMA_DETAIL = "a1_fct_vision_testlog_txt_processing_result_detail"
 
 REALTIME_WINDOW_SEC = 120
 MP_PROCESSES = 2
+
+# ✅ EXE 실행 시 문제 추적용 로그 파일(같은 폴더에 생성)
+LOG_FILE = Path(__file__).with_name("a1_fct_vision_testlog_txt_processing_factory.log")
+
+
+# ============================================
+# 0-1. 콘솔 HOLD + 로깅 유틸
+# ============================================
+def log_print(msg: str) -> None:
+    """
+    콘솔 출력 + 파일 로그 동시 기록
+    """
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        LOG_FILE.write_text(
+            (LOG_FILE.read_text(encoding="utf-8", errors="ignore") if LOG_FILE.exists() else "")
+            + f"[{ts}] {msg}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def hold_console(exit_code: int) -> None:
+    """
+    ✅ EXE 더블클릭 실행 시 에러가 나도 콘솔이 닫히지 않도록 대기
+    """
+    try:
+        log_print("\n" + "=" * 70)
+        log_print(f"[HOLD] exit_code={exit_code}")
+        log_print(f"[HOLD] 로그 파일: {LOG_FILE}")
+        log_print("[HOLD] 콘솔을 닫으려면 Enter를 누르세요...")
+        log_print("=" * 70)
+        input()
+    except EOFError:
+        # 파이프/리다이렉션 환경이면 input 불가 -> 잠깐 대기
+        time.sleep(10)
+    except Exception:
+        try:
+            time.sleep(10)
+        except Exception:
+            pass
 
 
 # ============================================
@@ -119,7 +174,7 @@ def load_processed_paths_today(conn, end_day_today: str):
         FROM {SCHEMA_HISTORY}.{TABLE_HISTORY}
         WHERE end_day = %s;
         """,
-        (end_day_today,)
+        (end_day_today,),
     )
     rows = cur.fetchall()
     cur.close()
@@ -162,8 +217,6 @@ def insert_history_rows(conn, rows):
         ],
         page_size=1000,
     )
-    # rowcount는 execute_batch에서 신뢰도가 떨어질 수 있어, 커밋 후 len(rows) 그대로 반환하지 않습니다.
-    # 여기서는 삽입 시도 건수 반환(로그용)으로 둡니다.
     conn.commit()
     cur.close()
     return len(rows)
@@ -292,8 +345,8 @@ def run_once():
 
     today_yyyymmdd = datetime.now().strftime("%Y%m%d")  # 오늘 날짜(end_day)
 
-    print("\n==================== run_once 시작 ====================")
-    print(f"시각: {started_at} / end_day(today)={today_yyyymmdd} / window={REALTIME_WINDOW_SEC}s")
+    log_print("\n==================== run_once 시작 ====================")
+    log_print(f"시각: {started_at} / end_day(today)={today_yyyymmdd} / window={REALTIME_WINDOW_SEC}s")
 
     conn = get_connection()
     try:
@@ -301,7 +354,7 @@ def run_once():
 
         # (변경) 오늘 end_day 기준 file_path만 로드
         processed_paths = load_processed_paths_today(conn, today_yyyymmdd)
-        print(f"[이력] 오늘(end_day={today_yyyymmdd}) 처리된 file_path 수 : {len(processed_paths)}")
+        log_print(f"[이력] 오늘(end_day={today_yyyymmdd}) 처리된 file_path 수 : {len(processed_paths)}")
 
         file_infos = []
         total_scanned = 0
@@ -312,7 +365,7 @@ def run_once():
         for mid in MIDDLE_FOLDERS:
             mid_path = BASE_LOG_DIR / mid
             if not mid_path.exists():
-                print(f"[SKIP] {mid_path} 없음")
+                log_print(f"[SKIP] {mid_path} 없음")
                 continue
 
             # 오늘 날짜 폴더만
@@ -355,24 +408,24 @@ def run_once():
                     seen_paths_this_run.add(file_path_str)
                     file_infos.append((file_path_str, mid, folder_date, gb))
 
-        print(f"[스캔] 전체 스캔 파일 수(오늘 폴더 내): {total_scanned}")
-        print(f"[스캔] 이번 실행에서 새로 처리할 파일 수(120초 이내): {len(file_infos)}")
+        log_print(f"[스캔] 전체 스캔 파일 수(오늘 폴더 내): {total_scanned}")
+        log_print(f"[스캔] 이번 실행에서 새로 처리할 파일 수(120초 이내): {len(file_infos)}")
 
         if not file_infos:
-            print("[정보] 새로 처리할 파일이 없습니다.")
+            log_print("[정보] 새로 처리할 파일이 없습니다.")
             return
 
-        print(f"[멀티프로세스] 사용 프로세스 수: {MP_PROCESSES}")
+        log_print(f"[멀티프로세스] 사용 프로세스 수: {MP_PROCESSES}")
 
         with mp.Pool(processes=MP_PROCESSES) as pool:
             history_rows = pool.map(process_one_file, file_infos)
 
         n_try = insert_history_rows(conn, history_rows)
-        print(f"[DB] history INSERT 시도 건수 : {n_try} (중복은 DB에서 자동 무시)")
+        log_print(f"[DB] history INSERT 시도 건수 : {n_try} (중복은 DB에서 자동 무시)")
 
     finally:
         conn.close()
-        print("==================== run_once 종료 ====================")
+        log_print("==================== run_once 종료 ====================")
 
 
 # ============================================
@@ -380,9 +433,23 @@ def run_once():
 # ============================================
 if __name__ == "__main__":
     mp.freeze_support()
+    exit_code = 0
     try:
         while True:
             run_once()
             time.sleep(1)
+
     except KeyboardInterrupt:
-        print("\n사용자에 의해 중단되었습니다. 프로그램을 종료합니다.")
+        log_print("\n[ABORT] 사용자에 의해 중단되었습니다. 프로그램을 종료합니다.")
+        exit_code = 130
+
+    except Exception as e:
+        # ✅ 어떤 예외든 콘솔 닫히기 전에 로그/출력 남기기
+        log_print("\n[ERROR] Unhandled exception: " + repr(e))
+        log_print(traceback.format_exc())
+        exit_code = 1
+
+    finally:
+        # ✅ EXE 더블클릭 시 콘솔 자동 종료 방지
+        hold_console(exit_code)
+        raise SystemExit(exit_code)
