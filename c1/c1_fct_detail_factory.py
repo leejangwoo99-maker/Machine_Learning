@@ -4,14 +4,17 @@ c1_fct_detail_loader_realtime.py
 ============================================
 FCT Detail TXT Parser -> PostgreSQL 적재 (Realtime Loop)
 
-중복방지(요청 반영):
-- fct_table 구조상 UNIQUE(file_path)는 불가능하므로,
-  ✅ SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별합니다.
-  (in-memory set + insert 후 set 갱신, 자정/주기적 재로딩)
+[요청 반영 변경점]
+1) ✅ "오늘 폴더(YYYY/MM/DD)"만 스캔 (UNC 환경 성능/반응성 개선)
+2) ✅ 중복방지: file_path가 같다면 처리하지 않고 pass
+   - 기동 시: DB에서 "오늘 end_day" 기준 DISTINCT file_path 로딩(기존 유지)
+   - 루프 중: in-memory set(existing)로만 빠르게 dedup
+   - 주기적 DB 재로딩(기존 유지)
 
 기타 사양은 기존 그대로 유지:
-- remark strict(PD/Non-PD만), test_ct 자정 음수 보정, yyyy/mm/dd 스캔,
-  end_time 반올림, end_day 보정, MP=2, 1초 loop, mtime 60초, end_day==today만 적재
+- remark strict(PD/Non-PD만), test_ct 자정 음수 보정,
+  end_time 반올림, end_day 보정, MP=2, 1초 loop,
+  mtime 60초, end_day==today만 적재
 """
 
 import re
@@ -27,7 +30,7 @@ from psycopg2.extras import execute_values
 # =========================
 # 0) 설정
 # =========================
-BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")  # 루트 (YYYY/MM 구조)
+BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")  # 루트 (YYYY/MM/DD 구조)
 
 DB_CONFIG = {
     "host": "192.168.108.162",
@@ -48,9 +51,6 @@ LOOP_SLEEP_SEC = 1
 
 # 멀티프로세스 고정
 MP_PROCESSES = 2
-
-# ✅ 오늘 기준 DISTINCT file_path 재로딩 주기(루프 횟수)
-DB_RELOAD_EVERY_LOOPS = 120  # 약 2분(1초 루프)
 
 # 라인 패턴: [hh:mm:ss.ss] 내용
 LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{1,3})\]\s(.+)$")
@@ -107,7 +107,6 @@ def _ensure_schema_and_table():
 
 def _load_existing_file_paths_today(today: date) -> set:
     """
-    ✅ fct_table 구조상 UNIQUE(file_path)는 불가능하므로,
     ✅ SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별합니다.
     """
     sql = f"""
@@ -256,29 +255,33 @@ def _parse_one_file_only_today(file_path_str: str):
     return file_path_str, rows, "OK"
 
 # =========================
-# 3) 스캔: yyyy/mm/dd 형식만 + 실시간(mtime 60초)
+# 3) 스캔: ✅ 오늘 폴더만 + 실시간(mtime 60초)
 # =========================
-def _iter_valid_month_folders(base: Path):
-    for y in sorted([p for p in base.iterdir() if p.is_dir() and YEAR_RE.match(p.name)]):
-        for m in sorted([p for p in y.iterdir() if p.is_dir() and MONTH_RE.match(p.name)]):
-            yield m
-
-def _collect_realtime_files(base: Path, cutoff_ts: float) -> list[str]:
+def _collect_realtime_files_today_only(base: Path, cutoff_ts: float, today: date) -> list[str]:
     """
+    ✅ 오늘(YYYY/MM/DD) 폴더만 대상으로
     cutoff_ts 이후 mtime 변경이 있는 txt만 수집
     """
     targets = []
-    for month_dir in _iter_valid_month_folders(base):
-        day_dirs = [d for d in month_dir.iterdir() if d.is_dir() and DAY_RE.match(d.name)]
-        for dd in day_dirs:
-            for fp in dd.rglob("*.txt"):
-                if not fp.is_file():
-                    continue
-                try:
-                    if fp.stat().st_mtime >= cutoff_ts:
-                        targets.append(str(fp))
-                except Exception:
-                    continue
+
+    y = f"{today.year:04d}"
+    m = f"{today.month:02d}"
+    d = f"{today.day:02d}"
+
+    today_dir = base / y / m / d
+    if not today_dir.exists():
+        return targets
+
+    # 오늘 폴더(하위 포함)만 탐색
+    for fp in today_dir.rglob("*.txt"):
+        if not fp.is_file():
+            continue
+        try:
+            if fp.stat().st_mtime >= cutoff_ts:
+                targets.append(str(fp))
+        except Exception:
+            continue
+
     return targets
 
 # =========================
@@ -303,6 +306,7 @@ def _insert_rows(rows: list[tuple]) -> int:
 # =========================
 def main():
     print(f"[INFO] Connection String: {_conn_str(DB_CONFIG)}")
+    print(f"[INFO] BASE_DIR={BASE_DIR}")
     _ensure_schema_and_table()
     print(f"[INFO] Table ensured: {SCHEMA_NAME}.{TABLE_NAME}")
 
@@ -314,8 +318,8 @@ def main():
     chunksize = 10
     print(f"[INFO] Multiprocessing fixed: processes={MP_PROCESSES}, chunksize={chunksize}")
     print(f"[INFO] Realtime window: mtime within {MTIME_WINDOW_SEC}s, loop every {LOOP_SLEEP_SEC}s")
-    print(f"[INFO] Only insert rows where end_day == today")
-    print(f"[INFO] Dedup by: SELECT DISTINCT file_path WHERE end_day=today (in-memory set cached)")
+    print(f"[INFO] Only scan today folder (YYYY/MM/DD) + only insert rows where end_day == today")
+    print(f"[INFO] Dedup: if file_path already in today's set -> PASS")
 
     total_inserted = 0
     loop_count = 0
@@ -331,20 +335,19 @@ def main():
                 existing = _load_existing_file_paths_today(current_day)
                 print(f"[DAY-CHANGE] reload existing for {current_day} -> {len(existing):,}")
 
-            # ✅ 주기적 재동기화(다른 프로세스 적재/재시작 반영)
-            if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
-                existing = _load_existing_file_paths_today(current_day)
-                print(f"[DB-RELOAD] existing_today({current_day})={len(existing):,}")
-
             now_ts = time_mod.time()
             cutoff_ts = now_ts - MTIME_WINDOW_SEC
 
-            candidate_files = _collect_realtime_files(BASE_DIR, cutoff_ts)
+            # ✅ 오늘 폴더만 스캔
+            candidate_files = _collect_realtime_files_today_only(BASE_DIR, cutoff_ts, current_day)
 
-            # ✅ 중복방지: 오늘 end_day 기준으로 이미 적재된 file_path는 제외
+            # ✅ 중복방지: file_path가 같다면 처리하지 않고 pass
             new_files = [f for f in candidate_files if f not in existing]
 
             if not new_files:
+                # (선택) 30초마다 상태 출력이 필요하면 주석 해제
+                # if (loop_count % 30) == 0:
+                #     print(f"[DBG] no_new_files | candidates={len(candidate_files):,} existing_today={len(existing):,}")
                 time_mod.sleep(LOOP_SLEEP_SEC)
                 continue
 
@@ -364,8 +367,7 @@ def main():
                     if status == "OK":
                         parsed_rows_all.extend(rows)
 
-                        # ✅ insert 후 중복방지: file 단위로 set 갱신
-                        # (동일 loop 내 재처리 방지 + 다음 loop에서도 빠르게 스킵)
+                        # ✅ 성공 처리한 file_path는 set에 추가해서 다음 loop에서 PASS
                         existing.add(file_path_str)
                     else:
                         if status == "SKIP_REMARK":

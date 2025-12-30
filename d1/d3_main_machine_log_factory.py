@@ -7,10 +7,13 @@
 # - end_day는 파일명(YYYYMMDD) 기준으로만 저장
 # - 오늘 파일(YYYYMMDD==오늘)만 처리
 # - (end_day, station, end_time, contents) 중복 방지 (UNIQUE INDEX + ON CONFLICT DO NOTHING)
-# - 현재시간 기준 120초 이내 새롭게 추가/수정된 파일만 처리(mtime 기준)
+# - ❌ 현재시간 기준 120초 이내 새롭게 추가/수정된 파일만 처리(mtime 기준)  -> 제거
+# - ✅ 하루 1개 파일이 계속 append 되는 구조에 맞게
+#      "offset(tell/seek) 기반 tail-follow"로 신규 라인만 적재
 # ============================================
 
 import re
+import os
 import time as time_mod
 from pathlib import Path
 from datetime import datetime
@@ -45,11 +48,10 @@ FILE_PATTERN = re.compile(r"(\d{8})_Main_Machine_Log\.txt$", re.IGNORECASE)
 # =========================
 N_PROCESSES = 2
 POOL_CHUNKSIZE = 10
-REALTIME_WINDOW_SEC = 120
 SLEEP_SEC = 1
 
-# 처리 캐시 (path -> mtime)
-PROCESSED_MTIME = {}
+# ✅ 처리 캐시 (path -> 마지막 읽은 파일 byte offset)
+PROCESSED_OFFSET = {}
 
 
 # =========================
@@ -92,29 +94,47 @@ def ensure_schema_table(engine):
 
 
 # =========================
-# 4. 파일 파싱 (워커)
+# 4. 파일 파싱 (워커) - TAIL FOLLOW
 # =========================
-def parse_main_log_file(path_str: str):
+def parse_main_log_file(args):
     """
     - end_day: 파일명 YYYYMMDD 그대로
     - end_time: 라인에서 추출한 time_str
     - 오늘 파일(YYYYMMDD==오늘)만 처리
+    - ✅ offset 기반: 마지막 읽은 위치 이후 신규 라인만 파싱
     """
+    path_str, start_offset = args
     file_path = Path(path_str)
+
     m = FILE_PATTERN.search(file_path.name)
     if not m:
-        return []
+        return path_str, start_offset, []
 
     file_ymd = m.group(1)
     today_ymd = datetime.now().strftime("%Y%m%d")
 
     # 오늘 파일만
     if file_ymd != today_ymd:
-        return []
+        return path_str, start_offset, []
+
+    # 파일이 truncate/재생성 된 경우 대비: offset > size 이면 0으로 리셋
+    try:
+        size = file_path.stat().st_size
+    except Exception:
+        return path_str, start_offset, []
+
+    if start_offset > size:
+        start_offset = 0
+
+    # 읽을 게 없으면 그대로 리턴
+    if start_offset == size:
+        return path_str, start_offset, []
 
     rows = []
     try:
         with open(file_path, "r", encoding="cp949", errors="ignore") as f:
+            f.seek(start_offset, os.SEEK_SET)
+
             for line in f:
                 line = line.rstrip()
                 mm = LINE_PATTERN.match(line)
@@ -134,25 +154,31 @@ def parse_main_log_file(path_str: str):
                 rows.append({
                     "end_day": file_ymd,
                     "station": "Main",
-                    "end_time": end_time_str,   # time -> end_time
+                    "end_time": end_time_str,
                     "contents": contents,
                 })
-    except Exception:
-        return []
 
-    return rows
+            new_offset = f.tell()
+
+    except Exception:
+        return path_str, start_offset, []
+
+    return path_str, new_offset, rows
 
 
 # =========================
-# 5. 실시간 대상 파일 수집
+# 5. 실시간 대상 파일 수집 (✅ mtime 필터 제거)
 # =========================
 def list_target_files_realtime(base_dir: Path):
+    """
+    - 기존: 120초 mtime 필터로 '최근 변경 파일'만
+    - 변경: 오늘 파일만 수집 (하루 1개 파일 append 구조)
+    """
     targets = []
     if not base_dir.exists():
         print("[WARN] BASE_DIR not found:", base_dir)
         return targets
 
-    cutoff_ts = time_mod.time() - REALTIME_WINDOW_SEC
     today_ymd = datetime.now().strftime("%Y%m%d")
 
     for year_dir in base_dir.iterdir():
@@ -167,27 +193,14 @@ def list_target_files_realtime(base_dir: Path):
                 if not (fp.is_file() and FILE_PATTERN.search(fp.name)):
                     continue
 
-                # 오늘 파일만
                 m = FILE_PATTERN.search(fp.name)
                 if not m or m.group(1) != today_ymd:
                     continue
 
-                try:
-                    mtime = fp.stat().st_mtime
-                except OSError:
-                    continue
-
-                if mtime < cutoff_ts:
-                    continue
-
-                fp_str = str(fp)
-                if mtime <= PROCESSED_MTIME.get(fp_str, 0):
-                    continue
-
-                targets.append(fp_str)
+                targets.append(str(fp))
 
     if targets:
-        print(f"[INFO] Realtime target files: {len(targets)}")
+        print(f"[INFO] Today target files: {len(targets)}")
 
     return targets
 
@@ -229,18 +242,27 @@ def main():
                 time_mod.sleep(SLEEP_SEC)
                 continue
 
-            # 캐시 선반영
+            # ✅ 캐시 선반영(원본 정책 유지) -> offset 정책으로 유지
+            # - 파일이 새로 발견되면 offset=0에서 시작
+            # - 이미 있던 파일이면 이전 offset부터 이어서 읽음
+            tasks = []
             for fp in files:
-                try:
-                    PROCESSED_MTIME[fp] = Path(fp).stat().st_mtime
-                except OSError:
-                    PROCESSED_MTIME[fp] = time_mod.time()
+                tasks.append((fp, int(PROCESSED_OFFSET.get(fp, 0))))
 
             all_rows = []
-            with Pool(processes=min(N_PROCESSES, len(files))) as pool:
-                for rows in pool.imap_unordered(parse_main_log_file, files, chunksize=POOL_CHUNKSIZE):
+            new_offsets = {}
+
+            # ✅ 기존 MP 구조 유지: Pool + imap_unordered + chunksize
+            with Pool(processes=min(N_PROCESSES, len(tasks))) as pool:
+                for path_str, offset_after, rows in pool.imap_unordered(
+                    parse_main_log_file, tasks, chunksize=POOL_CHUNKSIZE
+                ):
+                    new_offsets[path_str] = int(offset_after)
                     if rows:
                         all_rows.extend(rows)
+
+            # ✅ offset 캐시 갱신
+            PROCESSED_OFFSET.update(new_offsets)
 
             if all_rows:
                 df = pd.DataFrame(all_rows)

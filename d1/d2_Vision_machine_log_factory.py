@@ -3,20 +3,25 @@
 # d2_Vision_machine_log_factory.py
 # Vision Machine Log Parser (Realtime + Thread2 + TodayOnly) - OPTION A (DB가 중복 영구 차단)
 #
-# 전제(사용자 수행 완료):
-# - 아래 UNIQUE INDEX를 DB에 이미 생성함
-#   ux_vision1_machine_log_dedup on d1_machine_log."Vision1_machine_log"(end_day, station, end_time, contents)
-#   ux_vision2_machine_log_dedup on d1_machine_log."Vision2_machine_log"(end_day, station, end_time, contents)
-#
-# 동작:
+# [기존 기능 유지]
 # - 오늘 파일만 파싱
-# - 실시간 120초 내 새로 변경된 파일만 파싱
+# - 스레드 2개 고정
 # - INSERT는 ON CONFLICT DO NOTHING => 중복은 무조건 "조용히 무시"
 # - 어떤 상황에서도 프로세스가 멈추지 않도록(예외는 로그만 찍고 continue)
+# - INIT(스키마/테이블) 실패 시 재시도
+# - 날짜 변경 시 캐시 초기화
+# - loop pacing (SLEEP_SEC - elapsed)
+# - LOG_EVERY_LOOP 주기적 요약 로그
+#
+# [요청 반영 변경]
+# - ❌ 120초(mtime) 조건 제거
+# - ✅ 하루 1개 파일이 계속 append 되는 구조이므로,
+#      "offset 기반 tail-follow"로 신규 라인만 처리 (파일 전체 재파싱 제거)
 # ============================================
 
 import re
 import sys
+import os
 import time as time_mod
 from pathlib import Path
 from datetime import datetime
@@ -51,12 +56,11 @@ TABLE_MAP = {
 # 스레드 2개 고정
 THREAD_WORKERS = 2
 
-# 실시간 120초 이내 신규/수정 파일만
-REALTIME_WINDOW_SEC = 120
+# 1초 루프
 SLEEP_SEC = 1
 
-# 처리 캐시: path -> last_mtime
-PROCESSED_MTIME = {}
+# ✅ offset 캐시: path -> 마지막 읽은 파일 byte 위치
+PROCESSED_OFFSET = {}
 
 # 콘솔 로그 주기(너무 많은 출력 방지)
 LOG_EVERY_LOOP = 10  # 10회(=약 10초)마다 한번 요약 로그
@@ -105,8 +109,6 @@ def ensure_schema_tables(engine):
     """
     - 스키마/테이블만 보장
     - UNIQUE INDEX는 사용자가 이미 만들었으므로 여기서는 만들지 않음
-      (만들어도 되지만, 인덱스 생성은 중복 상태에 따라 실패할 수 있어
-       운영 중엔 '이미 생성됨' 전제를 두고 단순화하는 게 안정적)
     """
     ddl_template = """
     CREATE TABLE IF NOT EXISTS {schema}."{table}" (
@@ -130,6 +132,9 @@ def ensure_schema_tables(engine):
 LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
 FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
 
+YEAR_RE = re.compile(r"^\d{4}$")
+MONTH_RE = re.compile(r"^\d{2}$")
+
 
 def clean_contents(raw: str, max_len: int = 200):
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
@@ -144,26 +149,86 @@ def _open_text_file(path: Path):
         return path.open("r", encoding="cp949", errors="ignore")
 
 
-def parse_machine_log_file(path_str: str, today_ymd: str):
+# ============================================
+# 5) 오늘 파일 목록 수집 (✅ 120초/mtime 조건 제거)
+#    - 기존의 year/month 폴더 구조 순회/검증/정렬 방식 유지
+# ============================================
+def list_target_files_today(base_dir: Path, today_ymd: str):
+    files = []
+    if not base_dir.exists():
+        log(f"[WARN] BASE_DIR not found: {base_dir}")
+        return files
+
+    for year_dir in sorted(base_dir.iterdir()):
+        if not (year_dir.is_dir() and YEAR_RE.match(year_dir.name)):
+            continue
+
+        for month_dir in sorted(year_dir.iterdir()):
+            if not (month_dir.is_dir() and MONTH_RE.match(month_dir.name)):
+                continue
+
+            for file_path in month_dir.iterdir():
+                if not file_path.is_file():
+                    continue
+
+                m = FILENAME_PATTERN.search(file_path.name)
+                if not m:
+                    continue
+
+                file_ymd = m.group(1)
+                if file_ymd != today_ymd:
+                    continue
+
+                files.append(str(file_path))
+
+    return files
+
+
+# ============================================
+# 6) Tail-follow 파서 (offset 기반)
+#    - (path_str, today_ymd, offset) -> (rows, new_offset, station, path_str, status)
+#    - 기존 parse_machine_log_file()의 기능을 유지하되,
+#      파일 전체가 아니라 offset 이후 "신규 라인만" 읽는다.
+# ============================================
+def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
     """
-    오늘 파일만 파싱하여 records(list[dict]) 반환
+    return:
+      rows(list[dict]), new_offset(int), station(str|None), path_str(str), status(str)
     """
     file_path = Path(path_str)
 
     m = FILENAME_PATTERN.search(file_path.name)
     if not m:
-        return []
+        return [], offset, None, path_str, "SKIP_BADNAME"
 
     file_ymd = m.group(1)
     vision_no = m.group(2)
     station = f"Vision{vision_no}"
 
     if file_ymd != today_ymd:
-        return []
+        return [], offset, station, path_str, "SKIP_NOT_TODAY"
+
+    # 파일이 truncate(재생성/로테이션) 된 경우 보호: offset > size면 0 리셋
+    try:
+        size = file_path.stat().st_size
+    except Exception as e:
+        return [], offset, station, path_str, f"ERROR_STAT:{type(e).__name__}"
+
+    if offset > size:
+        offset = 0
+
+    # 읽을 게 없으면 스킵
+    if offset == size:
+        return [], offset, station, path_str, "SKIP_NOCHANGE"
 
     result = []
+    new_offset = offset
+
     try:
         with _open_text_file(file_path) as f:
+            # 텍스트 모드에서도 seek/tell 동작(바이트 기반)하도록 offset을 그대로 사용
+            f.seek(offset, os.SEEK_SET)
+
             for line in f:
                 line = line.rstrip("\n")
                 m2 = LINE_PATTERN.match(line)
@@ -189,64 +254,18 @@ def parse_machine_log_file(path_str: str, today_ymd: str):
                         "contents": contents,
                     }
                 )
+
+            new_offset = f.tell()
+
     except Exception as e:
-        log(f"[WARN] Failed to read: {file_path} / {e}")
-        return []
+        log(f"[WARN] Failed to read(tail): {file_path} / {type(e).__name__}: {e}")
+        return [], offset, station, path_str, f"ERROR_READ:{type(e).__name__}"
 
-    return result
-
-
-# ============================================
-# 5) 실시간(120초) 신규/수정 파일만 수집
-# ============================================
-def list_target_files_realtime(base_dir: Path, today_ymd: str):
-    files = []
-    if not base_dir.exists():
-        log(f"[WARN] BASE_DIR not found: {base_dir}")
-        return files
-
-    cutoff_ts = time_mod.time() - REALTIME_WINDOW_SEC
-
-    for year_dir in sorted(base_dir.iterdir()):
-        if not (year_dir.is_dir() and year_dir.name.isdigit() and len(year_dir.name) == 4):
-            continue
-
-        for month_dir in sorted(year_dir.iterdir()):
-            if not (month_dir.is_dir() and month_dir.name.isdigit() and len(month_dir.name) == 2):
-                continue
-
-            for file_path in month_dir.iterdir():
-                if not file_path.is_file():
-                    continue
-
-                m = FILENAME_PATTERN.search(file_path.name)
-                if not m:
-                    continue
-
-                file_ymd = m.group(1)
-                if file_ymd != today_ymd:
-                    continue
-
-                try:
-                    mtime = file_path.stat().st_mtime
-                except OSError:
-                    continue
-
-                if mtime < cutoff_ts:
-                    continue
-
-                fp = str(file_path)
-                prev_mtime = PROCESSED_MTIME.get(fp, 0)
-                if mtime <= prev_mtime:
-                    continue
-
-                files.append(fp)
-
-    return files
+    return result, int(new_offset), station, path_str, "OK"
 
 
 # ============================================
-# 6) DB Insert (중복은 무조건 무시)
+# 7) DB Insert (중복은 무조건 무시) - 기존 유지
 # ============================================
 def insert_to_db(engine, df: pd.DataFrame):
     if df is None or df.empty:
@@ -276,14 +295,14 @@ def insert_to_db(engine, df: pd.DataFrame):
 
 
 # ============================================
-# 7) main loop
+# 8) main loop - 기존 구조 유지(요약로그/INIT재시도/예외정책/페이싱)
 # ============================================
 def main():
-    log("### BUILD: d2 Vision parser OPTION-A v2025-12-23-01 ###")
+    log("### BUILD: d2 Vision parser OPTION-A (TAIL-FOLLOW) v2025-12-30-01 ###")
 
     engine = get_engine()
 
-    # INIT(스키마/테이블) - 실패해도 재시도
+    # INIT(스키마/테이블) - 실패해도 재시도 (기존 유지)
     while True:
         try:
             ensure_schema_tables(engine)
@@ -295,8 +314,9 @@ def main():
     log("=" * 78)
     log("[START] d2 Vision machine log realtime parser")
     log(f"[INFO] BASE_DIR={BASE_DIR}")
-    log(f"[INFO] WINDOW={REALTIME_WINDOW_SEC}s | THREADS={THREAD_WORKERS} | SLEEP={SLEEP_SEC}s")
+    log(f"[INFO] THREADS={THREAD_WORKERS} | SLEEP={SLEEP_SEC}s")
     log("[INFO] DEDUP POLICY = DB UNIQUE INDEX + ON CONFLICT DO NOTHING")
+    log("[INFO] FILE POLICY = TodayOnly + Tail-Follow(offset) | (mtime window removed)")
     log("=" * 78)
 
     loop_i = 0
@@ -309,64 +329,70 @@ def main():
         try:
             today_ymd = datetime.now().strftime("%Y%m%d")
 
-            # 날짜 변경 시: 캐시 초기화(오늘만 보니까 과감히 리셋)
+            # 날짜 변경 시: 캐시 초기화(오늘만 보니까 과감히 리셋) - 기존 유지
             if today_ymd != last_day:
-                log(f"[INFO] Day changed {last_day} -> {today_ymd} | reset processed cache")
+                log(f"[INFO] Day changed {last_day} -> {today_ymd} | reset processed cache(offset)")
                 last_day = today_ymd
-                PROCESSED_MTIME.clear()
+                PROCESSED_OFFSET.clear()
 
-            files = list_target_files_realtime(BASE_DIR, today_ymd=today_ymd)
+            files = list_target_files_today(BASE_DIR, today_ymd=today_ymd)
             if not files:
                 if loop_i % LOG_EVERY_LOOP == 0:
                     log(f"[LOOP] no files (today={today_ymd})")
                 time_mod.sleep(SLEEP_SEC)
                 continue
 
-            # 캐시 갱신(파일이 삭제/권한 오류여도 안전)
-            for fp in files:
-                try:
-                    PROCESSED_MTIME[fp] = Path(fp).stat().st_mtime
-                except OSError:
-                    PROCESSED_MTIME[fp] = time_mod.time()
-
-            # 파싱
+            # 파싱(tail-follow) - 스레드 2개 고정 유지 + as_completed 유지
             all_records = []
+            offset_updates = {}
+
             if len(files) >= 2:
                 workers = min(THREAD_WORKERS, len(files))
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = [ex.submit(parse_machine_log_file, fp, today_ymd) for fp in files]
+                    futs = []
+                    for fp in files:
+                        off = int(PROCESSED_OFFSET.get(fp, 0))
+                        futs.append(ex.submit(parse_machine_log_file_tail, fp, today_ymd, off))
+
                     for f in as_completed(futs):
-                        rows = f.result()
+                        rows, new_off, station, fp, status = f.result()
+                        offset_updates[fp] = int(new_off)
                         if rows:
                             all_records.extend(rows)
             else:
-                all_records.extend(parse_machine_log_file(files[0], today_ymd))
+                fp = files[0]
+                off = int(PROCESSED_OFFSET.get(fp, 0))
+                rows, new_off, station, fp, status = parse_machine_log_file_tail(fp, today_ymd, off)
+                offset_updates[fp] = int(new_off)
+                if rows:
+                    all_records.extend(rows)
+
+            # ✅ offset 갱신(항상 메인에서)
+            for fp, new_off in offset_updates.items():
+                PROCESSED_OFFSET[fp] = int(new_off)
 
             if not all_records:
                 if loop_i % LOG_EVERY_LOOP == 0:
-                    log(f"[LOOP] parsed=0 | files={len(files)}")
-                time_mod.sleep(SLEEP_SEC)
-                continue
+                    log(f"[LOOP] parsed=0 | files={len(files)} | (tail no new lines)")
+                # pacing below
+            else:
+                df = pd.DataFrame(all_records)
 
-            df = pd.DataFrame(all_records)
-
-            # DB insert (중복 무시)
-            try:
-                attempted = insert_to_db(engine, df)
-                if loop_i % LOG_EVERY_LOOP == 0 or attempted > 0:
-                    log(f"[DB] attempted={attempted:,} | files={len(files)} | parsed={len(df):,}")
-            except SQLAlchemyError as e:
-                # DB 이슈가 있어도 프로세스는 멈추지 않게: 로그만 찍고 다음 루프로
-                log(f"[WARN] DB insert error (ignored, continue): {type(e).__name__}: {e}")
+                # DB insert (중복 무시) - 예외 정책 유지
+                try:
+                    attempted = insert_to_db(engine, df)
+                    if loop_i % LOG_EVERY_LOOP == 0 or attempted > 0:
+                        log(f"[DB] attempted={attempted:,} | files={len(files)} | parsed={len(df):,}")
+                except SQLAlchemyError as e:
+                    log(f"[WARN] DB insert error (ignored, continue): {type(e).__name__}: {e}")
 
         except KeyboardInterrupt:
             log("\n[STOP] Interrupted by user.")
             break
         except Exception as e:
-            # 어떤 예외든 멈추지 않게: 로그만 찍고 continue
             log(f"[ERROR] Loop error (continue): {type(e).__name__}: {e}")
 
-        # loop pacing
+        # loop pacing - 기존 유지
         elapsed = time_mod.perf_counter() - loop_t0
         time_mod.sleep(max(0.0, SLEEP_SEC - elapsed))
 

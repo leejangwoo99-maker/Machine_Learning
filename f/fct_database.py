@@ -46,7 +46,7 @@ SRC_SCHEMA = "c1_fct_detail"
 SRC_TABLE  = "fct_detail"
 
 DATE_FROM = date(2025, 11, 13)
-DATE_TO   = date(2025, 11, 13)
+DATE_TO   = date(2025, 11, 18)
 
 FCT_SCHEMA = "a2_fct_table"
 FCT_TABLE  = "fct_table"

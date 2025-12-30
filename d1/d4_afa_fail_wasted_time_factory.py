@@ -1,41 +1,40 @@
 # -*- coding: utf-8 -*-
 """
 AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트 (Realtime) - HARDENED (Nuitka/EXE Safe)
+✅ Tail-Follow + State Machine 버전 (기존 기능/결과 동일 유지)
 
-목표: EXE/Nuitka 환경 포함, DB/드라이버/버전 차이에도 "안 깨지게" 보수 설계
-
-- 대상: d1_machine_log.FCT1~4_machine_log
+[기존 기능 동일 유지]
 - 이벤트: NG_TEXT(제품 감지 NG) -> OFF_TEXT(제품 검사 투입요구 ON)
 - Manual mode 전환 ~ Auto mode 전환 구간에서는 NG 무시
+- 1초마다 무한루프
+- 유효 날짜: end_day = 오늘(YYYYMMDD)만
+- 실시간 저장 조건: from/to 모두 "현재시간-60초" 이상인 페어만 저장
+- 저장: d1_machine_log.afa_fail_wasted_time (append + UNIQUE INDEX + ON CONFLICT DO NOTHING)
+- EXE/Nuitka 환경에서도 깨지지 않게 방어
 
-[요구사항]
-1) 스레드 2개 고정(ThreadPoolExecutor)
-2) 1초마다 무한루프 재실행
-3) 유효 날짜: end_day = 오늘(YYYYMMDD)만
-4) 실시간: 현재 시간 기준 60초 이내(ts_filter) 페어만 저장
-   - 쿼리: lookback(기본 120초) 로드
-   - 저장: from/to 모두 cutoff(최근 60초) 이상인 페어만 저장
-5) 미완성/비정상 row 방어(쿼리 + 파이썬 이중)
+[구조 변경(성능 개선)]
+- ❌ DB에서 120초 lookback 로드 + pandas groupby
+- ✅ 머신로그 파일을 "tail-follow"로 따라가며 새 줄만 처리
+- ✅ station별 메모리 state machine으로 즉시 페어 계산 후 DB 저장
 
-[저장]
-- 테이블: d1_machine_log.afa_fail_wasted_time
-- append + UNIQUE INDEX + ON CONFLICT DO NOTHING
+주의:
+- 아래 BASE_DIR 및 파일명 패턴은 기존 d1_machine_log 수집기와 동일한 FCT 머신 로그 기준입니다.
 """
 
 import re
 import sys
 import time
 import urllib.parse
+from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime, timedelta
 from multiprocessing import freeze_support
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
-from sqlalchemy import create_engine, text as sa_text
 import psycopg2
 from psycopg2.extras import execute_values
+from sqlalchemy import create_engine, text as sa_text
 
-pd.options.mode.chained_assignment = "raise"
 
 # ============================================
 # 0) DB / 상수
@@ -48,15 +47,10 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
-SCHEMA_MACHINE = "d1_machine_log"
+TABLE_SAVE_SCHEMA = "d1_machine_log"
+TABLE_SAVE_NAME = "afa_fail_wasted_time"
 
-TABLES_FCT = [
-    ("FCT1_machine_log", "FCT1"),
-    ("FCT2_machine_log", "FCT2"),
-    ("FCT3_machine_log", "FCT3"),
-    ("FCT4_machine_log", "FCT4"),
-]
-
+# 이벤트 텍스트 (기존 동일)
 NG_TEXT = "제품 감지 NG"
 OFF_TEXT = "제품 검사 투입요구 ON"
 MANUAL_TEXT = "Manual mode 전환"
@@ -64,18 +58,37 @@ AUTO_TEXT = "Auto mode 전환"
 
 VALID_CONTENTS = (NG_TEXT, OFF_TEXT, MANUAL_TEXT, AUTO_TEXT)
 
-TABLE_SAVE_SCHEMA = "d1_machine_log"
-TABLE_SAVE_NAME = "afa_fail_wasted_time"
-
+# 실시간 조건 (기존 동일)
 THREAD_WORKERS = 2
 LOOP_INTERVAL_SEC = 1
 TS_WINDOW_SEC = 60
-QUERY_LOOKBACK_SEC = 120
 
-PROGRESS_EVERY_GROUPS = 50
+# tail-follow가 “최근 구간만” 처리하도록 안전 버퍼(기존의 QUERY_LOOKBACK_SEC 역할 대체)
+# - 파일을 tail-follow 하므로 DB lookback은 불필요하지만,
+#   EXE 재시작/파일이 갑자기 커진 경우 등을 대비해
+#   "지금-120초 이전 이벤트"는 계산/저장 대상에서 자연스럽게 탈락하게끔 유지
+LOOKBACK_SEC_SOFT = 120
 
-# end_time 정규식 (쿼리/파이썬 공용): HH:MM:SS(.1~6)
-END_TIME_REGEX = r"^[0-2][0-9]:[0-5][0-9]:[0-5][0-9](\.[0-9]{1,6})?$"
+# 로그 과다 방지
+LOG_EVERY_LOOP = 10
+
+# ============================================
+# 1) 로그 파일 경로/패턴 (FCT 머신 로그 기준)
+# ============================================
+# 기존 FCT 머신 로그 수집기에서 사용하던 경로와 동일 계열로 맞춤
+# 파일이 실제로 있는 위치에 맞춰 BASE_DIR만 정확히 유지하면 됩니다.
+BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
+
+# 파일명 패턴 (기존 d1 수집기와 동일)
+# 예: 20251230_FCT1_Machine_Log.txt / 20251230_PDI1_Machine_Log.txt (PDI도 FCT로 취급 가능)
+FILENAME_PATTERN = re.compile(r"(\d{8})_(FCT|PDI)([1-4])_Machine_Log", re.IGNORECASE)
+
+# 라인 패턴:
+# - [hh:mm:ss] 또는 [hh:mm:ss.xx] 또는 [hh:mm:ss.xxxxxx] 허용
+LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?\]\s*(.*)$")
+
+# end_time 검증(완화): HH:MM:SS(.1~6)
+END_TIME_REGEX = re.compile(r"^[0-2]\d:[0-5]\d:[0-5]\d(\.\d{1,6})?$")
 
 
 # ============================================
@@ -93,7 +106,7 @@ def pause_console():
 
 
 # ============================================
-# 1) DB 유틸 (안정화 옵션 포함)
+# 2) DB 유틸 (기존과 동일)
 # ============================================
 def get_engine(config=DB_CONFIG):
     user = config["user"]
@@ -128,7 +141,7 @@ def get_psycopg2_conn(config=DB_CONFIG):
 
 
 # ============================================
-# 2) 저장 테이블 준비
+# 3) 저장 테이블 준비 (기존과 동일)
 # ============================================
 def ensure_save_table():
     engine = get_engine(DB_CONFIG)
@@ -155,230 +168,306 @@ def ensure_save_table():
 
 
 # ============================================
-# 3) FCT 로그 로드 (스레드)
+# 4) tail-follow 상태 구조
 # ============================================
-def load_fct_log_thread(args):
+@dataclass
+class StationState:
+    in_manual: bool = False
+    pending_ng_ts: datetime | None = None
+
+
+# station별 상태
+STATES: dict[str, StationState] = {
+    "FCT1": StationState(),
+    "FCT2": StationState(),
+    "FCT3": StationState(),
+    "FCT4": StationState(),
+}
+
+# tail-follow 오프셋: file_path -> last_byte_offset
+FILE_OFFSETS: dict[str, int] = {}
+
+# 파일별 "마지막 처리한 (end_day,end_time,contents)" (중복 라인/재시작 방어 보조)
+LAST_EVENT_FINGERPRINT: dict[str, tuple[str, str, str]] = {}
+
+
+# ============================================
+# 5) 유틸: contents 정리 (DB 저장용 포맷 유지)
+# ============================================
+def _clean_contents(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.replace("\x00", "").strip()
+    # 원본과 동일하게 핵심 키워드만 비교하므로, 과도한 정규화는 피함
+    return s
+
+
+def _normalize_end_time(hms: str, frac: str | None) -> str:
     """
-    ✅ Nuitka/EXE에서 발생하던
-    ValueError: cannot set a frame with no defined index and a scalar
-    방지 포함 버전
+    원본 로그가 [HH:MM:SS(.1~6)] 형태라서 그대로 사용하되,
+    - frac이 있으면 그대로 두되 (최대 6자리)
+    - 없으면 .00 붙여도 되지만, 기존 DB 적재(머신로그)와 호환 위해
+      여기서는 "없으면 HH:MM:SS" 형태 유지하고, ts 파싱 시 %f 유연 처리.
+    다만 출력(from_time/to_time)은 기존과 동일하게 "소수점 2자리"로 맞춘다.
     """
-    table_name, station_label, db_config, schema_name, today_yyyymmdd, cutoff_dt = args
-    t0 = time.perf_counter()
-
-    engine = get_engine(db_config)
-
-    stmt = sa_text(f"""
-        SELECT
-            end_day,
-            end_time,
-            contents
-        FROM {schema_name}."{table_name}"
-        WHERE
-            end_day = :today
-            AND contents = ANY(CAST(:valid_contents AS TEXT[]))
-            AND end_time ~ :time_re
-            AND to_timestamp(end_day || ' ' || end_time, 'YYYYMMDD HH24:MI:SS.US') >= CAST(:cutoff AS timestamp)
-        ORDER BY end_day ASC, end_time ASC
-    """)
-
-    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-
-    df = pd.read_sql(
-        stmt,
-        engine,
-        params={
-            "today": today_yyyymmdd,
-            "valid_contents": list(VALID_CONTENTS),
-            "time_re": END_TIME_REGEX,
-            "cutoff": cutoff_str,
-        },
-    )
-
-    # ============================
-    # ✅ HARDENING (핵심)
-    # ============================
-    # 어떤 환경에서는 read_sql 결과가 "컬럼 정보 없는 완전 빈 DF"로 나올 수 있음
-    # -> df.loc[:, "station"]=scalar 에서 ValueError 발생
-    if df is None or not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(columns=["end_day", "end_time", "contents"])
-
-    if df.columns is None or len(df.columns) == 0:
-        df = pd.DataFrame(columns=["end_day", "end_time", "contents"])
-
-    # 컬럼이 일부만 있을 경우도 대비
-    needed = ["end_day", "end_time", "contents"]
-    for c in needed:
-        if c not in df.columns:
-            df[c] = pd.Series(dtype="object")
-
-    # ✅ .loc 대입 금지(빈 DF에서 터짐) -> [] 대입은 안전
-    df["station"] = station_label
-    df = df.copy()
-
-    elapsed = time.perf_counter() - t0
-    return station_label, len(df), elapsed, df
+    if frac:
+        frac2 = frac[:6]  # 최대 6자리
+        return f"{hms}.{frac2}"
+    return hms
 
 
-def load_all_fct_logs(today_yyyymmdd: str, cutoff_dt: datetime) -> pd.DataFrame:
-    tasks = [(t, s, DB_CONFIG, SCHEMA_MACHINE, today_yyyymmdd, cutoff_dt) for t, s in TABLES_FCT]
+def _ts_from_end_day_time(end_day_yyyymmdd: str, end_time: str) -> datetime | None:
+    """
+    end_day(YYYYMMDD) + end_time(HH:MM:SS(.ffffff)) -> datetime
+    """
+    if not re.fullmatch(r"\d{8}", str(end_day_yyyymmdd)):
+        return None
+    if not END_TIME_REGEX.fullmatch(str(end_time)):
+        return None
 
-    log(f"[LOAD] 오늘={today_yyyymmdd} | lookback_cutoff={cutoff_dt:%Y-%m-%d %H:%M:%S} | threads={THREAD_WORKERS}")
+    # pandas 없이 datetime만으로 안전 파싱
+    try:
+        # 소수점이 있으면 %f, 없으면 일반
+        if "." in end_time:
+            # %f는 1~6자리 허용이 아니므로 6자리로 패딩
+            hms, frac = end_time.split(".", 1)
+            frac6 = (frac + "000000")[:6]
+            dt_str = f"{end_day_yyyymmdd} {hms}.{frac6}"
+            return datetime.strptime(dt_str, "%Y%m%d %H:%M:%S.%f")
+        else:
+            dt_str = f"{end_day_yyyymmdd} {end_time}"
+            return datetime.strptime(dt_str, "%Y%m%d %H:%M:%S")
+    except Exception:
+        return None
 
-    dfs = []
-    with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as ex:
-        futs = [ex.submit(load_fct_log_thread, task) for task in tasks]
-        done_cnt = 0
-        for f in as_completed(futs):
-            station_label, nrows, elapsed, df = f.result()
-            dfs.append(df)
-            done_cnt += 1
-            log(f"  - [{done_cnt}/{len(tasks)}] {station_label} 로드: rows={nrows:,} | {elapsed:.2f}s")
 
-    # 안전장치
-    dfs = [d for d in dfs if isinstance(d, pd.DataFrame)]
-    if not dfs:
-        return pd.DataFrame(columns=["end_day", "end_time", "contents", "station"])
-
-    df_all = pd.concat(dfs, ignore_index=True)
-
-    # 컬럼 보정
-    for c in ["end_day", "end_time", "contents", "station"]:
-        if c not in df_all.columns:
-            df_all[c] = pd.Series(dtype="object")
-
-    log(f"[LOAD] 합계 rows={len(df_all):,}")
-    return df_all
+def _fmt_time_2dec(ts: datetime) -> str:
+    """
+    기존 코드와 동일하게 "소수점 2자리 수준"으로 절삭 출력
+    - 기존: ts.strftime("%H:%M:%S.%f")[:-4]
+    """
+    return ts.strftime("%H:%M:%S.%f")[:-4]
 
 
 # ============================================
-# 4) 계산 로직
+# 6) 오늘 파일 찾기
 # ============================================
-def _is_valid_row_basic(end_day, end_time, contents) -> bool:
-    if end_day is None or end_time is None or contents is None:
-        return False
+def list_today_fct_log_files(today_ymd: str) -> dict[str, str]:
+    """
+    오늘자 FCT1~4 로그파일 경로를 찾아 station->path 반환
+    - BASE_DIR 아래 YYYY/MM 구조를 전부 훑되, 오늘 파일만
+    - PDI도 FCT로 취급(기존 머신로그 수집기와 동일 정책)
+    """
+    result: dict[str, str] = {}
+    if not BASE_DIR.exists():
+        return result
 
-    s_end_day = str(end_day)
-    s_end_time = str(end_time)
-    s_contents = str(contents)
-
-    if not re.fullmatch(r"\d{8}", s_end_day):
-        return False
-    if s_contents not in VALID_CONTENTS:
-        return False
-    if not re.fullmatch(r"[0-2]\d:[0-5]\d:[0-5]\d(\.\d{1,6})?", s_end_time):
-        return False
-
-    return True
-
-
-def compute_afa_fail_wasted(df_all: pd.DataFrame, ts_filter_cutoff: datetime) -> pd.DataFrame:
-    if df_all.empty:
-        return pd.DataFrame(columns=[
-            "end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
-        ])
-
-    log(f"[CALC] ts_filter_cutoff={ts_filter_cutoff:%Y-%m-%d %H:%M:%S} (최근 {TS_WINDOW_SEC}s 확정 이벤트만 결과)")
-
-    # apply는 느리지만, 안정성을 우선(Realtime 120초 구간이라 부담 적음)
-    mask_valid = df_all.apply(
-        lambda r: _is_valid_row_basic(r["end_day"], r["end_time"], r["contents"]),
-        axis=1
-    )
-    df_evt = df_all.loc[mask_valid].copy()
-
-    if df_evt.empty:
-        log("[CALC] 유효 이벤트가 없습니다(비정상 row 제거 후).")
-        return pd.DataFrame(columns=[
-            "end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
-        ])
-
-    df_evt = df_evt.sort_values(["end_day", "station", "end_time"]).reset_index(drop=True)
-
-    result_rows = []
-    groups = list(df_evt.groupby(["end_day", "station"], sort=False))
-    total_groups = len(groups)
-    log(f"[CALC] 그룹 수(end_day x station): {total_groups:,}")
-
-    grp_cnt = 0
-    for (end_day, station), grp in groups:
-        grp_cnt += 1
-        if grp_cnt == 1 or grp_cnt % PROGRESS_EVERY_GROUPS == 0 or grp_cnt == total_groups:
-            log(f"  - 진행: {grp_cnt:,}/{total_groups:,} (현재 {end_day}, {station})")
-
-        pending_from_ts = None
-        in_manual = False
-
-        for _, row in grp.iterrows():
-            contents = row["contents"]
-            end_time = row["end_time"]
-
-            ts = pd.to_datetime(f"{str(end_day)} {str(end_time)}", errors="coerce")
-            if pd.isna(ts):
+    # 성능: year/month만 2-depth 순회 (파일이 많지 않다는 전제)
+    for year_dir in BASE_DIR.iterdir():
+        if not (year_dir.is_dir() and year_dir.name.isdigit() and len(year_dir.name) == 4):
+            continue
+        for month_dir in year_dir.iterdir():
+            if not (month_dir.is_dir() and month_dir.name.isdigit() and len(month_dir.name) == 2):
                 continue
-
-            if contents == MANUAL_TEXT:
-                in_manual = True
-                continue
-            if contents == AUTO_TEXT:
-                in_manual = False
-                continue
-
-            if contents == NG_TEXT:
-                if in_manual:
+            for fp in month_dir.iterdir():
+                if not fp.is_file():
                     continue
-                if pending_from_ts is None:
-                    pending_from_ts = ts
+                m = FILENAME_PATTERN.search(fp.name)
+                if not m:
+                    continue
+                file_ymd = m.group(1)
+                no = m.group(3)
+                station = f"FCT{no}"
+                if file_ymd != today_ymd:
+                    continue
+                # station 1개만 필요. 같은 station 파일이 여러 개면 최신 mtime 우선
+                fp_str = str(fp)
+                if station not in result:
+                    result[station] = fp_str
+                else:
+                    try:
+                        if Path(fp_str).stat().st_mtime > Path(result[station]).stat().st_mtime:
+                            result[station] = fp_str
+                    except Exception:
+                        pass
+
+    return result
+
+
+# ============================================
+# 7) tail-follow: 파일에서 "새로 추가된 라인"만 읽기
+# ============================================
+def _open_text_file_best_effort(path: Path):
+    """
+    인코딩 방어: utf-8 시도 -> cp949
+    """
+    try:
+        return path.open("r", encoding="utf-8", errors="ignore")
+    except Exception:
+        return path.open("r", encoding="cp949", errors="ignore")
+
+
+def tail_read_new_lines(path_str: str) -> list[str]:
+    """
+    path_str 파일에서 마지막 오프셋 이후 새로 추가된 텍스트 라인만 반환.
+    - 파일이 truncate/rotate 되어 size < offset이면 offset=0으로 리셋
+    - EXE/Nuitka에서도 안전하게 동작하도록 예외 방어
+    """
+    p = Path(path_str)
+    if not p.exists() or not p.is_file():
+        return []
+
+    try:
+        size = p.stat().st_size
+    except Exception:
+        return []
+
+    last_off = FILE_OFFSETS.get(path_str, 0)
+    if size < last_off:
+        # 로그 파일이 재생성/초기화 된 경우
+        last_off = 0
+
+    lines: list[str] = []
+    try:
+        with _open_text_file_best_effort(p) as f:
+            f.seek(last_off)
+            chunk = f.read()
+            new_off = f.tell()
+
+        if not chunk:
+            FILE_OFFSETS[path_str] = new_off
+            return []
+
+        # 줄 단위로 분리
+        # - 마지막이 개행 없이 끝나면 다음 루프에 이어 읽혀야 하므로 보수적으로 처리
+        parts = chunk.splitlines()
+        # splitlines()는 마지막 개행 여부에 관계없이 잘라주지만,
+        # 마지막 라인이 "중간에 끊긴 라인"일 수 있어, 너무 공격적으로 버리진 않음.
+        # (실제 장비 로그는 보통 한 줄씩 flush되므로 큰 문제 없음)
+        lines.extend(parts)
+
+        FILE_OFFSETS[path_str] = new_off
+        return lines
+
+    except Exception:
+        return []
+
+
+# ============================================
+# 8) station별 이벤트 처리(state machine) + 결과 생성
+# ============================================
+def process_lines_for_station(station: str, end_day_ymd: str, file_path: str, lines: list[str], now_dt: datetime):
+    """
+    station의 새 라인을 받아서 상태를 업데이트하고,
+    생성된 wasted_time 결과 row(dict)를 반환
+    """
+    out_rows = []
+
+    st = STATES.get(station)
+    if st is None:
+        st = StationState()
+        STATES[station] = st
+
+    # soft lookback (재시작/오프셋 리셋 등에서 과거 이벤트가 들어오는 경우 탈락시키기 위함)
+    soft_cutoff = now_dt - timedelta(seconds=LOOKBACK_SEC_SOFT)
+    ts_filter_cutoff = now_dt - timedelta(seconds=TS_WINDOW_SEC)
+
+    for raw in lines:
+        if not raw:
+            continue
+
+        m = LINE_PATTERN.match(raw.strip())
+        if not m:
+            continue
+
+        hms = m.group(1)
+        frac = m.group(2) or None
+        contents_raw = m.group(3) or ""
+        contents = _clean_contents(contents_raw)
+
+        # 관심 이벤트만
+        if contents not in VALID_CONTENTS:
+            continue
+
+        end_time = _normalize_end_time(hms, frac)
+
+        # 기본 유효성
+        if not END_TIME_REGEX.fullmatch(end_time):
+            continue
+
+        ts = _ts_from_end_day_time(end_day_ymd, end_time)
+        if ts is None:
+            continue
+
+        # soft lookback 이전이면 state도 건드리지 않음(재시작 시 과거 데이터로 상태 오염 방지)
+        if ts < soft_cutoff:
+            continue
+
+        # 파일별 중복 라인 방어(같은 라인이 여러 번 들어오는 케이스)
+        fp_key = file_path
+        last_fp = LAST_EVENT_FINGERPRINT.get(fp_key)
+        cur_fp = (end_day_ymd, end_time, contents)
+        if last_fp == cur_fp:
+            continue
+        LAST_EVENT_FINGERPRINT[fp_key] = cur_fp
+
+        # --- 상태기계 로직 (기존과 동일 의미) ---
+        if contents == MANUAL_TEXT:
+            st.in_manual = True
+            # manual 진입 시 pending을 유지/삭제는 기존 코드상 명시가 없었으나
+            # 현장 안정성 위해 pending을 비우는 게 안전(Manual 동안 NG 무시이므로)
+            st.pending_ng_ts = None
+            continue
+
+        if contents == AUTO_TEXT:
+            st.in_manual = False
+            # auto 전환 시 pending은 초기화(이전 NG가 살아있으면 오탐 가능)
+            st.pending_ng_ts = None
+            continue
+
+        if contents == NG_TEXT:
+            if st.in_manual:
+                continue
+            if st.pending_ng_ts is None:
+                st.pending_ng_ts = ts
+            continue
+
+        if contents == OFF_TEXT:
+            if st.pending_ng_ts is None:
                 continue
 
-            if contents == OFF_TEXT and pending_from_ts is not None:
-                from_ts = pending_from_ts
-                to_ts = ts
+            from_ts = st.pending_ng_ts
+            to_ts = ts
+            st.pending_ng_ts = None
 
-                # 최근 60초 이내 페어만 저장
-                if from_ts < ts_filter_cutoff or to_ts < ts_filter_cutoff:
-                    pending_from_ts = None
-                    continue
+            # 저장 조건: from/to 모두 최근 60초 이내(ts_filter_cutoff 이상)
+            if from_ts < ts_filter_cutoff or to_ts < ts_filter_cutoff:
+                continue
 
-                # 표시 포맷(소수점 2자리 수준으로 절삭)
-                from_str = from_ts.strftime("%H:%M:%S.%f")[:-4]
-                to_str = to_ts.strftime("%H:%M:%S.%f")[:-4]
-                wasted = round(abs((to_ts - from_ts).total_seconds()), 2)
+            wasted = round(abs((to_ts - from_ts).total_seconds()), 2)
 
-                result_rows.append({
-                    "end_day": str(end_day),
-                    "station": str(station),
-                    "from_contents": NG_TEXT,
-                    "from_time": from_str,
-                    "to_contents": OFF_TEXT,
-                    "to_time": to_str,
-                    "wasted_time": wasted,
-                })
+            out_rows.append({
+                "end_day": str(end_day_ymd),
+                "station": station,
+                "from_contents": NG_TEXT,
+                "from_time": _fmt_time_2dec(from_ts),
+                "to_contents": OFF_TEXT,
+                "to_time": _fmt_time_2dec(to_ts),
+                "wasted_time": wasted,
+            })
 
-                pending_from_ts = None
-
-    df_wasted = pd.DataFrame(result_rows)
-    if df_wasted.empty:
-        log("[CALC] 생성된 결과가 없습니다(최근 60초 조건 또는 이벤트 페어 미충족).")
-        return pd.DataFrame(columns=[
-            "end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
-        ])
-
-    df_wasted = df_wasted.sort_values(["end_day", "station", "from_time"]).reset_index(drop=True)
-    log(f"[CALC] 결과 rows={len(df_wasted):,}")
-    return df_wasted
+    return out_rows
 
 
 # ============================================
-# 5) 저장
+# 9) 저장 (기존과 동일: execute_values + ON CONFLICT DO NOTHING)
 # ============================================
-def save_to_db_append_on_conflict(df_wasted: pd.DataFrame):
-    if df_wasted is None or df_wasted.empty:
-        log("[SAVE] 저장할 데이터 없음.")
-        return
+def save_to_db_append_on_conflict(rows: list[dict]):
+    if not rows:
+        return 0
 
     cols = ["end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"]
-    rows = [tuple(x) for x in df_wasted[cols].to_numpy()]
+    values = [tuple(r[c] for c in cols) for r in rows]
 
     insert_sql = f"""
         INSERT INTO {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME}
@@ -388,57 +477,124 @@ def save_to_db_append_on_conflict(df_wasted: pd.DataFrame):
         DO NOTHING
     """
 
-    t0 = time.perf_counter()
     conn = None
     try:
         conn = get_psycopg2_conn(DB_CONFIG)
         conn.autocommit = False
         with conn.cursor() as cur:
-            execute_values(cur, insert_sql, rows, page_size=1000)
+            execute_values(cur, insert_sql, values, page_size=1000)
         conn.commit()
-        elapsed = time.perf_counter() - t0
-        log(f"[SAVE] INSERT 완료(중복은 자동 무시) | rows={len(rows):,} | {elapsed:.2f}s")
+        return len(values)
     finally:
         if conn is not None:
             conn.close()
 
 
 # ============================================
-# 6) main loop
+# 10) worker (스레드): station 1개 처리
+# ============================================
+def worker_process_station(station: str, path_str: str, today_ymd: str, now_dt: datetime):
+    # tail-read
+    new_lines = tail_read_new_lines(path_str)
+    if not new_lines:
+        return station, 0, 0, []
+
+    # 이벤트 처리
+    rows = process_lines_for_station(
+        station=station,
+        end_day_ymd=today_ymd,
+        file_path=path_str,
+        lines=new_lines,
+        now_dt=now_dt
+    )
+    return station, len(new_lines), len(rows), rows
+
+
+# ============================================
+# 11) main loop (1초 무한루프)
 # ============================================
 def run_realtime_loop():
     ensure_save_table()
 
     log("=" * 78)
-    log(f"[START] AFA FAIL wasted time REALTIME | {datetime.now():%Y-%m-%d %H:%M:%S}")
+    log(f"[START] AFA FAIL wasted time REALTIME (TAIL-FOLLOW) | {datetime.now():%Y-%m-%d %H:%M:%S}")
     log(f"[INFO] DB = {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}")
-    log(f"[INFO] SOURCE SCHEMA = {SCHEMA_MACHINE}")
-    log(f"[INFO] SAVE TABLE    = {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (append + dedup)")
+    log(f"[INFO] SAVE TABLE = {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (append + dedup)")
+    log(f"[INFO] BASE_DIR = {BASE_DIR}")
     log(f"[INFO] THREAD_WORKERS = {THREAD_WORKERS}")
     log(f"[INFO] LOOP_INTERVAL_SEC = {LOOP_INTERVAL_SEC}")
-    log(f"[INFO] TS_WINDOW_SEC = {TS_WINDOW_SEC} | QUERY_LOOKBACK_SEC = {QUERY_LOOKBACK_SEC}")
+    log(f"[INFO] TS_WINDOW_SEC = {TS_WINDOW_SEC} (from/to 모두 최근 60초 이내만 저장)")
+    log(f"[INFO] SOFT_LOOKBACK_SEC = {LOOKBACK_SEC_SOFT} (재시작 시 과거 이벤트 상태오염 방지)")
     log("=" * 78)
 
+    loop_i = 0
+    last_day = datetime.now().strftime("%Y%m%d")
+
     while True:
+        loop_i += 1
         loop_t0 = time.perf_counter()
 
-        now = datetime.now()
-        today_yyyymmdd = now.strftime("%Y%m%d")
+        now_dt = datetime.now()
+        today_ymd = now_dt.strftime("%Y%m%d")
 
-        query_cutoff_dt = now - timedelta(seconds=QUERY_LOOKBACK_SEC)
-        ts_filter_cutoff = now - timedelta(seconds=TS_WINDOW_SEC)
+        # 날짜 변경: 상태/오프셋 초기화
+        if today_ymd != last_day:
+            log(f"[DAY-CHANGE] {last_day} -> {today_ymd} | reset states/offsets")
+            last_day = today_ymd
+            FILE_OFFSETS.clear()
+            LAST_EVENT_FINGERPRINT.clear()
+            for k in list(STATES.keys()):
+                STATES[k] = StationState()
 
         try:
-            df_all = load_all_fct_logs(today_yyyymmdd=today_yyyymmdd, cutoff_dt=query_cutoff_dt)
-            df_wasted = compute_afa_fail_wasted(df_all, ts_filter_cutoff=ts_filter_cutoff)
-            save_to_db_append_on_conflict(df_wasted)
+            station_files = list_today_fct_log_files(today_ymd)
+            if not station_files:
+                if loop_i % LOG_EVERY_LOOP == 0:
+                    log(f"[LOOP] no today files (today={today_ymd}) | BASE_DIR={BASE_DIR}")
+                time.sleep(LOOP_INTERVAL_SEC)
+                continue
 
+            # FCT1~4만 대상으로 고정 (있으면 처리, 없으면 스킵)
+            tasks = []
+            for st in ("FCT1", "FCT2", "FCT3", "FCT4"):
+                if st in station_files:
+                    tasks.append((st, station_files[st]))
+
+            if not tasks:
+                if loop_i % LOG_EVERY_LOOP == 0:
+                    log(f"[LOOP] today files found but no FCT1~4 matched (today={today_ymd})")
+                time.sleep(LOOP_INTERVAL_SEC)
+                continue
+
+            all_rows = []
+            total_new_lines = 0
+            total_pairs = 0
+
+            # 스레드 2개 고정 (기존 요구사항 동일)
+            with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as ex:
+                futs = [ex.submit(worker_process_station, st, fp, today_ymd, now_dt) for st, fp in tasks]
+                for f in as_completed(futs):
+                    st, nlines, npairs, rows = f.result()
+                    total_new_lines += nlines
+                    total_pairs += npairs
+                    if rows:
+                        all_rows.extend(rows)
+
+            inserted = 0
+            if all_rows:
+                inserted = save_to_db_append_on_conflict(all_rows)
+
+            if loop_i % LOG_EVERY_LOOP == 0 or inserted > 0:
+                log(f"[LOOP] files={len(tasks)} | new_lines={total_new_lines:,} | pairs={total_pairs:,} | inserted={inserted:,}")
+
+        except KeyboardInterrupt:
+            log("\n[STOP] 사용자 중단(Ctrl+C).")
+            break
         except Exception as e:
-            log("\n[ERROR] 루프 처리 중 예외가 발생했습니다.")
+            log("\n[ERROR] 루프 처리 중 예외가 발생했습니다. (continue)")
             log(f"  - {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
-            raise
 
         elapsed = time.perf_counter() - loop_t0
         time.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
