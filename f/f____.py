@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 # fct_database.py (최종 통합본 - cycle end_time 스냅 기반 value/min/max/result 매칭 보장)
+#
+# [추가 반영 사양]
+# 1) 실행 시작/종료 시간 + 총 실행시간(초) 콘솔 출력
+# 2) df 크기에 따라 자동 분기:
+#    - df가 작으면: 직접 UPSERT (execute_values 방식)
+#    - df가 크면: COPY + UNLOGGED 스테이징 + UPSERT
+#
+# ⚠️ 기존 기능(스냅/매칭/스텝매핑/삭제/부트스트랩/PK/업서트/타입변환 등) 절대 누락 없이 유지
 
 import io
 import time
 import urllib.parse
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -17,6 +25,14 @@ SHOW_PREVIEW = False
 END_TIME_TOL_SECONDS = 2
 COPY_CHUNK_ROWS = 200_000
 DEBUG_JOIN_COVERAGE = False   # ← 디버그 조인 커버리지 스위치
+
+# 자동 분기 기준(행 수)
+# - 이 값 이하: DIRECT UPSERT
+# - 초과: COPY + STAGING
+UPSERT_DIRECT_THRESHOLD_ROWS = 20_000
+
+# DIRECT UPSERT 배치 크기(너무 크면 packet/메모리 부담)
+DIRECT_UPSERT_BATCH_ROWS = 5_000
 
 # ============================================================
 # 1) DB 접속
@@ -46,8 +62,8 @@ print("[OK] engine ready")
 SRC_SCHEMA = "c1_fct_detail"
 SRC_TABLE  = "fct_detail"
 
-DATE_FROM = date(2025, 11, 18)
-DATE_TO   = date(2025, 11, 18)
+DATE_FROM = date(2025, 11, 15)
+DATE_TO   = date(2025, 11, 15)
 
 FCT_SCHEMA = "a2_fct_table"
 FCT_TABLE  = "fct_table"
@@ -713,27 +729,21 @@ def debug_join_coverage(df2: pd.DataFrame, fct: pd.DataFrame, sample_n: int = 20
         need = need.sample(sample_n, random_state=42).copy()
         print(f"[DBG] need sampled to {len(need)} rows for safe debug")
 
-    # =========================
     # 1) (end_day_text, cycle_end_time) 존재 여부
-    # =========================
     b1 = b[["end_day_text", "end_time_int"]].drop_duplicates()
     ref1 = (b1["end_day_text"].astype("string") + "|" + b1["end_time_int"].astype("string"))
     key1 = (need["end_day_text"].astype("string") + "|" + need["fct_end_time_int"].astype("string"))
     hit1 = int(key1.isin(pd.Index(ref1)).sum())
     print(f"[DBG-1] match by (end_day_text, cycle_end_time) = {hit1} / {len(need)}")
 
-    # =========================
     # 2) + station
-    # =========================
     b2 = b[["end_day_text", "end_time_int", "station"]].drop_duplicates()
     ref2 = (b2["end_day_text"].astype("string") + "|" + b2["end_time_int"].astype("string") + "|" + b2["station"].astype("string"))
     key2 = (need["end_day_text"].astype("string") + "|" + need["fct_end_time_int"].astype("string") + "|" + need["station"].astype("string"))
     hit2 = int(key2.isin(pd.Index(ref2)).sum())
     print(f"[DBG-2] match + station = {hit2} / {len(need)}")
 
-    # =========================
     # 3) + step_key_norm
-    # =========================
     b3 = b[["end_day_text", "end_time_int", "station", "step_key_norm"]].drop_duplicates()
     ref3 = (
         b3["end_day_text"].astype("string") + "|" +
@@ -750,9 +760,7 @@ def debug_join_coverage(df2: pd.DataFrame, fct: pd.DataFrame, sample_n: int = 20
     hit3 = int(key3.isin(pd.Index(ref3)).sum())
     print(f"[DBG-3] match + station + step_key_norm = {hit3} / {len(need)}")
 
-    # =========================
     # 4) + remark
-    # =========================
     b4 = b[["end_day_text", "end_time_int", "station", "step_key_norm", "remark"]].drop_duplicates()
     ref4 = (
         b4["end_day_text"].astype("string") + "|" +
@@ -771,7 +779,6 @@ def debug_join_coverage(df2: pd.DataFrame, fct: pd.DataFrame, sample_n: int = 20
     hit4 = int(key4.isin(pd.Index(ref4)).sum())
     print(f"[DBG-4] match + station + step_key_norm + remark = {hit4} / {len(need)}")
 
-    # 샘플로 포맷 확인
     print("\n[DBG] fct end_time_int sample:", b["end_time_int"].dropna().astype(str).head(5).tolist())
     print("[DBG] df2 fct_end_time_int sample:", a["fct_end_time_int"].dropna().astype(str).head(5).tolist())
     print("="*120 + "\n")
@@ -786,9 +793,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
         print("[CHK] value matched: 0 /", len(out), "(fct empty)")
         return out
 
-    # =========================
     # 키 보장
-    # =========================
     out["barcode_norm"] = normalize_barcode(out["barcode_information"])
     out["end_day_text"] = to_day_text_from_date(out["end_day"])
     out["fct_end_time_int"] = out["fct_end_time_int"].astype("string")
@@ -809,15 +814,11 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
         print("[CHK] value matched: 0 /", len(out), "(need empty)")
         return out.drop(columns=["_row_id"], errors="ignore")
 
-    # =========================
     # step 정규화
-    # =========================
     need["_step_stripped"] = strip_step_prefix_by_remark(need["step_description"], need["remark"])
     need["step_key_norm"] = norm_step_key(need["_step_stripped"])
 
-    # =========================
     # fct 키 정규화
-    # =========================
     fct2 = fct.copy()
     fct2["barcode_norm"] = normalize_barcode(fct2["barcode_information"])
     fct2["end_day_text"] = fct2["end_day"].astype("string")
@@ -828,9 +829,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
     for c in ["value","min","max","result"]:
         fct2[c] = fct2[c].astype("string")
 
-    # =========================
     # 실제 조인
-    # =========================
     fct_key = fct2[
         ["barcode_norm","end_day_text","station","end_time_int","step_key_norm","value","min","max","result"]
     ].rename(columns={"end_time_int":"end_time_int_fct"})
@@ -863,7 +862,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
     return out
 
 # ============================================================
-# 11) COPY 기반 Bulk Upsert
+# 11) UPSERT (자동 분기: DIRECT vs COPY)
 # ============================================================
 FINAL_COLS = [
     "group", "barcode_information", "station", "remark", "end_day", "end_time", "run_time",
@@ -871,10 +870,16 @@ FINAL_COLS = [
     "test_ct", "test_time", "file_path"
 ]
 
-def bulk_upsert_copy(engine_, df: pd.DataFrame):
+def _prepare_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    - DB 컬럼 타입/포맷 정리 (기존 bulk_upsert_copy 로직 동일)
+    - end_day: date
+    - end_time: time (hhmiss 변환 후 time)
+    - numeric cast
+    - value/min/max/result: string
+    """
     if df.empty:
-        print("[SKIP] df empty")
-        return
+        return df.copy()
 
     df2 = df[FINAL_COLS].copy()
 
@@ -889,6 +894,19 @@ def bulk_upsert_copy(engine_, df: pd.DataFrame):
     df2["end_day"] = pd.to_datetime(df2["end_day"], errors="coerce").dt.date
     end_time_hhmiss = to_time_text_from_time(df2["end_time"])
     df2["end_time"] = pd.to_datetime(end_time_hhmiss, format="%H%M%S", errors="coerce").dt.time
+
+    return df2
+
+def bulk_upsert_copy(engine_, df: pd.DataFrame):
+    """
+    대용량용: COPY + UNLOGGED staging + ON CONFLICT UPSERT
+    (기존 기능 유지)
+    """
+    if df.empty:
+        print("[SKIP] df empty")
+        return
+
+    df2 = _prepare_df_for_db(df)
 
     db_cols = [
         "group","barcode_information","station","remark","end_day","end_time","run_time",
@@ -976,12 +994,118 @@ def bulk_upsert_copy(engine_, df: pd.DataFrame):
     finally:
         raw.close()
 
-    print(f"[DONE] UPSERT 완료: {total} rows / sec={time.time()-t0:.2f}")
+    print(f"[DONE] UPSERT(COPY) 완료: {total} rows / sec={time.time()-t0:.2f}")
+
+def direct_upsert(engine_, df: pd.DataFrame):
+    """
+    소량용: 직접 INSERT ... ON CONFLICT DO UPDATE
+    - psycopg2.extras.execute_values 로 빠르게 배치 insert
+    - staging/ TRUNCATE 없음 -> 실시간/소량 적재에 적합
+    """
+    if df.empty:
+        print("[SKIP] df empty")
+        return
+
+    df2 = _prepare_df_for_db(df)
+
+    # PK 중복 제거(소량에서도 동일하게 보호)
+    PK_COLS = ["end_day", "barcode_information", "end_time", "test_time", "contents"]
+    before = len(df2)
+    df2 = df2.drop_duplicates(subset=PK_COLS, keep="last").copy()
+    dropped = before - len(df2)
+    if dropped > 0:
+        print(f"[WARN] direct upsert PK duplicates dropped: {dropped} (rows {before} -> {len(df2)})")
+
+    cols = [
+        "group","barcode_information","station","remark","end_day","end_time","run_time",
+        "contents","step_description","set_up_or_test_ct","value","min","max","result",
+        "test_ct","test_time","file_path"
+    ]
+
+    # execute_values 사용
+    raw = engine_.raw_connection()
+    t0 = time.time()
+    try:
+        from psycopg2.extras import execute_values
+        with raw.cursor() as cur:
+            sql = f"""
+            INSERT INTO {OUT_SCHEMA}.{OUT_TABLE} (
+                "group", barcode_information, station, remark, end_day, end_time, run_time,
+                contents, step_description, set_up_or_test_ct, value, min, max, result,
+                test_ct, test_time, file_path
+            ) VALUES %s
+            ON CONFLICT (end_day, barcode_information, end_time, test_time, contents)
+            DO UPDATE SET
+                "group" = EXCLUDED."group",
+                station = EXCLUDED.station,
+                remark = EXCLUDED.remark,
+                run_time = EXCLUDED.run_time,
+                step_description = EXCLUDED.step_description,
+                set_up_or_test_ct = EXCLUDED.set_up_or_test_ct,
+                value = EXCLUDED.value,
+                min = EXCLUDED.min,
+                max = EXCLUDED.max,
+                result = EXCLUDED.result,
+                test_ct = EXCLUDED.test_ct,
+                file_path = EXCLUDED.file_path,
+                updated_at = now();
+            """
+
+            total = len(df2)
+            for start in range(0, total, DIRECT_UPSERT_BATCH_ROWS):
+                end = min(start + DIRECT_UPSERT_BATCH_ROWS, total)
+                chunk = df2.iloc[start:end][cols]
+
+                # pandas NA/NaN -> None 변환
+                records = []
+                for row in chunk.itertuples(index=False, name=None):
+                    rec = []
+                    for v in row:
+                        if pd.isna(v):
+                            rec.append(None)
+                        else:
+                            # pandas Timestamp -> python date/time 변환은 _prepare_df_for_db에서 이미 처리됨
+                            rec.append(v)
+                    records.append(tuple(rec))
+
+                execute_values(cur, sql, records, page_size=min(1000, len(records)))
+                raw.commit()
+                print(f"[OK] direct upsert batch: {start}~{end-1} ({end-start} rows)")
+
+    finally:
+        raw.close()
+
+    print(f"[DONE] UPSERT(DIRECT) 완료: {len(df2)} rows / sec={time.time()-t0:.2f}")
+
+def upsert_auto(engine_, df: pd.DataFrame):
+    """
+    df 크기에 따라 자동 분기:
+    - 작으면 DIRECT UPSERT
+    - 크면 COPY UPSERT
+    """
+    n = int(len(df))
+    if n <= 0:
+        print("[SKIP] df empty")
+        return
+
+    if n <= UPSERT_DIRECT_THRESHOLD_ROWS:
+        print(f"[MODE] DIRECT UPSERT (rows={n} <= threshold={UPSERT_DIRECT_THRESHOLD_ROWS})")
+        direct_upsert(engine_, df)
+    else:
+        print(f"[MODE] COPY+STAGING UPSERT (rows={n} > threshold={UPSERT_DIRECT_THRESHOLD_ROWS})")
+        bulk_upsert_copy(engine_, df)
 
 # ============================================================
-# 12) MAIN
+# 12) MAIN (실행시간 출력 포함)
 # ============================================================
 def main():
+    # --- 실행 시작 시간 ---
+    run_start = datetime.now()
+    print("=" * 120)
+    print(f"[RUN] START : {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 120)
+
+    # 기존 부트스트랩 유지 (주의: 실시간 적재 전환 시 DROP/CREATE는 꺼야 함)
     bootstrap_fct_database(engine)
 
     df0 = load_source(engine)
@@ -1005,7 +1129,7 @@ def main():
     if DEBUG_JOIN_COVERAGE:
         debug_join_coverage(df2, fct)
 
-    # 3) value/min/max/result 매칭 (✅ 한 번만 수행)
+    # 2) value/min/max/result 매칭 (한 번만 수행)
     df3 = match_value_min_max_result_by_cycle(df2, fct)
 
     df_final = df3[FINAL_COLS].copy()
@@ -1013,7 +1137,16 @@ def main():
     if SHOW_PREVIEW:
         print(df_final.head(200))
 
-    bulk_upsert_copy(engine, df_final)
+    # 3) 업서트 자동 분기 실행
+    upsert_auto(engine, df_final)
+
+    # --- 실행 종료 시간 ---
+    run_end = datetime.now()
+    run_seconds = (run_end - run_start).total_seconds()
+    print("=" * 120)
+    print(f"[RUN] END   : {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[RUN] SEC   : {run_seconds:.2f} sec")
+    print("=" * 120)
     print("[DONE] 전체 파이프라인 종료")
 
 if __name__ == "__main__":
