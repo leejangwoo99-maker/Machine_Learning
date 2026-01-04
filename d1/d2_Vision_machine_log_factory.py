@@ -13,14 +13,15 @@
 # - loop pacing (SLEEP_SEC - elapsed)
 # - LOG_EVERY_LOOP 주기적 요약 로그
 #
-# [요청 반영 변경]
+# [유지되는 요청 반영]
 # - ❌ 120초(mtime) 조건 제거
 # - ✅ 하루 1개 파일이 계속 append 되는 구조이므로,
 #      "offset 기반 tail-follow"로 신규 라인만 처리 (파일 전체 재파싱 제거)
 #
-# [이번 수정 - 최소 변경]
-# - ✅ list_target_files_today(): month_dir "바로 아래"만 보던 탐색을
-#   month_dir 하위 전체로 확장 (rglob) => 폴더 구조가 달라도 "오늘 파일"을 찾게 함
+# [이번 수정(핵심, d1 방식으로 고정)]
+# - ✅ BASE_DIR을 Vision까지로 고정: \\...\Machine Log\Vision
+# - ✅ 파일 탐색을 Vision\YYYY\MM 폴더로 정확히 제한
+#   => UNC/NAS 환경에서 rglob 전체 스캔으로 인한 "no files" / 지연 / 타임아웃 방지
 # ============================================
 
 import re
@@ -41,7 +42,9 @@ import urllib.parse
 # ============================================
 # 1) 기본 설정
 # ============================================
-BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log")
+# ✅ Vision 로그 실제 위치에 맞게 고정
+#   \\192.168.108.155\FCT LogFile\Machine Log\Vision\YYYY\MM\YYYYMMDD_Vision*_Machine_Log.txt
+BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\Vision")
 
 DB_CONFIG = {
     "host": "192.168.108.162",
@@ -57,10 +60,24 @@ TABLE_MAP = {
     "Vision2": "Vision2_machine_log",
 }
 
+# 스레드 2개 고정
 THREAD_WORKERS = 2
+
+# 1초 루프
 SLEEP_SEC = 1
+
+# offset 캐시: path -> 마지막 읽은 파일 byte 위치
 PROCESSED_OFFSET = {}
-LOG_EVERY_LOOP = 10
+
+# 콘솔 로그 주기(너무 많은 출력 방지)
+LOG_EVERY_LOOP = 10  # 10회(=약 10초)마다 한번 요약 로그
+
+# 파일명 패턴 (YYYYMMDD_Vision1/2_Machine_Log)
+FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
+
+# 라인 패턴:
+# - [hh:mm:ss.xx] contents
+LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
 
 
 # ============================================
@@ -126,13 +143,6 @@ def ensure_schema_tables(engine):
 # ============================================
 # 4) 파일 파싱 유틸
 # ============================================
-LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
-FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
-
-YEAR_RE = re.compile(r"^\d{4}$")
-MONTH_RE = re.compile(r"^\d{2}$")
-
-
 def clean_contents(raw: str, max_len: int = 200):
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     s = " ".join(s.split())
@@ -140,6 +150,7 @@ def clean_contents(raw: str, max_len: int = 200):
 
 
 def _open_text_file(path: Path):
+    # 인코딩 혼재 방어
     try:
         return path.open("r", encoding="utf-8", errors="ignore")
     except Exception:
@@ -147,9 +158,7 @@ def _open_text_file(path: Path):
 
 
 # ============================================
-# 5) 오늘 파일 목록 수집 (✅ 120초/mtime 조건 제거)
-#    - ✅ 기존 year/month 폴더 검증/정렬 방식 유지
-#    - ✅ 변경: month_dir 바로 아래 -> month_dir 하위 전체(rglob)
+# 5) ✅ 오늘 파일 목록 수집 (d1 방식: Vision\YYYY\MM만 정확히)
 # ============================================
 def list_target_files_today(base_dir: Path, today_ymd: str):
     files = []
@@ -157,30 +166,30 @@ def list_target_files_today(base_dir: Path, today_ymd: str):
         log(f"[WARN] BASE_DIR not found: {base_dir}")
         return files
 
-    for year_dir in sorted(base_dir.iterdir()):
-        if not (year_dir.is_dir() and YEAR_RE.match(year_dir.name)):
-            continue
+    now = datetime.now()
+    year_dir = base_dir / f"{now.year:04d}"
+    month_dir = year_dir / f"{now.month:02d}"
 
-        for month_dir in sorted(year_dir.iterdir()):
-            if not (month_dir.is_dir() and MONTH_RE.match(month_dir.name)):
-                continue
+    if not month_dir.exists():
+        log(f"[WARN] month_dir not found: {month_dir}")
+        return files
 
-            # ✅ 최소 변경: month_dir 하위 전체 탐색
-            for file_path in month_dir.rglob("*.txt"):
-                if not file_path.is_file():
-                    continue
+    # 정석: 오늘 파일은 보통 2개
+    candidates = [
+        month_dir / f"{today_ymd}_Vision1_Machine_Log.txt",
+        month_dir / f"{today_ymd}_Vision2_Machine_Log.txt",
+    ]
 
-                m = FILENAME_PATTERN.search(file_path.name)
-                if not m:
-                    continue
+    for fp in candidates:
+        if fp.is_file():
+            files.append(str(fp))
 
-                file_ymd = m.group(1)
-                if file_ymd != today_ymd:
-                    continue
+    # ✅ 보험: 확장자/대소문자 변형 케이스가 있으면, "파일 0개일 때만" 가볍게 glob
+    if not files:
+        for fp in month_dir.glob(f"{today_ymd}_Vision*_Machine_Log.*"):
+            if fp.is_file() and FILENAME_PATTERN.search(fp.name):
+                files.append(str(fp))
 
-                files.append(str(file_path))
-
-    # 중복 제거 + 정렬(기존 느낌 유지)
     return sorted(set(files))
 
 
@@ -205,6 +214,7 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
     if file_ymd != today_ymd:
         return [], offset, station, path_str, "SKIP_NOT_TODAY"
 
+    # 파일이 truncate(재생성/로테이션) 된 경우 보호
     try:
         size = file_path.stat().st_size
     except Exception as e:
@@ -232,6 +242,7 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
                 end_time_str = m2.group(1)
                 contents_raw = m2.group(2)
 
+                # 시간 포맷 검증(완화)
                 try:
                     _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
                 except ValueError:
@@ -258,7 +269,7 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
 
 
 # ============================================
-# 7) DB Insert (중복은 무조건 무시) - 기존 유지
+# 7) DB INSERT (중복은 무조건 무시)
 # ============================================
 def insert_to_db(engine, df: pd.DataFrame):
     if df is None or df.empty:
@@ -291,7 +302,7 @@ def insert_to_db(engine, df: pd.DataFrame):
 # 8) main loop - 기존 구조 유지(요약로그/INIT재시도/예외정책/페이싱)
 # ============================================
 def main():
-    log("### BUILD: d2 Vision parser OPTION-A (TAIL-FOLLOW) v2025-12-30-01 ###")
+    log("### BUILD: d2 Vision parser OPTION-A (TAIL-FOLLOW) v2026-01-04-01 ###")
 
     engine = get_engine()
 
@@ -310,6 +321,7 @@ def main():
     log(f"[INFO] THREADS={THREAD_WORKERS} | SLEEP={SLEEP_SEC}s")
     log("[INFO] DEDUP POLICY = DB UNIQUE INDEX + ON CONFLICT DO NOTHING")
     log("[INFO] FILE POLICY = TodayOnly + Tail-Follow(offset) | (mtime window removed)")
+    log("[INFO] FILE SCAN = Vision\\YYYY\\MM fixed (d1 style, fast on UNC)")
     log("=" * 78)
 
     loop_i = 0
@@ -331,7 +343,7 @@ def main():
             files = list_target_files_today(BASE_DIR, today_ymd=today_ymd)
             if not files:
                 if loop_i % LOG_EVERY_LOOP == 0:
-                    log(f"[LOOP] no files (today={today_ymd})")
+                    log(f"[LOOP] no files (today={today_ymd}) | expected_dir={BASE_DIR}\\{datetime.now().year:04d}\\{datetime.now().month:02d}")
                 time_mod.sleep(SLEEP_SEC)
                 continue
 
