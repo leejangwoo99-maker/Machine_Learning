@@ -17,6 +17,10 @@
 # - ❌ 120초(mtime) 조건 제거
 # - ✅ 하루 1개 파일이 계속 append 되는 구조이므로,
 #      "offset 기반 tail-follow"로 신규 라인만 처리 (파일 전체 재파싱 제거)
+#
+# [이번 수정 - 최소 변경]
+# - ✅ list_target_files_today(): month_dir "바로 아래"만 보던 탐색을
+#   month_dir 하위 전체로 확장 (rglob) => 폴더 구조가 달라도 "오늘 파일"을 찾게 함
 # ============================================
 
 import re
@@ -53,17 +57,10 @@ TABLE_MAP = {
     "Vision2": "Vision2_machine_log",
 }
 
-# 스레드 2개 고정
 THREAD_WORKERS = 2
-
-# 1초 루프
 SLEEP_SEC = 1
-
-# ✅ offset 캐시: path -> 마지막 읽은 파일 byte 위치
 PROCESSED_OFFSET = {}
-
-# 콘솔 로그 주기(너무 많은 출력 방지)
-LOG_EVERY_LOOP = 10  # 10회(=약 10초)마다 한번 요약 로그
+LOG_EVERY_LOOP = 10
 
 
 # ============================================
@@ -151,7 +148,8 @@ def _open_text_file(path: Path):
 
 # ============================================
 # 5) 오늘 파일 목록 수집 (✅ 120초/mtime 조건 제거)
-#    - 기존의 year/month 폴더 구조 순회/검증/정렬 방식 유지
+#    - ✅ 기존 year/month 폴더 검증/정렬 방식 유지
+#    - ✅ 변경: month_dir 바로 아래 -> month_dir 하위 전체(rglob)
 # ============================================
 def list_target_files_today(base_dir: Path, today_ymd: str):
     files = []
@@ -167,7 +165,8 @@ def list_target_files_today(base_dir: Path, today_ymd: str):
             if not (month_dir.is_dir() and MONTH_RE.match(month_dir.name)):
                 continue
 
-            for file_path in month_dir.iterdir():
+            # ✅ 최소 변경: month_dir 하위 전체 탐색
+            for file_path in month_dir.rglob("*.txt"):
                 if not file_path.is_file():
                     continue
 
@@ -181,14 +180,12 @@ def list_target_files_today(base_dir: Path, today_ymd: str):
 
                 files.append(str(file_path))
 
-    return files
+    # 중복 제거 + 정렬(기존 느낌 유지)
+    return sorted(set(files))
 
 
 # ============================================
 # 6) Tail-follow 파서 (offset 기반)
-#    - (path_str, today_ymd, offset) -> (rows, new_offset, station, path_str, status)
-#    - 기존 parse_machine_log_file()의 기능을 유지하되,
-#      파일 전체가 아니라 offset 이후 "신규 라인만" 읽는다.
 # ============================================
 def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
     """
@@ -208,7 +205,6 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
     if file_ymd != today_ymd:
         return [], offset, station, path_str, "SKIP_NOT_TODAY"
 
-    # 파일이 truncate(재생성/로테이션) 된 경우 보호: offset > size면 0 리셋
     try:
         size = file_path.stat().st_size
     except Exception as e:
@@ -217,7 +213,6 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
     if offset > size:
         offset = 0
 
-    # 읽을 게 없으면 스킵
     if offset == size:
         return [], offset, station, path_str, "SKIP_NOCHANGE"
 
@@ -226,7 +221,6 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
 
     try:
         with _open_text_file(file_path) as f:
-            # 텍스트 모드에서도 seek/tell 동작(바이트 기반)하도록 offset을 그대로 사용
             f.seek(offset, os.SEEK_SET)
 
             for line in f:
@@ -238,7 +232,6 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
                 end_time_str = m2.group(1)
                 contents_raw = m2.group(2)
 
-                # 시간 포맷 검증(완화)
                 try:
                     _ = datetime.strptime(end_time_str, "%H:%M:%S.%f").time()
                 except ValueError:
@@ -346,26 +339,21 @@ def main():
             all_records = []
             offset_updates = {}
 
-            if len(files) >= 2:
-                workers = min(THREAD_WORKERS, len(files))
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = []
-                    for fp in files:
-                        off = int(PROCESSED_OFFSET.get(fp, 0))
-                        futs.append(ex.submit(parse_machine_log_file_tail, fp, today_ymd, off))
+            workers = min(THREAD_WORKERS, len(files))
+            if workers < 1:
+                workers = 1
 
-                    for f in as_completed(futs):
-                        rows, new_off, station, fp, status = f.result()
-                        offset_updates[fp] = int(new_off)
-                        if rows:
-                            all_records.extend(rows)
-            else:
-                fp = files[0]
-                off = int(PROCESSED_OFFSET.get(fp, 0))
-                rows, new_off, station, fp, status = parse_machine_log_file_tail(fp, today_ymd, off)
-                offset_updates[fp] = int(new_off)
-                if rows:
-                    all_records.extend(rows)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = []
+                for fp in files:
+                    off = int(PROCESSED_OFFSET.get(fp, 0))
+                    futs.append(ex.submit(parse_machine_log_file_tail, fp, today_ymd, off))
+
+                for f in as_completed(futs):
+                    rows, new_off, station, fp, status = f.result()
+                    offset_updates[fp] = int(new_off)
+                    if rows:
+                        all_records.extend(rows)
 
             # ✅ offset 갱신(항상 메인에서)
             for fp, new_off in offset_updates.items():
@@ -374,7 +362,6 @@ def main():
             if not all_records:
                 if loop_i % LOG_EVERY_LOOP == 0:
                     log(f"[LOOP] parsed=0 | files={len(files)} | (tail no new lines)")
-                # pacing below
             else:
                 df = pd.DataFrame(all_records)
 

@@ -72,8 +72,8 @@ TC_TO_STATION = {
 TARGET_SUBFOLDERS = ["GoodFile", "BadFile"]
 
 # 폴더(yyyymmdd) 기준 제한
-START_DAY = "20251001"
-END_DAY   = "20251220"
+START_DAY = "20250917"
+END_DAY   = "20250930"
 
 # DB 설정
 DB_CONFIG = {

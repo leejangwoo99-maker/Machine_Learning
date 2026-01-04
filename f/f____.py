@@ -6,17 +6,24 @@
 # 1) bootstrap = CREATE SCHEMA/TABLE IF NOT EXISTS (최초 1회/없으면 생성)
 # 2) DATE_FROM/DATE_TO = "자동 증분 선택" 지원
 #    - MODE = "AUTO_INCREMENT" : OUT_TABLE에 이미 적재된 max(end_day) 이후만 자동 처리
-#    - MODE = "MANUAL_RANGE"   : DATE_FROM~DATE_TO 수동 범위 처리(기존과 동일)
+#    - MODE = "MANUAL_RANGE"   : DATE_FROM~DATE_TO 수동 처리
 # 3) 실행 시작/종료/총 시간(초) 콘솔 출력 유지
 # 4) df 크기별 자동 분기 UPSERT 유지
 #    - 소량: DIRECT UPSERT(execute_values)
 #    - 대량: COPY+UNLOGGED staging+UPSERT
-# 5) ✅ [추가] file_path 기준 "이미 처리된 파일"은 전체 파이프라인에서 제외(pass)
+# 5) ✅ file_path 기준 "이미 처리된 파일"은 전체 파이프라인에서 제외(pass)
 #    - OUT_TABLE에 존재하는 file_path와 동일하면, 소스(df0)에서 해당 file_path 전체 제외
 #    - 안전장치: file_path NULL/빈값은 제외대상에서 뺌(처리 대상 유지)
 #
-# ⚠️ 기존 기능(스냅/매칭/스텝매핑/삭제/PK/업서트/타입변환/디버그 커버리지 등) 절대 누락 없이 유지
-# ⚠️ [요청] 1초 실시간 감시모드는 제외(단발 실행)
+# [치명적 결함 2개 수정]
+# (1) bootstrap에서 idx_file_path 인덱스 중복 생성 제거 (한 번만 생성)
+# (2) main()의 "중복 파이프라인" 제거:
+#     - 일자 루프 중간에 끊긴 뒤, 전체 범위를 다시 load_source()하는 구조 금지
+#     - processed_paths 함수 호출 시 engine 누락(또는 잘못된 호출) 방지
+#
+# [추가 운영형 보완 A,B]
+# (A) COPY 청크 자동 다운시프트(재시도 실패 시 200k→100k→50k→20k 자동 감소)
+# (B) processed file_path 조회 결과를 날짜(YYYY-MM-DD) 단위로 캐시하여 DB 조회량 최소화
 
 import io
 import time
@@ -26,18 +33,24 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 # ============================================================
 # 0) 실행 옵션
 # ============================================================
 SHOW_PREVIEW = False
 END_TIME_TOL_SECONDS = 2
-COPY_CHUNK_ROWS = 200_000
-DEBUG_JOIN_COVERAGE = False   # ← 디버그 조인 커버리지 스위치
+DEBUG_JOIN_COVERAGE = False  # 디버그 조인 커버리지 스위치
 
 # 자동 분기 기준(행 수)
 UPSERT_DIRECT_THRESHOLD_ROWS = 20_000
 DIRECT_UPSERT_BATCH_ROWS = 5_000
+
+# COPY 기본 청크(시작값) + 다운시프트 후보
+COPY_CHUNK_START_ROWS = 200_000
+COPY_CHUNK_FALLBACKS = [200_000, 100_000, 50_000, 20_000]  # ✅ (A) 자동 다운시프트
+COPY_RETRY_PER_CHUNK = 3
+COPY_RETRY_SLEEP_SEC = 5
 
 # ============================================================
 # [운영 모드] 날짜 처리 방식
@@ -47,25 +60,19 @@ DIRECT_UPSERT_BATCH_ROWS = 5_000
 DATE_MODE = "MANUAL_RANGE"   # "AUTO_INCREMENT" or "MANUAL_RANGE"
 
 # MANUAL_RANGE 모드에서만 사용
-DATE_FROM = date(2025, 11, 15)
-DATE_TO   = date(2025, 11, 18)
+DATE_FROM = date(year=2025, month=11, day=26)
+DATE_TO   = date(year=2025, month=12, day=19)
 
 # AUTO_INCREMENT 모드 세부 옵션
-# - SAFETY_LOOKBACK_DAYS: "실시간/지연 도착" 데이터 보정용 재처리 구간(최근 N일을 다시 UPSERT)
-#   예) 2일로 두면: (max_end_day - 2일) ~ today 범위를 매번 재처리 -> 누락 방지(UPSERT라 중복 문제 없음)
 SAFETY_LOOKBACK_DAYS = 2
-
-# - AUTO_TO_TODAY: True면 DATE_TO를 오늘로 고정 (운영 기본)
 AUTO_TO_TODAY = True
-
-# - MAX_DAYS_PER_RUN: 하루치씩 처리하면 안정적, 너무 길면 한번에 크게 처리
 MAX_DAYS_PER_RUN = 7   # 1~7 권장 (운영 안정 목적)
 
 # ============================================================
 # 1) DB 접속
 # ============================================================
 DB_CONFIG = {
-    "host": "localhost",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -74,11 +81,21 @@ DB_CONFIG = {
 
 def get_engine(cfg):
     pw = urllib.parse.quote_plus(cfg["password"])
-    conn_str = (
-        f"postgresql+psycopg2://{cfg['user']}:{pw}@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
-        "?connect_timeout=5"
+    conn_str = f"postgresql+psycopg2://{cfg['user']}:{pw}@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
+    return create_engine(
+        conn_str,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        connect_args={
+            "connect_timeout": 10,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+            "application_name": "fct_database_upsert",
+            "options": "-c statement_timeout=0",
+        },
     )
-    return create_engine(conn_str, pool_pre_ping=True)
 
 engine = get_engine(DB_CONFIG)
 print("[OK] engine ready")
@@ -97,6 +114,7 @@ OUT_TABLE  = "fct_database"
 
 # ============================================================
 # 3) 테이블 부트스트랩 (운영형: DROP 금지, IF NOT EXISTS)
+#    ✅ 치명 결함(1): idx_file_path 중복 생성 제거 -> 딱 1회만
 # ============================================================
 def bootstrap_fct_database(engine_):
     with engine_.begin() as conn:
@@ -124,7 +142,6 @@ def bootstrap_fct_database(engine_):
             PRIMARY KEY (end_day, barcode_information, end_time, test_time, contents)
         );
         """))
-        # 운영에서 흔히 필요한 보조 인덱스
         conn.execute(text(f"""
         CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_end_day
         ON {OUT_SCHEMA}.{OUT_TABLE} (end_day);
@@ -137,11 +154,11 @@ def bootstrap_fct_database(engine_):
         CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_station
         ON {OUT_SCHEMA}.{OUT_TABLE} (station);
         """))
-        # ✅ file_path 스킵/조회 성능용(선택이지만 권장)
         conn.execute(text(f"""
         CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_file_path
         ON {OUT_SCHEMA}.{OUT_TABLE} (file_path);
         """))
+
     print(f"[OK] bootstrap done: {OUT_SCHEMA}.{OUT_TABLE} ensured (NO DROP)")
 
 # ============================================================
@@ -374,13 +391,10 @@ def normalize_test_time_for_sort(s: pd.Series) -> pd.Series:
 
 def strip_step_prefix_by_remark(step: pd.Series, remark: pd.Series) -> pd.Series:
     out = step.astype("string")
-
     is_pd = remark.astype("string") == "PD"
     is_np = remark.astype("string") == "Non-PD"
-
     out.loc[is_pd] = out.loc[is_pd].str.replace(r"^pd_", "", regex=True)
     out.loc[is_np] = out.loc[is_np].str.replace(r"^nonpd_", "", regex=True)
-
     return out.fillna(pd.NA).astype("string").str.strip()
 
 def norm_step_key(s: pd.Series) -> pd.Series:
@@ -408,11 +422,6 @@ def _safe_date(v):
     return None
 
 def resolve_date_range(engine_) -> tuple[date, date]:
-    """
-    DATE_MODE에 따라 (DATE_FROM, DATE_TO) 결정
-    - AUTO_INCREMENT: OUT_TABLE max(end_day) 기준 증분 처리 + safety lookback 적용
-    - MANUAL_RANGE : 전역 DATE_FROM~DATE_TO 그대로
-    """
     if DATE_MODE == "MANUAL_RANGE":
         if DATE_FROM is None or DATE_TO is None:
             raise ValueError("[STOP] MANUAL_RANGE requires DATE_FROM and DATE_TO")
@@ -420,13 +429,11 @@ def resolve_date_range(engine_) -> tuple[date, date]:
             raise ValueError("[STOP] DATE_TO < DATE_FROM")
         return DATE_FROM, DATE_TO
 
-    # AUTO_INCREMENT
     with engine_.connect() as conn:
         max_sql = text(f"SELECT MAX(end_day) AS max_end_day FROM {OUT_SCHEMA}.{OUT_TABLE};")
         row = conn.execute(max_sql).fetchone()
         max_end_day = _safe_date(row[0] if row else None)
 
-        # 소스 최신일(참고)
         src_max_sql = text(f"SELECT MAX(end_day) AS src_max_end_day FROM {SRC_SCHEMA}.{SRC_TABLE};")
         row2 = conn.execute(src_max_sql).fetchone()
         src_max_end_day = _safe_date(row2[0] if row2 else None)
@@ -437,12 +444,10 @@ def resolve_date_range(engine_) -> tuple[date, date]:
     if src_max_end_day is None:
         raise ValueError("[STOP] source has no end_day (src_max_end_day is NULL)")
 
-    # 처리 상한: 소스 최신일/오늘 중 작은 값
     if to_day > src_max_end_day:
         to_day = src_max_end_day
 
     if max_end_day is None:
-        # 최초 실행: 최신일 기준 MAX_DAYS_PER_RUN만큼만
         from_day = max(date(1900, 1, 1), to_day - timedelta(days=MAX_DAYS_PER_RUN - 1))
     else:
         from_day = max_end_day - timedelta(days=SAFETY_LOOKBACK_DAYS)
@@ -457,53 +462,65 @@ def resolve_date_range(engine_) -> tuple[date, date]:
     return from_day, to_day
 
 # ============================================================
-# 6-A) ✅ [추가] file_path 기준 처리 제외(이미 처리된 파일 PASS)
+# 6-A) ✅ file_path 기준 처리 제외(이미 처리된 파일 PASS)
+#     ✅ (B) 날짜 단위 캐시
 # ============================================================
-def _clean_file_path_series(s: pd.Series) -> pd.Series:
-    # 공백/널/빈문자 안전 정리
-    return s.astype("string").fillna("").str.strip()
+_processed_paths_cache: dict[str, set] = {}  # key: "YYYY-MM-DD"
 
-def get_processed_file_paths(engine_) -> set:
-    """
-    OUT_TABLE에 이미 존재하는 file_path 집합을 읽어옴.
-    - NULL/빈문자 제외
-    - 대량에서도 문제없도록 DISTINCT만 가져옴(인덱스 권장)
-    """
-    with engine_.connect() as conn:
-        rows = conn.execute(text(f"""
+def get_processed_file_paths(engine_, candidate_paths, chunk_size: int = 5000) -> set:
+    if candidate_paths is None:
+        return set()
+
+    s = pd.Series(candidate_paths, dtype="string").fillna("").str.strip()
+    s = s[s != ""].drop_duplicates()
+    paths = s.tolist()
+    if not paths:
+        return set()
+
+    exist = set()
+    sql = text(f"""
         SELECT DISTINCT file_path
         FROM {OUT_SCHEMA}.{OUT_TABLE}
-        WHERE file_path IS NOT NULL
-          AND btrim(file_path) <> ''
-        """)).fetchall()
-    return set(r[0] for r in rows if r and r[0] is not None and str(r[0]).strip() != "")
+        WHERE file_path = ANY(:paths)
+    """)
 
-def filter_out_already_processed_by_file_path(df: pd.DataFrame, processed_paths: set) -> pd.DataFrame:
+    with engine_.connect() as conn:
+        for i in range(0, len(paths), chunk_size):
+            sub = paths[i:i+chunk_size]
+            rows = conn.execute(sql, {"paths": sub}).fetchall()
+            exist.update([r[0] for r in rows if r and r[0]])
+
+    return exist
+
+def get_processed_file_paths_cached(engine_, day_: date, candidate_paths) -> set:
     """
-    df0 (source)에서 file_path가 processed_paths에 존재하면 해당 file_path 전체를 제외
+    ✅ (B) 동일 일자 처리 중에는 processed file_path 조회를 1회만 수행
     """
-    if df.empty:
-        return df
+    key = day_.strftime("%Y-%m-%d")
+    if key in _processed_paths_cache:
+        return _processed_paths_cache[key]
+
+    exist = get_processed_file_paths(engine_, candidate_paths)
+    _processed_paths_cache[key] = exist
+    return exist
+
+def apply_file_path_skip(df0: pd.DataFrame, processed_paths: set) -> pd.DataFrame:
+    if df0 is None or df0.empty:
+        return df0
     if not processed_paths:
-        return df
+        print("[OK] file_path skip applied: processed_paths=0")
+        return df0
 
-    fp = _clean_file_path_series(df["file_path"] if "file_path" in df.columns else pd.Series([], dtype="string"))
-    # file_path 비어있는 row는 "스킵 판단 불가" -> 처리 대상 유지
+    fp = df0["file_path"].astype("string").fillna("").str.strip()
     has_fp = fp != ""
     mask_skip = has_fp & fp.isin(processed_paths)
 
-    before = len(df)
-    out = df.loc[~mask_skip].copy()
-    skipped = before - len(out)
+    before = len(df0)
+    out = df0.loc[~mask_skip].copy()
+    skipped_rows = before - len(out)
+    skipped_files = int(fp.loc[mask_skip].nunique()) if skipped_rows > 0 else 0
 
-    if skipped > 0:
-        # 몇 개의 file_path가 스킵됐는지 같이 출력(운영에 유용)
-        try:
-            skipped_files = int(fp.loc[mask_skip].nunique())
-        except Exception:
-            skipped_files = -1
-        print(f"[SKIP] file_path already processed -> rows skipped: {skipped} (unique file_path skipped: {skipped_files})")
-
+    print(f"[OK] file_path skip applied: skipped_rows={skipped_rows} / remain_rows={len(out)} / unique_file_path_skipped={skipped_files}")
     return out
 
 # ============================================================
@@ -614,7 +631,6 @@ def build_steps_and_setup_ct(df: pd.DataFrame) -> pd.DataFrame:
     work["set_up_or_test_ct"] = np.nan
 
     work["_test_ct_num"] = pd.to_numeric(work["test_ct"], errors="coerce").fillna(0.0).astype("float64")
-
     c = work["contents"].astype(str)
     work["_is_okng"] = c.str.contains(OK_TOKEN, na=False) | c.str.contains(NG_TOKEN, na=False)
 
@@ -633,7 +649,6 @@ def build_steps_and_setup_ct(df: pd.DataFrame) -> pd.DataFrame:
     base = work[["group", "_row_no", "_csum"]].rename(columns={"_row_no": "prev_okng_row_no", "_csum": "prev_okng_csum"})
     okng = okng.merge(base, how="left", on=["group", "prev_okng_row_no"])
     okng["prev_okng_csum"] = okng["prev_okng_csum"].fillna(0.0)
-
     okng["set_up_or_test_ct"] = (okng["_csum"] - okng["prev_okng_csum"]).astype("float64")
 
     def map_step(remark_: str, k_: int):
@@ -722,6 +737,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
         print("[DBG] fct empty -> snap skip")
         return out
 
+    # df 쪽 키 준비
     if "barcode_norm" not in out.columns:
         out["barcode_norm"] = normalize_barcode(out["barcode_information"])
     if "end_day_text" not in out.columns:
@@ -731,6 +747,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     if "end_sec" not in out.columns:
         out["end_sec"] = hhmiss_to_seconds(pd.to_numeric(out["end_time_int"], errors="coerce"))
 
+    # fct 쪽 키 준비
     f = fct.copy()
     if "barcode_norm" not in f.columns:
         f["barcode_norm"] = normalize_barcode(f["barcode_information"])
@@ -741,12 +758,14 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     if "end_sec" not in f.columns:
         f["end_sec"] = hhmiss_to_seconds(pd.to_numeric(f["end_time_int"], errors="coerce"))
 
+    # group 대표 1행 (cycle end_time 스냅 기준)
     reps = out.groupby("group", sort=False).head(1)[["group", "barcode_norm", "end_day_text", "end_sec"]].copy()
     reps = reps.dropna(subset=["barcode_norm", "end_day_text", "end_sec"]).reset_index(drop=True)
     if reps.empty:
         print("[DBG] reps empty -> snap skip")
         return out
 
+    # merge (suffix가 실제로 붙지 않을 수 있으므로 안전 처리)
     j = reps.merge(
         f[["barcode_norm", "end_day_text", "end_time_int", "end_sec", "station", "run_time"]],
         how="left",
@@ -757,24 +776,29 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
         print("[DBG] snap join empty")
         return out
 
-    j["fct_end_sec"] = j["end_sec_fct"] if "end_sec_fct" in j.columns else j["end_sec"]
-    j["fct_end_time_int"] = (j["end_time_int_fct"] if "end_time_int_fct" in j.columns else j["end_time_int"]).astype("string")
+    # suffix가 적용되면 end_time_int_fct / end_sec_fct
+    # 적용 안되면 end_time_int / end_sec
+    col_time = "end_time_int_fct" if "end_time_int_fct" in j.columns else "end_time_int"
+    col_sec = "end_sec_fct" if "end_sec_fct" in j.columns else "end_sec"
 
+    j["fct_end_time_int"] = j[col_time].astype("string")
+    j["fct_end_sec"] = pd.to_numeric(j[col_sec], errors="coerce")
+
+    # diff 계산(±tol)
     j["diff"] = (pd.to_numeric(j["fct_end_sec"], errors="coerce") - pd.to_numeric(j["end_sec"], errors="coerce")).abs()
     j = j[(j["diff"].notna()) & (j["diff"] <= END_TIME_TOL_SECONDS)].copy()
     if j.empty:
         print("[DBG] snap: no cand within tol")
         return out
 
+    # group별 diff 최소 1개 선택
     best_idx = j.groupby("group")["diff"].idxmin()
     best = j.loc[best_idx, ["group", "fct_end_time_int", "fct_end_sec", "station", "run_time"]].copy()
 
+    # out에 merge
     out = out.merge(best, on="group", how="left", suffixes=("", "_m"))
 
-    if "fct_end_sec_m" in out.columns:
-        out["fct_end_sec"] = out["fct_end_sec"].astype("Int64")
-        out["fct_end_sec_m"] = out["fct_end_sec_m"].astype("Int64")
-
+    # merge 결과 반영
     out["fct_end_time_int"] = out["fct_end_time_int"].where(out["fct_end_time_int"].notna(), out.get("fct_end_time_int_m"))
     out["fct_end_sec"] = out["fct_end_sec"].where(out["fct_end_sec"].notna(), out.get("fct_end_sec_m"))
     out["station"] = out["station"].where(out["station"].notna(), out.get("station_m"))
@@ -782,100 +806,16 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
 
     out = out.drop(columns=["fct_end_time_int_m", "fct_end_sec_m", "station_m", "run_time_m"], errors="ignore")
 
-    matched = int(out["fct_end_sec"].notna().sum())
+    matched_rows = int(out["fct_end_sec"].notna().sum())
     total_groups = int(out["group"].nunique())
     matched_groups = int(out.loc[out["fct_end_sec"].notna(), "group"].nunique())
-    print(f"[OK] snap group cycle: matched_groups={matched_groups}/{total_groups} (rows with fct_end_sec={matched})")
+    print(f"[OK] snap group cycle: matched_groups={matched_groups}/{total_groups} (rows with fct_end_sec={matched_rows})")
 
     return out
 
 # ============================================================
 # 11) value/min/max/result 매칭
 # ============================================================
-def debug_join_coverage(df2: pd.DataFrame, fct: pd.DataFrame, sample_n: int = 200_000):
-    print("\n" + "="*120)
-    print("[DBG] JOIN COVERAGE CHECK (메모리 안전, 폭발 방지)")
-    print("="*120)
-
-    if fct is None or fct.empty:
-        print("[DBG] fct is empty -> STOP")
-        return
-
-    a = df2.copy()
-    b = fct.copy()
-
-    if "end_day_text" not in a.columns:
-        a["end_day_text"] = to_day_text_from_date(a["end_day"])
-    if "fct_end_time_int" not in a.columns:
-        print("[DBG] df2 has no fct_end_time_int -> snap 실패 가능성")
-        print("      columns:", a.columns.tolist())
-        return
-    if "station" not in a.columns:
-        a["station"] = pd.NA
-    if "remark" not in a.columns:
-        a["remark"] = pd.NA
-
-    a["_step_stripped"] = strip_step_prefix_by_remark(a["step_description"].astype("string"), a["remark"].astype("string"))
-    a["step_key_norm"] = norm_step_key(a["_step_stripped"])
-
-    if "end_day_text" not in b.columns:
-        b["end_day_text"] = b["end_day"].astype("string")
-    if "end_time_int" not in b.columns:
-        b["end_time_int"] = to_time_text_from_time(b["end_time"])
-    if "station" not in b.columns:
-        b["station"] = pd.NA
-    if "remark" not in b.columns:
-        b["remark"] = pd.NA
-
-    b["_step_raw"] = b["step_description"].astype("string").fillna("").str.replace(r"^(pd_|nonpd_)", "", regex=True)
-    b["step_key_norm"] = norm_step_key(b["_step_raw"])
-
-    need = a[
-        a["fct_end_time_int"].notna()
-        & a["end_day_text"].notna()
-        & a["step_description"].notna()
-        & a["station"].notna()
-    ].copy()
-
-    print(f"[DBG] df2 rows total={len(a)} / need rows={len(need)}")
-    print(f"[DBG] snap filled fct_end_time_int={int(a['fct_end_time_int'].notna().sum())} / station={int(a['station'].notna().sum())}")
-
-    if need.empty:
-        print("[DBG] need empty -> 매칭 시도 자체가 0")
-        return
-
-    if len(need) > sample_n:
-        need = need.sample(sample_n, random_state=42).copy()
-        print(f"[DBG] need sampled to {len(need)} rows for safe debug")
-
-    b1 = b[["end_day_text", "end_time_int"]].drop_duplicates()
-    ref1 = (b1["end_day_text"].astype("string") + "|" + b1["end_time_int"].astype("string"))
-    key1 = (need["end_day_text"].astype("string") + "|" + need["fct_end_time_int"].astype("string"))
-    hit1 = int(key1.isin(pd.Index(ref1)).sum())
-    print(f"[DBG-1] match by (end_day_text, cycle_end_time) = {hit1} / {len(need)}")
-
-    b2 = b[["end_day_text", "end_time_int", "station"]].drop_duplicates()
-    ref2 = (b2["end_day_text"].astype("string") + "|" + b2["end_time_int"].astype("string") + "|" + b2["station"].astype("string"))
-    key2 = (need["end_day_text"].astype("string") + "|" + need["fct_end_time_int"].astype("string") + "|" + need["station"].astype("string"))
-    hit2 = int(key2.isin(pd.Index(ref2)).sum())
-    print(f"[DBG-2] match + station = {hit2} / {len(need)}")
-
-    b3 = b[["end_day_text", "end_time_int", "station", "step_key_norm"]].drop_duplicates()
-    ref3 = (b3["end_day_text"].astype("string") + "|" + b3["end_time_int"].astype("string") + "|" + b3["station"].astype("string") + "|" + b3["step_key_norm"].astype("string"))
-    key3 = (need["end_day_text"].astype("string") + "|" + need["fct_end_time_int"].astype("string") + "|" + need["station"].astype("string") + "|" + need["step_key_norm"].astype("string"))
-    hit3 = int(key3.isin(pd.Index(ref3)).sum())
-    print(f"[DBG-3] match + station + step_key_norm = {hit3} / {len(need)}")
-
-    b4 = b[["end_day_text", "end_time_int", "station", "step_key_norm", "remark"]].drop_duplicates()
-    ref4 = (b4["end_day_text"].astype("string") + "|" + b4["end_time_int"].astype("string") + "|" + b4["station"].astype("string") + "|" + b4["step_key_norm"].astype("string") + "|" + b4["remark"].astype("string"))
-    key4 = (need["end_day_text"].astype("string") + "|" + need["fct_end_time_int"].astype("string") + "|" + need["station"].astype("string") + "|" + need["step_key_norm"].astype("string") + "|" + need["remark"].astype("string"))
-    hit4 = int(key4.isin(pd.Index(ref4)).sum())
-    print(f"[DBG-4] match + station + step_key_norm + remark = {hit4} / {len(need)}")
-
-    print("\n[DBG] fct end_time_int sample:", b["end_time_int"].dropna().astype(str).head(5).tolist())
-    print("[DBG] df2 fct_end_time_int sample:", a["fct_end_time_int"].dropna().astype(str).head(5).tolist())
-    print("="*120 + "\n")
-
 def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
@@ -920,30 +860,29 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
         fct2[c] = fct2[c].astype("string")
 
     fct_key = fct2[
-        ["barcode_norm","end_day_text","station","end_time_int","step_key_norm","value","min","max","result"]
-    ].rename(columns={"end_time_int":"end_time_int_fct"})
+        ["barcode_norm", "end_day_text", "station", "end_time_int", "step_key_norm", "value", "min", "max", "result"]
+    ].rename(columns={"end_time_int": "end_time_int_fct"})
 
-    need2 = need.drop(columns=["value","min","max","result"], errors="ignore")
+    need2 = need.drop(columns=["value", "min", "max", "result"], errors="ignore")
 
     j = need2.merge(
         fct_key,
         how="left",
-        left_on=["barcode_norm","end_day_text","station","fct_end_time_int","step_key_norm"],
-        right_on=["barcode_norm","end_day_text","station","end_time_int_fct","step_key_norm"]
+        left_on=["barcode_norm", "end_day_text", "station", "fct_end_time_int", "step_key_norm"],
+        right_on=["barcode_norm", "end_day_text", "station", "end_time_int_fct", "step_key_norm"]
     )
 
     print("[DBG-MATCH] join rows:", len(j), "/", len(need2))
     print("[DBG-MATCH] non-null value in join:", int(j["value"].notna().sum()))
 
     j = j.sort_values("_row_id").drop_duplicates("_row_id", keep="first")
-
-    got = j[["_row_id","value","min","max","result"]]
+    got = j[["_row_id", "value", "min", "max", "result"]]
 
     out = out.merge(got, on="_row_id", how="left", suffixes=("", "_m"))
-    for c in ["value","min","max","result"]:
+    for c in ["value", "min", "max", "result"]:
         out[c] = out[c].combine_first(out[f"{c}_m"])
 
-    out = out.drop(columns=[f"{c}_m" for c in ["value","min","max","result"]], errors="ignore")
+    out = out.drop(columns=[f"{c}_m" for c in ["value", "min", "max", "result"]], errors="ignore")
     out = out.drop(columns=["_row_id"], errors="ignore")
 
     print("[CHK] value matched:", int(out["value"].notna().sum()), "/", len(out))
@@ -978,6 +917,78 @@ def _prepare_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
 
     return df2
 
+def _copy_one_chunk(engine_, staging: str, chunk: pd.DataFrame, start: int, end: int):
+    """
+    COPY + INSERT UPSERT를 "한 청크" 단위로 수행 (재시도/재연결을 위에서 컨트롤)
+    """
+    def to_copy_buffer(frame: pd.DataFrame) -> io.StringIO:
+        buf = io.StringIO()
+        frame.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
+        buf.seek(0)
+        return buf
+
+    raw = engine_.raw_connection()
+    try:
+        with raw.cursor() as cur:
+            # staging 준비
+            cur.execute(f"""
+            CREATE UNLOGGED TABLE IF NOT EXISTS {staging}
+            (LIKE {OUT_SCHEMA}.{OUT_TABLE} INCLUDING DEFAULTS);
+            """)
+            raw.commit()
+
+            cur.execute(f"TRUNCATE TABLE {staging};")
+            raw.commit()
+
+            buf = to_copy_buffer(chunk)
+            copy_sql = f"""
+            COPY {staging} (
+                "group", barcode_information, station, remark, end_day, end_time, run_time,
+                contents, step_description, set_up_or_test_ct, value, min, max, result,
+                test_ct, test_time, file_path
+            )
+            FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N');
+            """
+            cur.copy_expert(copy_sql, buf)
+            raw.commit()
+
+            cur.execute(f"""
+            INSERT INTO {OUT_SCHEMA}.{OUT_TABLE} (
+                "group", barcode_information, station, remark, end_day, end_time, run_time,
+                contents, step_description, set_up_or_test_ct, value, min, max, result,
+                test_ct, test_time, file_path
+            )
+            SELECT
+                "group", barcode_information, station, remark, end_day, end_time, run_time,
+                contents, step_description, set_up_or_test_ct, value, min, max, result,
+                test_ct, test_time, file_path
+            FROM {staging}
+            ON CONFLICT (end_day, barcode_information, end_time, test_time, contents)
+            DO UPDATE SET
+                "group" = EXCLUDED."group",
+                station = EXCLUDED.station,
+                remark = EXCLUDED.remark,
+                run_time = EXCLUDED.run_time,
+                step_description = EXCLUDED.step_description,
+                set_up_or_test_ct = EXCLUDED.set_up_or_test_ct,
+                value = EXCLUDED.value,
+                min = EXCLUDED.min,
+                max = EXCLUDED.max,
+                result = EXCLUDED.result,
+                test_ct = EXCLUDED.test_ct,
+                file_path = EXCLUDED.file_path,
+                updated_at = now();
+            """)
+            raw.commit()
+
+        print(f"[OK] bulk upsert chunk: {start}~{end-1} ({end-start} rows)")
+
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
+
 def bulk_upsert_copy(engine_, df: pd.DataFrame):
     if df.empty:
         print("[SKIP] df empty")
@@ -992,84 +1003,67 @@ def bulk_upsert_copy(engine_, df: pd.DataFrame):
     ]
     df_db = df2[db_cols].copy()
 
-    def to_copy_buffer(frame: pd.DataFrame) -> io.StringIO:
-        buf = io.StringIO()
-        frame.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
-        buf.seek(0)
-        return buf
-
     total = len(df_db)
     t0 = time.time()
 
-    raw = engine_.raw_connection()
-    try:
-        with raw.cursor() as cur:
-            staging = f"{OUT_SCHEMA}._stg_{OUT_TABLE}"
-            cur.execute(f"""
-            CREATE UNLOGGED TABLE IF NOT EXISTS {staging}
-            (LIKE {OUT_SCHEMA}.{OUT_TABLE} INCLUDING DEFAULTS);
-            """)
-            raw.commit()
+    staging = f"{OUT_SCHEMA}._stg_{OUT_TABLE}"
 
-            for start in range(0, total, COPY_CHUNK_ROWS):
-                end = min(start + COPY_CHUNK_ROWS, total)
-                chunk = df_db.iloc[start:end].copy()
-                PK_COLS = ["end_day", "barcode_information", "end_time", "test_time", "contents"]
+    # ✅ (A) 청크 크기 자동 다운시프트 루프
+    chunk_sizes = [x for x in COPY_CHUNK_FALLBACKS if x <= COPY_CHUNK_START_ROWS]
+    if not chunk_sizes:
+        chunk_sizes = [COPY_CHUNK_START_ROWS]
 
-                before_rows = len(chunk)
-                chunk = chunk.drop_duplicates(subset=PK_COLS, keep="last").copy()
-                dropped = before_rows - len(chunk)
-                if dropped > 0:
-                    print(f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})")
+    current_chunk_rows = chunk_sizes[0]
 
-                cur.execute(f"TRUNCATE TABLE {staging};")
-                raw.commit()
+    start = 0
+    while start < total:
+        end = min(start + current_chunk_rows, total)
+        chunk = df_db.iloc[start:end].copy()
 
-                buf = to_copy_buffer(chunk)
-                copy_sql = f"""
-                COPY {staging} (
-                    "group", barcode_information, station, remark, end_day, end_time, run_time,
-                    contents, step_description, set_up_or_test_ct, value, min, max, result,
-                    test_ct, test_time, file_path
-                )
-                FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N');
-                """
-                cur.copy_expert(copy_sql, buf)
-                raw.commit()
+        # PK 중복 제거(청크 내부)
+        PK_COLS = ["end_day", "barcode_information", "end_time", "test_time", "contents"]
+        before_rows = len(chunk)
+        chunk = chunk.drop_duplicates(subset=PK_COLS, keep="last").copy()
+        dropped = before_rows - len(chunk)
+        if dropped > 0:
+            print(f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})")
 
-                cur.execute(f"""
-                INSERT INTO {OUT_SCHEMA}.{OUT_TABLE} (
-                    "group", barcode_information, station, remark, end_day, end_time, run_time,
-                    contents, step_description, set_up_or_test_ct, value, min, max, result,
-                    test_ct, test_time, file_path
-                )
-                SELECT
-                    "group", barcode_information, station, remark, end_day, end_time, run_time,
-                    contents, step_description, set_up_or_test_ct, value, min, max, result,
-                    test_ct, test_time, file_path
-                FROM {staging}
-                ON CONFLICT (end_day, barcode_information, end_time, test_time, contents)
-                DO UPDATE SET
-                    "group" = EXCLUDED."group",
-                    station = EXCLUDED.station,
-                    remark = EXCLUDED.remark,
-                    run_time = EXCLUDED.run_time,
-                    step_description = EXCLUDED.step_description,
-                    set_up_or_test_ct = EXCLUDED.set_up_or_test_ct,
-                    value = EXCLUDED.value,
-                    min = EXCLUDED.min,
-                    max = EXCLUDED.max,
-                    result = EXCLUDED.result,
-                    test_ct = EXCLUDED.test_ct,
-                    file_path = EXCLUDED.file_path,
-                    updated_at = now();
-                """)
-                raw.commit()
+        attempt = 0
+        while True:
+            try:
+                _copy_one_chunk(engine_, staging, chunk, start, end)
+                break
+            except (OperationalError, Exception) as e:
+                attempt += 1
+                msg = str(e)
+                print(f"[ERR] COPY+UPSERT failed (attempt={attempt}/{COPY_RETRY_PER_CHUNK}) at chunk {start}~{end-1}")
+                print("      ", msg[:300])
 
-                print(f"[OK] bulk upsert chunk: {start}~{end-1} ({end-start} rows)")
+                # 재시도 초과 -> 청크 다운시프트 후 재시도(가능하면)
+                if attempt >= COPY_RETRY_PER_CHUNK:
+                    # 더 작은 청크가 있으면 다운시프트
+                    next_sizes = [x for x in chunk_sizes if x < current_chunk_rows]
+                    if next_sizes:
+                        current_chunk_rows = next_sizes[0]
+                        print(f"[DOWN] COPY_CHUNK_ROWS downshift -> {current_chunk_rows} (retry chunk from {start})")
+                        # end 재계산 후 chunk 재구성
+                        end = min(start + current_chunk_rows, total)
+                        chunk = df_db.iloc[start:end].copy()
+                        before_rows = len(chunk)
+                        chunk = chunk.drop_duplicates(subset=PK_COLS, keep="last").copy()
+                        dropped = before_rows - len(chunk)
+                        if dropped > 0:
+                            print(f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})")
+                        attempt = 0
+                        time.sleep(COPY_RETRY_SLEEP_SEC)
+                        continue
 
-    finally:
-        raw.close()
+                    # 더 줄일 청크가 없으면 최종 실패
+                    raise
+
+                time.sleep(COPY_RETRY_SLEEP_SEC)
+
+        start = end
 
     print(f"[DONE] UPSERT(COPY) 완료: {total} rows / sec={time.time()-t0:.2f}")
 
@@ -1138,7 +1132,10 @@ def direct_upsert(engine_, df: pd.DataFrame):
                 print(f"[OK] direct upsert batch: {start}~{end-1} ({end-start} rows)")
 
     finally:
-        raw.close()
+        try:
+            raw.close()
+        except Exception:
+            pass
 
     print(f"[DONE] UPSERT(DIRECT) 완료: {len(df2)} rows / sec={time.time()-t0:.2f}")
 
@@ -1157,6 +1154,7 @@ def upsert_auto(engine_, df: pd.DataFrame):
 
 # ============================================================
 # 13) MAIN (운영형, 단발 실행)
+#     ✅ 치명 결함(2): 중복 파이프라인 제거(일자별 1회 처리만)
 # ============================================================
 def main():
     run_start = datetime.now()
@@ -1165,66 +1163,67 @@ def main():
     print(f"[RUN] MODE  : DATE_MODE={DATE_MODE}, SAFETY_LOOKBACK_DAYS={SAFETY_LOOKBACK_DAYS}, MAX_DAYS_PER_RUN={MAX_DAYS_PER_RUN}")
     print("=" * 120)
 
-    # 운영형 부트스트랩 (NO DROP)
     bootstrap_fct_database(engine)
 
-    # 처리 날짜 범위 결정
     d_from, d_to = resolve_date_range(engine)
     print(f"[RUN] DATE_RANGE : {d_from} ~ {d_to}")
 
-    # 소스 로드 (범위 내 없으면 종료)
-    df0 = load_source(engine, d_from, d_to)
-    if df0.empty:
-        run_end = datetime.now()
-        print("=" * 120)
-        print(f"[RUN] END   : {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"[RUN] SEC   : {(run_end - run_start).total_seconds():.2f} sec")
-        print("=" * 120)
-        print("[DONE] no data -> exit")
-        return
+    cur = d_from
+    while cur <= d_to:
+        day_start = time.time()
+        print("\n" + "-" * 120)
+        print(f"[RUN] DAY : {cur}")
+        print("-" * 120)
 
-    # ✅ file_path 기준 "이미 처리된 파일" PASS
-    processed_paths = get_processed_file_paths(engine)
-    df0 = filter_out_already_processed_by_file_path(df0, processed_paths)
+        # 1) 소스 로드(해당일 1회)
+        df0 = load_source(engine, cur, cur)
+        if df0.empty:
+            print("[SKIP] no source rows")
+            cur = cur + timedelta(days=1)
+            continue
 
-    if df0.empty:
-        run_end = datetime.now()
-        print("=" * 120)
-        print(f"[RUN] END   : {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"[RUN] SEC   : {(run_end - run_start).total_seconds():.2f} sec")
-        print("=" * 120)
-        print("[DONE] all source rows skipped by file_path -> exit")
-        return
+        # 2) file_path 스킵(해당일 후보만 조회 + ✅ 캐시)
+        processed = get_processed_file_paths_cached(engine, cur, df0["file_path"].tolist())
+        df0 = apply_file_path_skip(df0, processed)
+        if df0.empty:
+            print("[SKIP] all rows skipped by file_path")
+            cur = cur + timedelta(days=1)
+            continue
 
-    df1 = build_steps_and_setup_ct(df0)
+        # 3) step/ct 구성
+        df1 = build_steps_and_setup_ct(df0)
 
-    # 매칭 키 준비 (fct_detail 쪽)
-    df1["barcode_norm"] = normalize_barcode(df1["barcode_information"])
-    df1["end_day_text"] = to_day_text_from_date(df1["end_day"])
-    df1["end_time_int"] = to_time_text_from_time(df1["end_time"])
-    df1["end_sec"] = hhmiss_to_seconds(pd.to_numeric(df1["end_time_int"], errors="coerce"))
+        # 4) 매칭 키 준비(fct_detail 쪽)
+        df1["barcode_norm"] = normalize_barcode(df1["barcode_information"])
+        df1["end_day_text"] = to_day_text_from_date(df1["end_day"])
+        df1["end_time_int"] = to_time_text_from_time(df1["end_time"])
+        df1["end_sec"] = hhmiss_to_seconds(pd.to_numeric(df1["end_time_int"], errors="coerce"))
 
-    days = df1["end_day_text"].dropna().unique().tolist()
-    patterns = [f"%{b}%" for b in df1["barcode_norm"].dropna().unique().tolist()]
+        days = df1["end_day_text"].dropna().unique().tolist()
+        patterns = [f"%{b}%" for b in df1["barcode_norm"].dropna().unique().tolist()]
 
-    fct = load_fct_table(engine, days, patterns)
+        # 5) fct_table 로드
+        fct = load_fct_table(engine, days, patterns)
+        if fct.empty:
+            print("[WARN] fct_table empty for this day -> value/min/max/result will be all NULL")
 
-    # 1) group cycle end_time + station/run_time 스냅
-    df2 = snap_group_cycle_to_fct(df1, fct)
+        # 6) group cycle 스냅 + station/run_time
+        df2 = snap_group_cycle_to_fct(df1, fct)
 
-    if DEBUG_JOIN_COVERAGE:
-        debug_join_coverage(df2, fct)
+        # 7) value/min/max/result 매칭
+        df3 = match_value_min_max_result_by_cycle(df2, fct)
 
-    # 2) value/min/max/result 매칭
-    df3 = match_value_min_max_result_by_cycle(df2, fct)
+        df_final = df3[FINAL_COLS].copy()
 
-    df_final = df3[FINAL_COLS].copy()
+        if SHOW_PREVIEW:
+            print(df_final.head(200))
 
-    if SHOW_PREVIEW:
-        print(df_final.head(200))
+        # 8) 업서트
+        upsert_auto(engine, df_final)
 
-    # 3) 업서트 자동 분기 실행
-    upsert_auto(engine, df_final)
+        print(f"[RUN] DAY DONE : {cur} / rows_final={len(df_final)} / sec={time.time()-day_start:.2f}")
+
+        cur = cur + timedelta(days=1)
 
     run_end = datetime.now()
     run_seconds = (run_end - run_start).total_seconds()
