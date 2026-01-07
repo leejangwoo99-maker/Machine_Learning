@@ -3,24 +3,25 @@
 FCT OP-CT Boxplot Summary + UPH(병렬합산) 계산 + PostgreSQL 저장 스크립트 (MP 적용, Realtime Window 실행)
 
 - Source: a1_fct_vision_testlog_txt_processing_history.fct_vision_testlog_txt_processing_history
-- Output:
-  1) e1_FCT_ct.fct_op_ct         (summary_df2: plotly_json 포함, html 제외)
-  2) e1_FCT_ct.fct_whole_op_ct   (final_df_86: left/right/whole UPH/CTeq/final_ct)
+- Output (APPEND 누적):
+  1) e1_FCT_ct.fct_op_ct         (summary_df2: plotly_json 포함, html 제외, inserted_at 포함)
+  2) e1_FCT_ct.fct_whole_op_ct   (final_df_86: left/right/whole UPH/CTeq/final_ct, inserted_at 포함)
 
-요구사항(추가 반영):
+요구사항(반영):
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
-- 테이블 존재 시 PASS (기존 유지)
-- [멀티프로세스] 워커 2개 고정 (요청: a2와 동일)
+- [멀티프로세스] 워커 2개 고정
 - [무한 루프] 1초마다 재실행
 - [윈도우] 08:27:00 ~ 08:29:59, 20:27:00 ~ 20:29:59 에만 실행
 - [유효 날짜 범위] end_day가 "현재 날짜 기준의 달(YYYYMM)"만 해당
 - [실시간] 현재 시간 기준 120초 이내 데이터만 반영 (end_ts 기준)
-- [미완성 방지 역할 분리] e1은 파일을 직접 만지지 않고 DB만 안전하게 읽음 (a2에서 파일 안정화/적재 담당)
+- [안정화 버퍼] end_ts <= now - 2초
+- [DB 저장] 매번 APPEND로 누적 저장 (중복 허용)
+  - 누적 “update” 의미: 최신 상태는 inserted_at DESC로 조회하면 됨
 
 주의:
-- e1은 DB 집계이므로 "파일 미완성 방지 로직(크기/mtime/lock)"을 직접 적용할 파일이 없습니다.
-  대신, DB에서 읽는 데이터도 '최근 120초' + '안정화 버퍼(예: 2초)'를 두어 "방금 들어온 미확정 row"를 회피합니다.
+- e1은 DB 집계이므로 파일 미완성 방지 로직을 직접 적용할 대상이 없음.
+  대신 DB row도 최근 구간 + 안정화 버퍼로 “방금 들어온 미확정 row” 회피.
 """
 
 import sys
@@ -28,7 +29,7 @@ from pathlib import Path
 import urllib.parse
 from datetime import datetime, time as dtime
 import time as time_mod
-from multiprocessing import cpu_count, freeze_support
+from multiprocessing import freeze_support
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -57,8 +58,8 @@ SRC_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
 SRC_TABLE  = "fct_vision_testlog_txt_processing_history"
 
 TARGET_SCHEMA = "e1_FCT_ct"
-TBL_OPCT      = "fct_op_ct"          # summary_df2 저장
-TBL_WHOLE     = "fct_whole_op_ct"    # final_df_86 저장
+TBL_OPCT      = "fct_op_ct"
+TBL_WHOLE     = "fct_whole_op_ct"
 
 # boxplot html 저장 폴더(현재 스크립트 기준)
 OUT_DIR = Path("./fct_opct_boxplot_html")
@@ -67,31 +68,18 @@ OUT_DIR = Path("./fct_opct_boxplot_html")
 OPCT_MAX_SEC = 600
 
 # =========================
-# Realtime Loop 사양(요청 반영)
+# Realtime Loop 사양
 # =========================
-# ✅ 워커 2개 고정
 MAX_WORKERS = 2
-
-# ✅ 1초 루프
 LOOP_INTERVAL_SEC = 1.0
-
-# ✅ "최근 120초" 데이터만 (end_ts 기준)
 RECENT_SECONDS = 120
-
-# ✅ DB 안정화 버퍼(방금 적재된 미확정 row 회피)
-# end_ts <= now - STABLE_DATA_SEC 만 사용(권장: 2초)
 STABLE_DATA_SEC = 2
 
-# ✅ 실행 윈도우: 08:27:00~08:29:59, 20:27:00~20:29:59
 WINDOWS = [
     (dtime(8, 27, 0),  dtime(8, 29, 59)),
     (dtime(20, 27, 0), dtime(20, 29, 59)),
 ]
 
-# 테이블 존재 시 PASS (요청: 기존 유지)
-PASS_IF_TABLE_EXISTS = True
-
-# 진행상황 로그(루프 n회마다)
 HEARTBEAT_EVERY_LOOPS = 30  # 약 30초
 
 
@@ -124,23 +112,17 @@ def ensure_schema(conn, schema_name: str):
         cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema_name)))
     conn.commit()
 
-def table_exists(conn, schema_name: str, table_name: str) -> bool:
-    q = """
-    SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = %s
-          AND table_name   = %s
-    )
-    """
-    with conn.cursor() as cur:
-        cur.execute(q, (schema_name, table_name))
-        return bool(cur.fetchone()[0])
+def safe_cat_to_str(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if isinstance(out[c].dtype, CategoricalDtype):
+            out[c] = out[c].astype(str)
+    return out
 
-def save_df_if_table_not_exists(df: pd.DataFrame, schema_name: str, table_name: str, engine):
+def save_df_append(df: pd.DataFrame, schema_name: str, table_name: str, engine):
     """
-    테이블이 이미 존재하면 PASS
-    없으면 테이블 생성 후 전체 저장
+    테이블 없으면 생성, 있으면 append 누적.
+    중복 허용 (요구사항).
     """
     if df is None or len(df) == 0:
         log(f"[SKIP] {schema_name}.{table_name}: df가 비어있습니다.")
@@ -152,69 +134,99 @@ def save_df_if_table_not_exists(df: pd.DataFrame, schema_name: str, table_name: 
     if "month" in df_to_save.columns:
         df_to_save["month"] = df_to_save["month"].astype(str)
 
-    # Categorical 안전 처리
-    for c in df_to_save.columns:
-        if isinstance(df_to_save[c].dtype, CategoricalDtype):
-            df_to_save[c] = df_to_save[c].astype(str)
+    df_to_save = safe_cat_to_str(df_to_save)
 
+    # schema 보장
     with psycopg2.connect(**DB_CONFIG) as conn:
         ensure_schema(conn, schema_name)
 
-        if PASS_IF_TABLE_EXISTS and table_exists(conn, schema_name, table_name):
-            log(f"[PASS] {schema_name}.{table_name} 이미 존재 -> 저장 생략")
-            return
-
-    log(f"[SAVE] {schema_name}.{table_name} to_sql 시작 (rows={len(df_to_save)})")
+    log(f"[APPEND] {schema_name}.{table_name} to_sql append (rows={len(df_to_save)})")
     df_to_save.to_sql(
         name=table_name,
         con=engine,
         schema=schema_name,
-        if_exists="fail",
+        if_exists="append",
         index=False,
         method="multi",
         chunksize=5000
     )
-    log(f"[OK] {schema_name}.{table_name} 생성 및 저장 완료 (rows={len(df_to_save)})")
+    log(f"[OK] append 완료: {schema_name}.{table_name} (+{len(df_to_save)})")
 
 
 # =========================
-# 2) 소스 로딩 + op_ct 계산 (현재달 + 최근 120초 + 안정화 버퍼)
+# 2) 소스 로딩 + op_ct 계산
+#    (현재달 + 최근 120초 + 안정화 버퍼 + 안전 timestamp 파싱)
 # =========================
 def load_source_df(engine) -> pd.DataFrame:
     """
-    - end_day: 현재달(YYYYMM%)만
+    - end_day: 현재달(YYYYMM)만
     - end_ts: now-RECENT_SECONDS ~ now-STABLE_DATA_SEC 구간만
+    - end_day/end_time 포맷 불량 row는 end_ts NULL로 만들어 쿼리 자체가 죽지 않게 방어
     """
-    now_dt = datetime.now()
     yyyymm = current_yyyymm()
 
-    # DB는 end_day/end_time이 보통 TEXT이므로, SQL에서 안전하게 timestamp로 조합
-    # end_day가 DATE형이면 아래 to_char 조건을 조정하세요.
     sql_query = f"""
     WITH base AS (
         SELECT
             station,
             remark,
-            end_day,
-            end_time,
+            btrim(end_day::text)  AS end_day_text,
+            btrim(end_time::text) AS end_time_text,
             result,
             goodorbad,
-            (to_timestamp(end_day || ' ' || end_time, 'YYYY-MM-DD HH24:MI:SS')) AS end_ts
+
+            -- end_day를 안전하게 date로 변환 (형식 불량이면 NULL)
+            CASE
+                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN (btrim(end_day::text))::date
+                ELSE NULL
+            END AS end_day_date,
+
+            -- end_ts 안전 생성: 검증된 형식에만 to_timestamp 실행
+            CASE
+                -- 1) HH:MI:SS 또는 HH:MI:SS.msec
+                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+                 AND btrim(end_time::text) ~ '^\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$'
+                THEN to_timestamp(
+                    btrim(end_day::text) || ' ' || split_part(btrim(end_time::text), '.', 1),
+                    'YYYY-MM-DD HH24:MI:SS'
+                )
+
+                -- 2) HHMMSS 또는 HHMMSS.msec (예: 150311, 150311.26)
+                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+                 AND btrim(end_time::text) ~ '^\\d{{6}}(\\.\\d+)?$'
+                THEN to_timestamp(
+                    btrim(end_day::text) || ' ' ||
+                    substring(btrim(end_time::text) from 1 for 2) || ':' ||
+                    substring(btrim(end_time::text) from 3 for 2) || ':' ||
+                    substring(btrim(end_time::text) from 5 for 2),
+                    'YYYY-MM-DD HH24:MI:SS'
+                )
+
+                ELSE NULL
+            END AS end_ts
+
         FROM {SRC_SCHEMA}.{SRC_TABLE}
         WHERE
             station IN ('FCT1','FCT2','FCT3','FCT4')
             AND remark IN ('PD','Non-PD')
             AND result <> 'FAIL'
             AND goodorbad <> 'BadFile'
-            AND to_char(to_date(end_day, 'YYYY-MM-DD'), 'YYYYMM') = :yyyymm
     )
     SELECT
-        station, remark, end_day, end_time, result, goodorbad, end_ts
+        station,
+        remark,
+        end_day_text AS end_day,
+        end_time_text AS end_time,
+        result,
+        goodorbad,
+        end_ts
     FROM base
     WHERE
-        end_ts IS NOT NULL
-        AND end_ts >= (now() - INTERVAL '{RECENT_SECONDS} seconds')
-        AND end_ts <= (now() - INTERVAL '{STABLE_DATA_SEC} seconds')
+        end_day_date IS NOT NULL
+        AND to_char(end_day_date, 'YYYYMM') = :yyyymm
+        AND end_ts IS NOT NULL
+        AND end_ts >= (now()::timestamp - INTERVAL '{RECENT_SECONDS} seconds')
+        AND end_ts <= (now()::timestamp - INTERVAL '{STABLE_DATA_SEC} seconds')
     ORDER BY end_ts ASC
     """
 
@@ -226,10 +238,7 @@ def load_source_df(engine) -> pd.DataFrame:
         return df
 
     log("[2/6] 타입 정리 및 op_ct 생성...")
-    # end_day는 date로 변환(기존)
     df["end_day"] = pd.to_datetime(df["end_day"], errors="coerce").dt.date
-
-    # end_ts는 SQL에서 만들어왔으니 그대로 사용
     df["end_ts"] = pd.to_datetime(df["end_ts"], errors="coerce")
 
     df = df.sort_values(["station", "remark", "end_ts"], ascending=True).reset_index(drop=True)
@@ -256,10 +265,6 @@ def _range_str(values: pd.Series):
     return f"{vmin:.1f}~{vmax:.1f}"
 
 def _summarize_group_worker(args):
-    """
-    ProcessPoolExecutor용 워커 (pickle-safe)
-    args = (station, remark, month, op_ct_values_list, out_dir_str)
-    """
     station, remark, month, op_ct_list, out_dir_str = args
     out_dir = Path(out_dir_str)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -268,7 +273,6 @@ def _summarize_group_worker(args):
     s = s[s <= OPCT_MAX_SEC]
 
     sample_amount = int(len(s))
-
     if sample_amount == 0:
         return {
             "station": station,
@@ -298,7 +302,6 @@ def _summarize_group_worker(args):
     s_wo = s[(s >= lower_bound) & (s <= upper_bound)]
     avg_wo = float(s_wo.mean()) if len(s_wo) else None
 
-    # html boxplot 저장(요구사항상 e1 저장은 html 제외지만, 파일로는 남김)
     fig = px.box(
         pd.DataFrame({"op_ct": s}),
         y="op_ct",
@@ -508,9 +511,14 @@ def main_once():
     summary_df2 = build_plotly_json_column(df_raw, summary_df)
     final_df_86 = build_final_df_86(summary_df2)
 
-    log("[6/6] DB 저장 단계 시작...")
-    save_df_if_table_not_exists(summary_df2, TARGET_SCHEMA, TBL_OPCT, engine)
-    save_df_if_table_not_exists(final_df_86, TARGET_SCHEMA, TBL_WHOLE, engine)
+    # 누적 저장의 “최신” 식별용
+    inserted_at = datetime.now()
+    summary_df2["inserted_at"] = inserted_at
+    final_df_86["inserted_at"] = inserted_at
+
+    log("[6/6] DB 저장 단계 시작...(APPEND 누적, 중복 허용)")
+    save_df_append(summary_df2, TARGET_SCHEMA, TBL_OPCT, engine)
+    save_df_append(final_df_86, TARGET_SCHEMA, TBL_WHOLE, engine)
 
     log("=== DONE (ONE SHOT) ===")
 

@@ -162,10 +162,6 @@ def _make_plotly_box_json(values: np.ndarray, name: str):
 # 2) 로딩 + 전처리 (현재달 + 최근120초 + 안정화버퍼)
 # =========================
 def load_source(engine) -> pd.DataFrame:
-    """
-    - end_day: 현재달(YYYYMM)만
-    - end_ts: now-RECENT_SECONDS ~ now-STABLE_DATA_SEC 만
-    """
     yyyymm = current_yyyymm()
 
     query = f"""
@@ -173,13 +169,52 @@ def load_source(engine) -> pd.DataFrame:
         SELECT
             station,
             remark,
-            barcode_information,
-            step_description,
+            btrim(barcode_information::text) AS barcode_information,
+            btrim(step_description::text)     AS step_description,
             result,
-            end_day,
-            end_time,
+            btrim(end_day::text)             AS end_day_text,
+            btrim(end_time::text)            AS end_time_text,
             run_time,
-            to_timestamp(end_day || end_time, '{ENDTS_FORMAT}') AS end_ts
+
+            -- end_day_date: 현재달 필터용 (YYYYMMDD / YYYY-MM-DD 둘 다 허용)
+            CASE
+                WHEN btrim(end_day::text) ~ '^\\d{{8}}$'
+                    THEN to_date(btrim(end_day::text), 'YYYYMMDD')
+                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+                    THEN to_date(btrim(end_day::text), 'YYYY-MM-DD')
+                ELSE NULL
+            END AS end_day_date,
+
+            -- end_ts: 안전 timestamp 생성 (맞는 포맷에만 to_timestamp 실행)
+            CASE
+                -- A) end_day=YYYYMMDD, end_time=HHMMSS(또는 HHMMSS.fff)
+                WHEN btrim(end_day::text) ~ '^\\d{{8}}$'
+                 AND btrim(end_time::text) ~ '^\\d{{6}}(\\.\\d+)?$'
+                THEN to_timestamp(
+                    btrim(end_day::text) ||
+                    substring(btrim(end_time::text) from 1 for 6),
+                    'YYYYMMDDHH24MISS'
+                )
+
+                -- B) end_day=YYYYMMDD, end_time=HH:MI:SS(또는 HH:MI:SS.fff)
+                WHEN btrim(end_day::text) ~ '^\\d{{8}}$'
+                 AND btrim(end_time::text) ~ '^\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$'
+                THEN to_timestamp(
+                    btrim(end_day::text) || ' ' || split_part(btrim(end_time::text), '.', 1),
+                    'YYYYMMDD HH24:MI:SS'
+                )
+
+                -- C) end_day=YYYY-MM-DD, end_time=HH:MI:SS(또는 HH:MI:SS.fff)
+                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+                 AND btrim(end_time::text) ~ '^\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$'
+                THEN to_timestamp(
+                    btrim(end_day::text) || ' ' || split_part(btrim(end_time::text), '.', 1),
+                    'YYYY-MM-DD HH24:MI:SS'
+                )
+
+                ELSE NULL
+            END AS end_ts
+
         FROM {SRC_SCHEMA}.{SRC_TABLE}
         WHERE
             station IN ('FCT1','FCT2','FCT3','FCT4')
@@ -190,15 +225,19 @@ def load_source(engine) -> pd.DataFrame:
                 OR
                 (remark = 'Non-PD' AND step_description = '1.32 Test iqz(uA)')
             )
-            AND substring(end_day from 1 for 6) = :yyyymm
     )
     SELECT
-        station, remark, barcode_information, step_description, result, end_day, end_time, run_time
+        station, remark, barcode_information, step_description, result,
+        end_day_text AS end_day,
+        end_time_text AS end_time,
+        run_time
     FROM base
     WHERE
-        end_ts IS NOT NULL
-        AND end_ts >= (now() - INTERVAL '{RECENT_SECONDS} seconds')
-        AND end_ts <= (now() - INTERVAL '{STABLE_DATA_SEC} seconds')
+        end_day_date IS NOT NULL
+        AND to_char(end_day_date, 'YYYYMM') = :yyyymm
+        AND end_ts IS NOT NULL
+        AND end_ts >= (now()::timestamp - INTERVAL '{RECENT_SECONDS} seconds')
+        AND end_ts <= (now()::timestamp - INTERVAL '{STABLE_DATA_SEC} seconds')
     ORDER BY end_ts ASC
     """
 
@@ -214,7 +253,15 @@ def load_source(engine) -> pd.DataFrame:
     df["end_time"] = df["end_time"].astype(str).str.strip()
     df["run_time"] = pd.to_numeric(df["run_time"], errors="coerce")
 
-    df["month"] = df["end_day"].str.slice(0, 6)
+    # month는 end_day 포맷이 YYYYMMDD / YYYY-MM-DD 모두 가능하므로 안전 생성
+    # - YYYYMMDD -> 앞 6자리
+    # - YYYY-MM-DD -> YYYYMM
+    df["month"] = np.where(
+        df["end_day"].str.match(r"^\d{8}$"),
+        df["end_day"].str.slice(0, 6),
+        df["end_day"].str.slice(0, 4) + df["end_day"].str.slice(5, 7)
+    )
+
     df = df.sort_values(["end_day", "end_time"], ascending=[True, True]).reset_index(drop=True)
 
     before = len(df)
@@ -225,7 +272,6 @@ def load_source(engine) -> pd.DataFrame:
 
     log("[OK] 전처리 완료")
     return df
-
 
 # =========================
 # 3) 요약 생성 (boxplot 통계 + plotly_json) - MP=2
