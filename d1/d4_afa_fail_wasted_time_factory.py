@@ -17,13 +17,18 @@ AFA FAIL (NG -> OFF) wasted time 계산 및 DB 저장 스크립트 (Realtime) - 
 - ✅ 머신로그 파일을 "tail-follow"로 따라가며 새 줄만 처리
 - ✅ station별 메모리 state machine으로 즉시 페어 계산 후 DB 저장
 
-주의:
-- 아래 BASE_DIR 및 파일명 패턴은 기존 d1_machine_log 수집기와 동일한 FCT 머신 로그 기준입니다.
+[Nuitka/EXE 콘솔 강제 종료 방지(가능한 범위)]
+- Ctrl+C / Ctrl+Break: 즉시 종료 대신 STOP_REQUESTED 플래그로 정상 종료 유도
+- 콘솔 X 닫기/로그오프/시스템 종료 이벤트: 가능한 경우 STOP_REQUESTED로 유도
+  (Windows 정책상 '완전 차단'은 불가할 수 있으나, 대부분 케이스에서 정상 종료 루트로 유도)
+- 어떤 종료 경로에서도 pause_console()로 콘솔이 바로 닫히지 않게 유지
 """
 
+import os
 import re
 import sys
 import time
+import signal
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,30 +69,21 @@ LOOP_INTERVAL_SEC = 1
 TS_WINDOW_SEC = 60
 
 # tail-follow가 “최근 구간만” 처리하도록 안전 버퍼(기존의 QUERY_LOOKBACK_SEC 역할 대체)
-# - 파일을 tail-follow 하므로 DB lookback은 불필요하지만,
-#   EXE 재시작/파일이 갑자기 커진 경우 등을 대비해
-#   "지금-120초 이전 이벤트"는 계산/저장 대상에서 자연스럽게 탈락하게끔 유지
 LOOKBACK_SEC_SOFT = 120
 
 # 로그 과다 방지
 LOG_EVERY_LOOP = 10
 
+
 # ============================================
 # 1) 로그 파일 경로/패턴 (FCT 머신 로그 기준)
 # ============================================
-# 기존 FCT 머신 로그 수집기에서 사용하던 경로와 동일 계열로 맞춤
-# 파일이 실제로 있는 위치에 맞춰 BASE_DIR만 정확히 유지하면 됩니다.
 BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")
 
-# 파일명 패턴 (기존 d1 수집기와 동일)
-# 예: 20251230_FCT1_Machine_Log.txt / 20251230_PDI1_Machine_Log.txt (PDI도 FCT로 취급 가능)
 FILENAME_PATTERN = re.compile(r"(\d{8})_(FCT|PDI)([1-4])_Machine_Log", re.IGNORECASE)
 
-# 라인 패턴:
-# - [hh:mm:ss] 또는 [hh:mm:ss.xx] 또는 [hh:mm:ss.xxxxxx] 허용
 LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?\]\s*(.*)$")
 
-# end_time 검증(완화): HH:MM:SS(.1~6)
 END_TIME_REGEX = re.compile(r"^[0-2]\d:[0-5]\d:[0-5]\d(\.\d{1,6})?$")
 
 
@@ -99,9 +95,94 @@ def log(msg: str):
 
 
 def pause_console():
+    """
+    EXE/Nuitka에서 콘솔이 즉시 닫히는 걸 막기 위한 '마지막 멈춤'.
+    - 일반 python 실행에서도 문제 없음.
+    """
     try:
         input("\n[END] 작업이 종료되었습니다. 콘솔을 닫으려면 Enter를 누르세요...")
     except Exception:
+        pass
+
+
+# ============================================
+# [Nuitka/EXE] 종료 신호 처리 (강제 종료 방지/정상 종료 유도)
+# ============================================
+STOP_REQUESTED = False
+
+
+def _request_stop(reason: str = ""):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    if reason:
+        log(f"[STOP-REQ] {reason}")
+
+
+def _install_signal_handlers():
+    # Ctrl+C
+    try:
+        signal.signal(signal.SIGINT, lambda s, f: _request_stop("SIGINT(Ctrl+C)"))
+    except Exception:
+        pass
+
+    # Ctrl+Break (Windows)
+    try:
+        signal.signal(signal.SIGBREAK, lambda s, f: _request_stop("SIGBREAK(Ctrl+Break)"))
+    except Exception:
+        pass
+
+    # (가능한 환경에서) SIGTERM
+    try:
+        signal.signal(signal.SIGTERM, lambda s, f: _request_stop("SIGTERM"))
+    except Exception:
+        pass
+
+
+def _install_windows_console_ctrl_handler():
+    """
+    Windows 콘솔 닫기/로그오프/시스템종료 이벤트 처리.
+    - Windows 정책상 완전 차단은 불가할 수 있습니다.
+    - 가능한 경우 STOP_REQUESTED로 전환해 루프가 정상 종료되도록 유도합니다.
+    """
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        # https://learn.microsoft.com/en-us/windows/console/handlerroutine
+        CTRL_C_EVENT = 0
+        CTRL_BREAK_EVENT = 1
+        CTRL_CLOSE_EVENT = 2
+        CTRL_LOGOFF_EVENT = 5
+        CTRL_SHUTDOWN_EVENT = 6
+
+        HandlerRoutine = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+
+        def _handler(ctrl_type):
+            # 콘솔 닫기/로그오프/종료 등
+            if ctrl_type == CTRL_C_EVENT:
+                _request_stop("CTRL_C_EVENT")
+                return True
+            if ctrl_type == CTRL_BREAK_EVENT:
+                _request_stop("CTRL_BREAK_EVENT")
+                return True
+            if ctrl_type == CTRL_CLOSE_EVENT:
+                _request_stop("CTRL_CLOSE_EVENT(콘솔닫기)")
+                # True를 반환해도 OS가 강제 종료할 수는 있음. 그래도 최대한 정상 종료 유도.
+                return True
+            if ctrl_type == CTRL_LOGOFF_EVENT:
+                _request_stop("CTRL_LOGOFF_EVENT")
+                return True
+            if ctrl_type == CTRL_SHUTDOWN_EVENT:
+                _request_stop("CTRL_SHUTDOWN_EVENT")
+                return True
+            return False
+
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(HandlerRoutine(_handler), True)
+
+    except Exception:
+        # 핸들러 설치 실패해도 기능에는 영향 없게 방어
         pass
 
 
@@ -146,6 +227,7 @@ def get_psycopg2_conn(config=DB_CONFIG):
 def ensure_save_table():
     engine = get_engine(DB_CONFIG)
     create_sql = f"""
+    CREATE SCHEMA IF NOT EXISTS {TABLE_SAVE_SCHEMA};
     CREATE TABLE IF NOT EXISTS {TABLE_SAVE_SCHEMA}.{TABLE_SAVE_NAME} (
         id            BIGSERIAL PRIMARY KEY,
         end_day       TEXT NOT NULL,
@@ -176,7 +258,6 @@ class StationState:
     pending_ng_ts: datetime | None = None
 
 
-# station별 상태
 STATES: dict[str, StationState] = {
     "FCT1": StationState(),
     "FCT2": StationState(),
@@ -184,10 +265,7 @@ STATES: dict[str, StationState] = {
     "FCT4": StationState(),
 }
 
-# tail-follow 오프셋: file_path -> last_byte_offset
 FILE_OFFSETS: dict[str, int] = {}
-
-# 파일별 "마지막 처리한 (end_day,end_time,contents)" (중복 라인/재시작 방어 보조)
 LAST_EVENT_FINGERPRINT: dict[str, tuple[str, str, str]] = {}
 
 
@@ -198,38 +276,24 @@ def _clean_contents(s: str) -> str:
     if s is None:
         return ""
     s = s.replace("\x00", "").strip()
-    # 원본과 동일하게 핵심 키워드만 비교하므로, 과도한 정규화는 피함
     return s
 
 
 def _normalize_end_time(hms: str, frac: str | None) -> str:
-    """
-    원본 로그가 [HH:MM:SS(.1~6)] 형태라서 그대로 사용하되,
-    - frac이 있으면 그대로 두되 (최대 6자리)
-    - 없으면 .00 붙여도 되지만, 기존 DB 적재(머신로그)와 호환 위해
-      여기서는 "없으면 HH:MM:SS" 형태 유지하고, ts 파싱 시 %f 유연 처리.
-    다만 출력(from_time/to_time)은 기존과 동일하게 "소수점 2자리"로 맞춘다.
-    """
     if frac:
-        frac2 = frac[:6]  # 최대 6자리
+        frac2 = frac[:6]
         return f"{hms}.{frac2}"
     return hms
 
 
 def _ts_from_end_day_time(end_day_yyyymmdd: str, end_time: str) -> datetime | None:
-    """
-    end_day(YYYYMMDD) + end_time(HH:MM:SS(.ffffff)) -> datetime
-    """
     if not re.fullmatch(r"\d{8}", str(end_day_yyyymmdd)):
         return None
     if not END_TIME_REGEX.fullmatch(str(end_time)):
         return None
 
-    # pandas 없이 datetime만으로 안전 파싱
     try:
-        # 소수점이 있으면 %f, 없으면 일반
         if "." in end_time:
-            # %f는 1~6자리 허용이 아니므로 6자리로 패딩
             hms, frac = end_time.split(".", 1)
             frac6 = (frac + "000000")[:6]
             dt_str = f"{end_day_yyyymmdd} {hms}.{frac6}"
@@ -242,10 +306,6 @@ def _ts_from_end_day_time(end_day_yyyymmdd: str, end_time: str) -> datetime | No
 
 
 def _fmt_time_2dec(ts: datetime) -> str:
-    """
-    기존 코드와 동일하게 "소수점 2자리 수준"으로 절삭 출력
-    - 기존: ts.strftime("%H:%M:%S.%f")[:-4]
-    """
     return ts.strftime("%H:%M:%S.%f")[:-4]
 
 
@@ -253,16 +313,10 @@ def _fmt_time_2dec(ts: datetime) -> str:
 # 6) 오늘 파일 찾기
 # ============================================
 def list_today_fct_log_files(today_ymd: str) -> dict[str, str]:
-    """
-    오늘자 FCT1~4 로그파일 경로를 찾아 station->path 반환
-    - BASE_DIR 아래 YYYY/MM 구조를 전부 훑되, 오늘 파일만
-    - PDI도 FCT로 취급(기존 머신로그 수집기와 동일 정책)
-    """
     result: dict[str, str] = {}
     if not BASE_DIR.exists():
         return result
 
-    # 성능: year/month만 2-depth 순회 (파일이 많지 않다는 전제)
     for year_dir in BASE_DIR.iterdir():
         if not (year_dir.is_dir() and year_dir.name.isdigit() and len(year_dir.name) == 4):
             continue
@@ -280,7 +334,7 @@ def list_today_fct_log_files(today_ymd: str) -> dict[str, str]:
                 station = f"FCT{no}"
                 if file_ymd != today_ymd:
                     continue
-                # station 1개만 필요. 같은 station 파일이 여러 개면 최신 mtime 우선
+
                 fp_str = str(fp)
                 if station not in result:
                     result[station] = fp_str
@@ -298,9 +352,6 @@ def list_today_fct_log_files(today_ymd: str) -> dict[str, str]:
 # 7) tail-follow: 파일에서 "새로 추가된 라인"만 읽기
 # ============================================
 def _open_text_file_best_effort(path: Path):
-    """
-    인코딩 방어: utf-8 시도 -> cp949
-    """
     try:
         return path.open("r", encoding="utf-8", errors="ignore")
     except Exception:
@@ -308,11 +359,6 @@ def _open_text_file_best_effort(path: Path):
 
 
 def tail_read_new_lines(path_str: str) -> list[str]:
-    """
-    path_str 파일에서 마지막 오프셋 이후 새로 추가된 텍스트 라인만 반환.
-    - 파일이 truncate/rotate 되어 size < offset이면 offset=0으로 리셋
-    - EXE/Nuitka에서도 안전하게 동작하도록 예외 방어
-    """
     p = Path(path_str)
     if not p.exists() or not p.is_file():
         return []
@@ -324,10 +370,8 @@ def tail_read_new_lines(path_str: str) -> list[str]:
 
     last_off = FILE_OFFSETS.get(path_str, 0)
     if size < last_off:
-        # 로그 파일이 재생성/초기화 된 경우
         last_off = 0
 
-    lines: list[str] = []
     try:
         with _open_text_file_best_effort(p) as f:
             f.seek(last_off)
@@ -338,16 +382,9 @@ def tail_read_new_lines(path_str: str) -> list[str]:
             FILE_OFFSETS[path_str] = new_off
             return []
 
-        # 줄 단위로 분리
-        # - 마지막이 개행 없이 끝나면 다음 루프에 이어 읽혀야 하므로 보수적으로 처리
         parts = chunk.splitlines()
-        # splitlines()는 마지막 개행 여부에 관계없이 잘라주지만,
-        # 마지막 라인이 "중간에 끊긴 라인"일 수 있어, 너무 공격적으로 버리진 않음.
-        # (실제 장비 로그는 보통 한 줄씩 flush되므로 큰 문제 없음)
-        lines.extend(parts)
-
         FILE_OFFSETS[path_str] = new_off
-        return lines
+        return parts
 
     except Exception:
         return []
@@ -357,10 +394,6 @@ def tail_read_new_lines(path_str: str) -> list[str]:
 # 8) station별 이벤트 처리(state machine) + 결과 생성
 # ============================================
 def process_lines_for_station(station: str, end_day_ymd: str, file_path: str, lines: list[str], now_dt: datetime):
-    """
-    station의 새 라인을 받아서 상태를 업데이트하고,
-    생성된 wasted_time 결과 row(dict)를 반환
-    """
     out_rows = []
 
     st = STATES.get(station)
@@ -368,7 +401,6 @@ def process_lines_for_station(station: str, end_day_ymd: str, file_path: str, li
         st = StationState()
         STATES[station] = st
 
-    # soft lookback (재시작/오프셋 리셋 등에서 과거 이벤트가 들어오는 경우 탈락시키기 위함)
     soft_cutoff = now_dt - timedelta(seconds=LOOKBACK_SEC_SOFT)
     ts_filter_cutoff = now_dt - timedelta(seconds=TS_WINDOW_SEC)
 
@@ -385,13 +417,10 @@ def process_lines_for_station(station: str, end_day_ymd: str, file_path: str, li
         contents_raw = m.group(3) or ""
         contents = _clean_contents(contents_raw)
 
-        # 관심 이벤트만
         if contents not in VALID_CONTENTS:
             continue
 
         end_time = _normalize_end_time(hms, frac)
-
-        # 기본 유효성
         if not END_TIME_REGEX.fullmatch(end_time):
             continue
 
@@ -399,11 +428,9 @@ def process_lines_for_station(station: str, end_day_ymd: str, file_path: str, li
         if ts is None:
             continue
 
-        # soft lookback 이전이면 state도 건드리지 않음(재시작 시 과거 데이터로 상태 오염 방지)
         if ts < soft_cutoff:
             continue
 
-        # 파일별 중복 라인 방어(같은 라인이 여러 번 들어오는 케이스)
         fp_key = file_path
         last_fp = LAST_EVENT_FINGERPRINT.get(fp_key)
         cur_fp = (end_day_ymd, end_time, contents)
@@ -414,14 +441,11 @@ def process_lines_for_station(station: str, end_day_ymd: str, file_path: str, li
         # --- 상태기계 로직 (기존과 동일 의미) ---
         if contents == MANUAL_TEXT:
             st.in_manual = True
-            # manual 진입 시 pending을 유지/삭제는 기존 코드상 명시가 없었으나
-            # 현장 안정성 위해 pending을 비우는 게 안전(Manual 동안 NG 무시이므로)
             st.pending_ng_ts = None
             continue
 
         if contents == AUTO_TEXT:
             st.in_manual = False
-            # auto 전환 시 pending은 초기화(이전 NG가 살아있으면 오탐 가능)
             st.pending_ng_ts = None
             continue
 
@@ -440,7 +464,6 @@ def process_lines_for_station(station: str, end_day_ymd: str, file_path: str, li
             to_ts = ts
             st.pending_ng_ts = None
 
-            # 저장 조건: from/to 모두 최근 60초 이내(ts_filter_cutoff 이상)
             if from_ts < ts_filter_cutoff or to_ts < ts_filter_cutoff:
                 continue
 
@@ -494,12 +517,10 @@ def save_to_db_append_on_conflict(rows: list[dict]):
 # 10) worker (스레드): station 1개 처리
 # ============================================
 def worker_process_station(station: str, path_str: str, today_ymd: str, now_dt: datetime):
-    # tail-read
     new_lines = tail_read_new_lines(path_str)
     if not new_lines:
         return station, 0, 0, []
 
-    # 이벤트 처리
     rows = process_lines_for_station(
         station=station,
         end_day_ymd=today_ymd,
@@ -514,6 +535,8 @@ def worker_process_station(station: str, path_str: str, today_ymd: str, now_dt: 
 # 11) main loop (1초 무한루프)
 # ============================================
 def run_realtime_loop():
+    global STOP_REQUESTED
+
     ensure_save_table()
 
     log("=" * 78)
@@ -525,19 +548,20 @@ def run_realtime_loop():
     log(f"[INFO] LOOP_INTERVAL_SEC = {LOOP_INTERVAL_SEC}")
     log(f"[INFO] TS_WINDOW_SEC = {TS_WINDOW_SEC} (from/to 모두 최근 60초 이내만 저장)")
     log(f"[INFO] SOFT_LOOKBACK_SEC = {LOOKBACK_SEC_SOFT} (재시작 시 과거 이벤트 상태오염 방지)")
+    log("[INFO] 종료: Ctrl+C 또는 Ctrl+Break 를 누르면 '정상 종료'로 빠집니다. (콘솔 유지됨)")
     log("=" * 78)
 
     loop_i = 0
     last_day = datetime.now().strftime("%Y%m%d")
 
-    while True:
+    # 핵심: STOP_REQUESTED가 True가 되면 루프 종료
+    while not STOP_REQUESTED:
         loop_i += 1
         loop_t0 = time.perf_counter()
 
         now_dt = datetime.now()
         today_ymd = now_dt.strftime("%Y%m%d")
 
-        # 날짜 변경: 상태/오프셋 초기화
         if today_ymd != last_day:
             log(f"[DAY-CHANGE] {last_day} -> {today_ymd} | reset states/offsets")
             last_day = today_ymd
@@ -554,7 +578,6 @@ def run_realtime_loop():
                 time.sleep(LOOP_INTERVAL_SEC)
                 continue
 
-            # FCT1~4만 대상으로 고정 (있으면 처리, 없으면 스킵)
             tasks = []
             for st in ("FCT1", "FCT2", "FCT3", "FCT4"):
                 if st in station_files:
@@ -570,7 +593,6 @@ def run_realtime_loop():
             total_new_lines = 0
             total_pairs = 0
 
-            # 스레드 2개 고정 (기존 요구사항 동일)
             with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as ex:
                 futs = [ex.submit(worker_process_station, st, fp, today_ymd, now_dt) for st, fp in tasks]
                 for f in as_completed(futs):
@@ -587,10 +609,8 @@ def run_realtime_loop():
             if loop_i % LOG_EVERY_LOOP == 0 or inserted > 0:
                 log(f"[LOOP] files={len(tasks)} | new_lines={total_new_lines:,} | pairs={total_pairs:,} | inserted={inserted:,}")
 
-        except KeyboardInterrupt:
-            log("\n[STOP] 사용자 중단(Ctrl+C).")
-            break
         except Exception as e:
+            # STOP_REQUESTED가 True인 상태에서 들어올 수 있는 예외도 있으므로 계속 방어
             log("\n[ERROR] 루프 처리 중 예외가 발생했습니다. (continue)")
             log(f"  - {type(e).__name__}: {e}")
             import traceback
@@ -599,8 +619,14 @@ def run_realtime_loop():
         elapsed = time.perf_counter() - loop_t0
         time.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
 
+    log("[STOP] 정상 종료 루트로 루프를 종료합니다.")
+
 
 def main():
+    # 종료 신호 핸들러 설치(가능한 범위 내)
+    _install_signal_handlers()
+    _install_windows_console_ctrl_handler()
+
     run_realtime_loop()
 
 
@@ -608,13 +634,14 @@ if __name__ == "__main__":
     freeze_support()
     try:
         main()
-    except KeyboardInterrupt:
-        log("\n[STOP] 사용자 중단(Ctrl+C).")
-        pause_console()
     except Exception as e:
         log("\n[ERROR] 예외가 발생했습니다.")
         log(f"  - {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
+        # 어떤 예외든 콘솔 유지
         pause_console()
         sys.exit(1)
+    else:
+        # 정상 종료도 콘솔 유지
+        pause_console()

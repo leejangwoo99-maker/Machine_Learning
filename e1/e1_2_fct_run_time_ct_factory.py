@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 FCT RunTime CT 분석 파이프라인 (iqz step 전용) - Realtime Window + MP=2 고정
+[증분 로딩 + 5초 주기 + 커서 기반 중복 방지 버전]
++ (추천) 커서 NULL이면 now()-10분만 읽고 시작
 
 - Source: a2_fct_table.fct_table
 - Filter:
@@ -16,22 +18,13 @@ FCT RunTime CT 분석 파이프라인 (iqz step 전용) - Realtime Window + MP=2
   2) e1_FCT_ct.fct_upper_outlier_ct_list
      UNIQUE INDEX (station, remark, barcode_information, end_day, end_time), ON CONFLICT DO NOTHING
 
-요구사항(추가 반영):
-- DataFrame 콘솔 출력 없음
-- 진행상황만 표시
-- [멀티프로세스] 2개 고정 (요청)
-- [무한 루프 기능] 1초마다 재실행
-- [윈도우] 08:27:00 ~ 08:29:59, 20:27:00 ~ 20:29:59 에만 실행
-- [유효 날짜 범위] end_day가 "현재 날짜 기준의 달(YYYYMM)"만 해당
-- [실시간] 현재 시간 기준 120초 이내 데이터만 반영 (end_day+end_time -> end_ts 기준)
-- [미완성 방지 역할 분리] 이 스크립트는 파일을 직접 파싱하지 않고 DB만 읽음
-  * 따라서 "파일 크기/mtime/lock" 같은 파일 안정화 로직은 a2(파서/적재) 쪽에서 처리
-  * 본 스크립트(e*)는 DB에서 최근 120초 범위 + 안정화 버퍼(STABLE_DATA_SEC) 적용으로 안전하게 조회
-
-주의(필수 확인):
-- a2_fct_table.fct_table 의 end_day 포맷이 'YYYYMMDD' 인지, 'YYYY-MM-DD' 인지에 따라 SQL 파싱이 달라집니다.
-  현재 코드는 end_day가 'YYYYMMDD'라고 가정하고 to_timestamp(end_day||end_time, 'YYYYMMDDHH24MISS') 를 사용합니다.
-  만약 end_time이 'HHMMSS'가 아니라 'HH:MM:SS'이면, 아래의 ENDTIME_FORMAT 을 'HH24:MI:SS' 형태로 바꿔주세요.
+변경 반영:
+- 120초 조건 제거
+- (station, remark)별 cursor(last_end_ts) 이후 데이터만 증분 로딩
+- 5초 주기
+- 안정화 버퍼(end_ts <= now - 2초) 유지
+- 저장 성공 이후에만 cursor 갱신
+- ✅ 커서 NULL이면 DB now()-10분부터만 읽고 시작(첫 실행 폭주 방지)
 """
 
 import sys
@@ -73,20 +66,23 @@ TARGET_TABLE_1  = "fct_run_time_ct"
 TARGET_SCHEMA_2 = "e1_FCT_ct"
 TARGET_TABLE_2  = "fct_upper_outlier_ct_list"
 
+# ✅ Cursor table (증분 로딩)
+CURSOR_SCHEMA = "e1_FCT_ct"
+CURSOR_TABLE  = "fct_run_time_ct_cursor"
+
 # =========================
 # Realtime Loop 사양(요청 반영)
 # =========================
-# ✅ 워커 2개 고정
 MAX_WORKERS = 2
 
-# ✅ 1초 루프
-LOOP_INTERVAL_SEC = 1.0
-
-# ✅ 최근 120초
-RECENT_SECONDS = 120
+# ✅ 5초 루프
+LOOP_INTERVAL_SEC = 5.0
 
 # ✅ DB 안정화 버퍼(방금 적재된 row 회피)
 STABLE_DATA_SEC = 2
+
+# ✅ (추천) 커서 NULL이면 최근 N분만 읽고 시작 (첫 실행 폭주 방지)
+BOOTSTRAP_LOOKBACK_MINUTES = 10
 
 # ✅ 실행 윈도우
 WINDOWS = [
@@ -94,12 +90,10 @@ WINDOWS = [
     (dtime(20, 27, 0), dtime(20, 29, 59)),
 ]
 
-HEARTBEAT_EVERY_LOOPS = 30
+HEARTBEAT_EVERY_LOOPS = 12  # 5초*12=60초
 
-# end_day/end_time 포맷 가정
-# end_day: 'YYYYMMDD'
-# end_time: 'HHMMSS' (6자리)
-ENDTS_FORMAT = "YYYYMMDDHH24MISS"
+STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]
+REMARKS  = ["PD", "Non-PD"]
 
 
 # =========================
@@ -159,10 +153,62 @@ def _make_plotly_box_json(values: np.ndarray, name: str):
 
 
 # =========================
-# 2) 로딩 + 전처리 (현재달 + 최근120초 + 안정화버퍼)
+# 1-1) Cursor 테이블
 # =========================
-def load_source(engine) -> pd.DataFrame:
+def ensure_cursor_table():
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS {CURSOR_SCHEMA};
+
+    CREATE TABLE IF NOT EXISTS {CURSOR_SCHEMA}.{CURSOR_TABLE} (
+        station     TEXT NOT NULL,
+        remark      TEXT NOT NULL,
+        last_end_ts TIMESTAMP NULL,
+        updated_at  TIMESTAMP NOT NULL DEFAULT now(),
+        PRIMARY KEY (station, remark)
+    );
+    """
+    with get_conn_psycopg2(DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+        conn.commit()
+
+def get_cursors(engine) -> dict:
+    """
+    return: {(station, remark): last_end_ts or None}
+    """
+    ensure_cursor_table()
+    q = text(f"SELECT station, remark, last_end_ts FROM {CURSOR_SCHEMA}.{CURSOR_TABLE}")
+    df = pd.read_sql(q, engine)
+
+    cur_map = {(st, rk): None for st in STATIONS for rk in REMARKS}
+    for _, r in df.iterrows():
+        cur_map[(r["station"], r["remark"])] = r["last_end_ts"]
+    return cur_map
+
+def upsert_cursor(engine, station: str, remark: str, last_end_ts: datetime):
+    ensure_cursor_table()
+    sql_up = text(f"""
+        INSERT INTO {CURSOR_SCHEMA}.{CURSOR_TABLE} (station, remark, last_end_ts, updated_at)
+        VALUES (:station, :remark, :last_end_ts, now())
+        ON CONFLICT (station, remark)
+        DO UPDATE SET last_end_ts = EXCLUDED.last_end_ts,
+                      updated_at  = now()
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql_up, {"station": station, "remark": remark, "last_end_ts": last_end_ts})
+
+
+# =========================
+# 2) 로딩 + 전처리 (현재달 + 안정화버퍼 + cursor 이후만)
+#    ✅ 커서 NULL이면 now()-10분부터만 읽고 시작
+# =========================
+def load_source_incremental(engine) -> pd.DataFrame:
     yyyymm = current_yyyymm()
+    cursors = get_cursors(engine)
+
+    log("[1/5] 원본 데이터 증분 로딩 시작(현재달 + 안정화버퍼 + cursor)...")
+    dfs = []
+    total_rows = 0
 
     query = f"""
     WITH base AS (
@@ -185,14 +231,13 @@ def load_source(engine) -> pd.DataFrame:
                 ELSE NULL
             END AS end_day_date,
 
-            -- end_ts: 안전 timestamp 생성 (맞는 포맷에만 to_timestamp 실행)
+            -- end_ts: 안전 timestamp 생성
             CASE
                 -- A) end_day=YYYYMMDD, end_time=HHMMSS(또는 HHMMSS.fff)
                 WHEN btrim(end_day::text) ~ '^\\d{{8}}$'
                  AND btrim(end_time::text) ~ '^\\d{{6}}(\\.\\d+)?$'
                 THEN to_timestamp(
-                    btrim(end_day::text) ||
-                    substring(btrim(end_time::text) from 1 for 6),
+                    btrim(end_day::text) || substring(btrim(end_time::text) from 1 for 6),
                     'YYYYMMDDHH24MISS'
                 )
 
@@ -211,67 +256,93 @@ def load_source(engine) -> pd.DataFrame:
                     btrim(end_day::text) || ' ' || split_part(btrim(end_time::text), '.', 1),
                     'YYYY-MM-DD HH24:MI:SS'
                 )
-
                 ELSE NULL
             END AS end_ts
 
         FROM {SRC_SCHEMA}.{SRC_TABLE}
         WHERE
-            station IN ('FCT1','FCT2','FCT3','FCT4')
+            station = :station
+            AND remark  = :remark
             AND barcode_information LIKE 'B%%'
             AND result <> 'FAIL'
             AND (
-                (remark = 'PD' AND step_description = '1.36 Test iqz(uA)')
+                (:remark = 'PD' AND step_description = '1.36 Test iqz(uA)')
                 OR
-                (remark = 'Non-PD' AND step_description = '1.32 Test iqz(uA)')
+                (:remark = 'Non-PD' AND step_description = '1.32 Test iqz(uA)')
             )
     )
     SELECT
         station, remark, barcode_information, step_description, result,
         end_day_text AS end_day,
         end_time_text AS end_time,
-        run_time
+        run_time,
+        end_ts,
+        end_day_date
     FROM base
     WHERE
         end_day_date IS NOT NULL
         AND to_char(end_day_date, 'YYYYMM') = :yyyymm
         AND end_ts IS NOT NULL
-        AND end_ts >= (now()::timestamp - INTERVAL '{RECENT_SECONDS} seconds')
         AND end_ts <= (now()::timestamp - INTERVAL '{STABLE_DATA_SEC} seconds')
+        AND end_ts > COALESCE(
+            :last_end_ts,
+            (now()::timestamp - INTERVAL '{BOOTSTRAP_LOOKBACK_MINUTES} minutes')
+        )
     ORDER BY end_ts ASC
     """
 
-    log("[1/5] 원본 데이터 로딩 시작(현재달 + 최근120초 + 안정화버퍼)...")
-    df = pd.read_sql(text(query), engine, params={"yyyymm": yyyymm})
-    log(f"[OK] 로딩 완료 (rows={len(df)})")
+    for st in STATIONS:
+        for rk in REMARKS:
+            last_ts = cursors.get((st, rk))
+            df_part = pd.read_sql(
+                text(query),
+                engine,
+                params={
+                    "station": st,
+                    "remark": rk,
+                    "yyyymm": yyyymm,
+                    "last_end_ts": last_ts,
+                }
+            )
+            n = len(df_part)
+            total_rows += n
+            if n > 0:
+                log(f"[INFO] +{st}/{rk}: rows={n} (cursor={last_ts})")
+                dfs.append(df_part)
+            else:
+                log(f"[SKIP] {st}/{rk}: 신규 없음 (cursor={last_ts})")
 
-    if len(df) == 0:
-        return df
+    if total_rows == 0:
+        log("[OK] 로딩 완료 (rows=0)")
+        return pd.DataFrame()
+
+    df = pd.concat(dfs, ignore_index=True)
+    log(f"[OK] 로딩 완료 (rows={len(df)})")
 
     log("[2/5] 전처리 (end_day/end_time 정리, month 생성, run_time 숫자화)...")
     df["end_day"] = df["end_day"].astype(str).str.strip()
     df["end_time"] = df["end_time"].astype(str).str.strip()
     df["run_time"] = pd.to_numeric(df["run_time"], errors="coerce")
 
-    # month는 end_day 포맷이 YYYYMMDD / YYYY-MM-DD 모두 가능하므로 안전 생성
-    # - YYYYMMDD -> 앞 6자리
-    # - YYYY-MM-DD -> YYYYMM
     df["month"] = np.where(
         df["end_day"].str.match(r"^\d{8}$"),
         df["end_day"].str.slice(0, 6),
         df["end_day"].str.slice(0, 4) + df["end_day"].str.slice(5, 7)
     )
 
-    df = df.sort_values(["end_day", "end_time"], ascending=[True, True]).reset_index(drop=True)
+    df["end_ts"] = pd.to_datetime(df["end_ts"], errors="coerce")
+
+    df = df.sort_values(["end_ts", "end_day", "end_time"], ascending=[True, True, True]).reset_index(drop=True)
 
     before = len(df)
-    df = df.dropna(subset=["run_time"]).reset_index(drop=True)
+    df = df.dropna(subset=["run_time", "end_ts"]).reset_index(drop=True)
     dropped = before - len(df)
     if dropped:
-        log(f"[INFO] run_time NaN 제거: {dropped} rows drop")
+        log(f"[INFO] run_time/end_ts NaN 제거: {dropped} rows drop")
 
     log("[OK] 전처리 완료")
     return df
+
 
 # =========================
 # 3) 요약 생성 (boxplot 통계 + plotly_json) - MP=2
@@ -592,13 +663,13 @@ def save_upper_outlier_df(upper_outlier_df: pd.DataFrame):
 # =========================
 def main_once():
     log("=== FCT RunTime CT Pipeline RUN (ONE SHOT) ===")
-    log(f"[INFO] MP workers={MAX_WORKERS} | month={current_yyyymm()} | recent={RECENT_SECONDS}s | stable_buf={STABLE_DATA_SEC}s")
+    log(f"[INFO] MP workers={MAX_WORKERS} | month={current_yyyymm()} | stable_buf={STABLE_DATA_SEC}s | loop=5s | bootstrap={BOOTSTRAP_LOOKBACK_MINUTES}m")
 
     engine = get_engine(DB_CONFIG)
 
-    df_raw = load_source(engine)
+    df_raw = load_source_incremental(engine)
     if df_raw is None or len(df_raw) == 0:
-        log("[SKIP] 최근 데이터 없음 -> 저장 생략")
+        log("[SKIP] 신규 데이터 없음 -> 저장 생략")
         return
 
     summary_df = build_summary_df(df_raw)
@@ -606,6 +677,12 @@ def main_once():
 
     upper_outlier_df = build_upper_outlier_df(df_raw, summary_df)
     save_upper_outlier_df(upper_outlier_df)
+
+    # ✅ 저장 성공 이후 cursor 갱신
+    cur_update = df_raw.groupby(["station", "remark"])["end_ts"].max().reset_index()
+    for _, r in cur_update.iterrows():
+        upsert_cursor(engine, r["station"], r["remark"], r["end_ts"])
+        log(f"[CURSOR] {r['station']}/{r['remark']} -> {r['end_ts']}")
 
     log("=== DONE (ONE SHOT) ===")
 
@@ -661,7 +738,6 @@ if __name__ == "__main__":
         log(f"\n[ERROR] Unhandled exception: {repr(e)}")
         exit_code = 1
     finally:
-        # Nuitka / PyInstaller EXE로 실행된 경우에만 콘솔 유지
         if getattr(sys, "frozen", False):
             print("\n[INFO] 프로그램이 종료되었습니다.")
             input("Press Enter to exit...")

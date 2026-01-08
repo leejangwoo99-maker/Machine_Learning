@@ -1,27 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-FCT OP-CT Boxplot Summary + UPH(병렬합산) 계산 + PostgreSQL 저장 스크립트 (MP 적용, Realtime Window 실행)
-
-- Source: a1_fct_vision_testlog_txt_processing_history.fct_vision_testlog_txt_processing_history
-- Output (APPEND 누적):
-  1) e1_FCT_ct.fct_op_ct         (summary_df2: plotly_json 포함, html 제외, inserted_at 포함)
-  2) e1_FCT_ct.fct_whole_op_ct   (final_df_86: left/right/whole UPH/CTeq/final_ct, inserted_at 포함)
-
-요구사항(반영):
-- DataFrame 콘솔 출력 없음
-- 진행상황만 표시
-- [멀티프로세스] 워커 2개 고정
-- [무한 루프] 1초마다 재실행
-- [윈도우] 08:27:00 ~ 08:29:59, 20:27:00 ~ 20:29:59 에만 실행
-- [유효 날짜 범위] end_day가 "현재 날짜 기준의 달(YYYYMM)"만 해당
-- [실시간] 현재 시간 기준 120초 이내 데이터만 반영 (end_ts 기준)
-- [안정화 버퍼] end_ts <= now - 2초
-- [DB 저장] 매번 APPEND로 누적 저장 (중복 허용)
-  - 누적 “update” 의미: 최신 상태는 inserted_at DESC로 조회하면 됨
+FCT OP-CT Boxplot Summary + UPH(병렬합산) + PostgreSQL 저장 (MP 적용, Realtime Window 실행)
+- 증분 로딩: (station, remark)별 cursor(last_end_ts) 이후 신규 데이터만 로드
+- 5초 주기 실행
+- 윈도우 시간(08:27~08:29:59, 20:27~20:29:59)에서만 실행
+- 현재달(YYYYMM)만 처리
+- 안정화 버퍼: end_ts <= now - 2초
+- 저장(APPEND): e1_FCT_ct.fct_op_ct / e1_FCT_ct.fct_whole_op_ct (inserted_at 포함)
+- 커서 테이블: e1_FCT_ct.fct_opct_cursor (저장 성공 후 갱신)
+- ✅ (추천) 커서 NULL이면 now()-10분만 읽고 시작(첫 실행 폭주 방지)
 
 주의:
-- e1은 DB 집계이므로 파일 미완성 방지 로직을 직접 적용할 대상이 없음.
-  대신 DB row도 최근 구간 + 안정화 버퍼로 “방금 들어온 미확정 row” 회피.
+- e1 집계는 DB 기반이므로 파일 미완성 방지 대신 안정화 버퍼로 “방금 들어온 미확정 row” 회피
 """
 
 import sys
@@ -61,8 +51,16 @@ TARGET_SCHEMA = "e1_FCT_ct"
 TBL_OPCT      = "fct_op_ct"
 TBL_WHOLE     = "fct_whole_op_ct"
 
+# Cursor table (증분 로딩)
+CURSOR_SCHEMA = "e1_FCT_ct"
+CURSOR_TABLE  = "fct_opct_cursor"
+
+# ✅ (추천) 커서 NULL이면 최근 N분만 읽고 시작 (첫 실행 폭주 방지)
+BOOTSTRAP_LOOKBACK_MINUTES = 10
+
 # boxplot html 저장 폴더(현재 스크립트 기준)
 OUT_DIR = Path("./fct_opct_boxplot_html")
+ENABLE_HTML = False   # EXE 운용 안정성 위해 기본 OFF. 필요 시 True.
 
 # op_ct 필터
 OPCT_MAX_SEC = 600
@@ -71,16 +69,18 @@ OPCT_MAX_SEC = 600
 # Realtime Loop 사양
 # =========================
 MAX_WORKERS = 2
-LOOP_INTERVAL_SEC = 1.0
-RECENT_SECONDS = 120
-STABLE_DATA_SEC = 2
+LOOP_INTERVAL_SEC = 5.0     # ✅ 5초 주기
+STABLE_DATA_SEC = 2         # 안정화 버퍼
 
 WINDOWS = [
     (dtime(8, 27, 0),  dtime(8, 29, 59)),
     (dtime(20, 27, 0), dtime(20, 29, 59)),
 ]
 
-HEARTBEAT_EVERY_LOOPS = 30  # 약 30초
+HEARTBEAT_EVERY_LOOPS = 12  # 5초*12=60초마다 idle 로그
+
+STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]
+REMARKS  = ["PD", "Non-PD"]
 
 
 # =========================
@@ -122,7 +122,7 @@ def safe_cat_to_str(df: pd.DataFrame) -> pd.DataFrame:
 def save_df_append(df: pd.DataFrame, schema_name: str, table_name: str, engine):
     """
     테이블 없으면 생성, 있으면 append 누적.
-    중복 허용 (요구사항).
+    중복 허용 (요구사항). 다만 소스 로딩은 cursor로 신규만 읽어 중복을 실질 차단.
     """
     if df is None or len(df) == 0:
         log(f"[SKIP] {schema_name}.{table_name}: df가 비어있습니다.")
@@ -130,7 +130,6 @@ def save_df_append(df: pd.DataFrame, schema_name: str, table_name: str, engine):
 
     df_to_save = df.copy()
 
-    # month는 문자열 고정
     if "month" in df_to_save.columns:
         df_to_save["month"] = df_to_save["month"].astype(str)
 
@@ -154,16 +153,63 @@ def save_df_append(df: pd.DataFrame, schema_name: str, table_name: str, engine):
 
 
 # =========================
-# 2) 소스 로딩 + op_ct 계산
-#    (현재달 + 최근 120초 + 안정화 버퍼 + 안전 timestamp 파싱)
+# 1-1) Cursor 테이블
 # =========================
-def load_source_df(engine) -> pd.DataFrame:
+def ensure_cursor_table():
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS {CURSOR_SCHEMA};
+
+    CREATE TABLE IF NOT EXISTS {CURSOR_SCHEMA}.{CURSOR_TABLE} (
+        station     TEXT NOT NULL,
+        remark      TEXT NOT NULL,
+        last_end_ts TIMESTAMP NULL,
+        updated_at  TIMESTAMP NOT NULL DEFAULT now(),
+        PRIMARY KEY (station, remark)
+    );
     """
-    - end_day: 현재달(YYYYMM)만
-    - end_ts: now-RECENT_SECONDS ~ now-STABLE_DATA_SEC 구간만
-    - end_day/end_time 포맷 불량 row는 end_ts NULL로 만들어 쿼리 자체가 죽지 않게 방어
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+        conn.commit()
+
+def get_cursors(engine) -> dict:
     """
+    return: {(station, remark): last_end_ts or None}
+    """
+    ensure_cursor_table()
+    q = text(f"SELECT station, remark, last_end_ts FROM {CURSOR_SCHEMA}.{CURSOR_TABLE}")
+    df = pd.read_sql(q, engine)
+
+    cur_map = {(st, rk): None for st in STATIONS for rk in REMARKS}
+    for _, r in df.iterrows():
+        cur_map[(r["station"], r["remark"])] = r["last_end_ts"]
+    return cur_map
+
+def upsert_cursor(engine, station: str, remark: str, last_end_ts: datetime):
+    ensure_cursor_table()
+    sql_up = text(f"""
+        INSERT INTO {CURSOR_SCHEMA}.{CURSOR_TABLE} (station, remark, last_end_ts, updated_at)
+        VALUES (:station, :remark, :last_end_ts, now())
+        ON CONFLICT (station, remark)
+        DO UPDATE SET last_end_ts = EXCLUDED.last_end_ts,
+                      updated_at  = now()
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql_up, {"station": station, "remark": remark, "last_end_ts": last_end_ts})
+
+
+# =========================
+# 2) 소스 로딩(증분) + op_ct 계산
+#    - 현재달 + 안정화버퍼 + cursor 이후 신규만
+#    ✅ 커서 NULL이면 now()-10분부터만 읽고 시작
+# =========================
+def load_source_df_incremental(engine) -> pd.DataFrame:
     yyyymm = current_yyyymm()
+    cursors = get_cursors(engine)
+
+    log("[1/6] DB에서 원본 데이터 증분 로딩 시작...(cursor 기반)")
+    dfs = []
+    total_rows = 0
 
     sql_query = f"""
     WITH base AS (
@@ -175,15 +221,12 @@ def load_source_df(engine) -> pd.DataFrame:
             result,
             goodorbad,
 
-            -- end_day를 안전하게 date로 변환 (형식 불량이면 NULL)
             CASE
                 WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN (btrim(end_day::text))::date
                 ELSE NULL
             END AS end_day_date,
 
-            -- end_ts 안전 생성: 검증된 형식에만 to_timestamp 실행
             CASE
-                -- 1) HH:MI:SS 또는 HH:MI:SS.msec
                 WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
                  AND btrim(end_time::text) ~ '^\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$'
                 THEN to_timestamp(
@@ -191,7 +234,6 @@ def load_source_df(engine) -> pd.DataFrame:
                     'YYYY-MM-DD HH24:MI:SS'
                 )
 
-                -- 2) HHMMSS 또는 HHMMSS.msec (예: 150311, 150311.26)
                 WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
                  AND btrim(end_time::text) ~ '^\\d{{6}}(\\.\\d+)?$'
                 THEN to_timestamp(
@@ -201,14 +243,13 @@ def load_source_df(engine) -> pd.DataFrame:
                     substring(btrim(end_time::text) from 5 for 2),
                     'YYYY-MM-DD HH24:MI:SS'
                 )
-
                 ELSE NULL
             END AS end_ts
 
         FROM {SRC_SCHEMA}.{SRC_TABLE}
         WHERE
-            station IN ('FCT1','FCT2','FCT3','FCT4')
-            AND remark IN ('PD','Non-PD')
+            station = :station
+            AND remark  = :remark
             AND result <> 'FAIL'
             AND goodorbad <> 'BadFile'
     )
@@ -225,36 +266,56 @@ def load_source_df(engine) -> pd.DataFrame:
         end_day_date IS NOT NULL
         AND to_char(end_day_date, 'YYYYMM') = :yyyymm
         AND end_ts IS NOT NULL
-        AND end_ts >= (now()::timestamp - INTERVAL '{RECENT_SECONDS} seconds')
         AND end_ts <= (now()::timestamp - INTERVAL '{STABLE_DATA_SEC} seconds')
+        AND end_ts > COALESCE(
+            :last_end_ts,
+            (now()::timestamp - INTERVAL '{BOOTSTRAP_LOOKBACK_MINUTES} minutes')
+        )
     ORDER BY end_ts ASC
     """
 
-    log("[1/6] DB에서 원본 데이터 로딩 시작(현재달 + 최근120초 + 안정화버퍼)...")
-    df = pd.read_sql(text(sql_query), engine, params={"yyyymm": yyyymm})
-    log(f"[OK] 원본 로딩 완료 (rows={len(df)})")
+    for st in STATIONS:
+        for rk in REMARKS:
+            last_ts = cursors.get((st, rk))
+            df_part = pd.read_sql(
+                text(sql_query),
+                engine,
+                params={
+                    "station": st,
+                    "remark": rk,
+                    "yyyymm": yyyymm,
+                    "last_end_ts": last_ts,
+                },
+            )
+            n = len(df_part)
+            total_rows += n
+            if n > 0:
+                log(f"[INFO] +{st}/{rk}: rows={n} (cursor={last_ts})")
+                dfs.append(df_part)
+            else:
+                log(f"[SKIP] {st}/{rk}: 신규 없음 (cursor={last_ts})")
 
-    if len(df) == 0:
-        return df
+    if total_rows == 0:
+        log("[OK] 원본 로딩 완료 (rows=0)")
+        return pd.DataFrame()
+
+    df = pd.concat(dfs, ignore_index=True)
+    log(f"[OK] 원본 로딩 완료 (rows={len(df)})")
 
     log("[2/6] 타입 정리 및 op_ct 생성...")
     df["end_day"] = pd.to_datetime(df["end_day"], errors="coerce").dt.date
-    df["end_ts"] = pd.to_datetime(df["end_ts"], errors="coerce")
+    df["end_ts"]  = pd.to_datetime(df["end_ts"], errors="coerce")
 
     df = df.sort_values(["station", "remark", "end_ts"], ascending=True).reset_index(drop=True)
     df["op_ct"] = df.groupby(["station", "remark"])["end_ts"].diff().dt.total_seconds()
     df["month"] = pd.to_datetime(df["end_day"].astype(str), errors="coerce").dt.strftime("%Y%m")
-
-    n_bad_ts = int(df["end_ts"].isna().sum())
-    if n_bad_ts > 0:
-        log(f"[WARN] end_ts 파싱 실패 행 {n_bad_ts}개 (end_day/end_time 형식 확인 필요)")
 
     log("[OK] op_ct / month 생성 완료")
     return df
 
 
 # =========================
-# 3) Boxplot 요약 + html 저장 (MP=2)
+# 3) Boxplot 요약 + (옵션) HTML 저장 (MP=2)
 # =========================
 def _range_str(values: pd.Series):
     values = values.dropna()
@@ -265,9 +326,8 @@ def _range_str(values: pd.Series):
     return f"{vmin:.1f}~{vmax:.1f}"
 
 def _summarize_group_worker(args):
-    station, remark, month, op_ct_list, out_dir_str = args
+    station, remark, month, op_ct_list, out_dir_str, enable_html = args
     out_dir = Path(out_dir_str)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     s = pd.Series(op_ct_list).dropna()
     s = s[s <= OPCT_MAX_SEC]
@@ -302,16 +362,13 @@ def _summarize_group_worker(args):
     s_wo = s[(s >= lower_bound) & (s <= upper_bound)]
     avg_wo = float(s_wo.mean()) if len(s_wo) else None
 
-    fig = px.box(
-        pd.DataFrame({"op_ct": s}),
-        y="op_ct",
-        points="outliers",
-        title=None
-    )
-
-    html_name = f"boxplot_{station}_{remark}_{month}.html"
-    html_path = out_dir / html_name
-    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
+    html_path = None
+    if enable_html:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fig = px.box(pd.DataFrame({"op_ct": s}), y="op_ct", points="outliers", title=None)
+        html_name = f"boxplot_{station}_{remark}_{month}.html"
+        html_path = str(out_dir / html_name)
+        fig.write_html(html_path, include_plotlyjs="cdn", full_html=True)
 
     return {
         "station": station,
@@ -324,7 +381,7 @@ def _summarize_group_worker(args):
         "q3": round(q3, 2),
         "op_ct_upper_outlier": _range_str(upper_outliers),
         "del_out_op_ct_av": round(avg_wo, 2) if avg_wo is not None else None,
-        "html": str(html_path),
+        "html": html_path,
     }
 
 def build_summary_df(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -339,7 +396,7 @@ def build_summary_df(df_raw: pd.DataFrame) -> pd.DataFrame:
     group_items = []
     for (station, remark, month), g in df_raw.groupby(["station", "remark", "month"], sort=True):
         op_ct_list = g["op_ct"].dropna().tolist()
-        group_items.append((station, remark, month, op_ct_list, str(OUT_DIR)))
+        group_items.append((station, remark, month, op_ct_list, str(OUT_DIR), ENABLE_HTML))
 
     total = len(group_items)
     log(f"[INFO] 그룹 수 = {total}")
@@ -374,12 +431,7 @@ def _make_boxplot_json_worker(args):
     if len(s) == 0:
         return idx, None
 
-    fig = px.box(
-        pd.DataFrame({"op_ct": s}),
-        y="op_ct",
-        points="outliers",
-        title=None
-    )
+    fig = px.box(pd.DataFrame({"op_ct": s}), y="op_ct", points="outliers", title=None)
     return idx, fig.to_json(validate=False)
 
 def build_plotly_json_column(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
@@ -462,9 +514,7 @@ def build_final_df_86(summary_df2: pd.DataFrame) -> pd.DataFrame:
     ].copy()
     left_right_df["final_ct"] = np.nan
 
-    whole_df = (
-        left_right_df.groupby(["month", "remark"], as_index=False)["uph"].sum()
-    )
+    whole_df = left_right_df.groupby(["month", "remark"], as_index=False)["uph"].sum()
     whole_df["station"] = "whole"
     whole_df["ct_eq"] = np.nan
     whole_df["final_ct"] = np.where(
@@ -497,28 +547,32 @@ def build_final_df_86(summary_df2: pd.DataFrame) -> pd.DataFrame:
 def main_once():
     log("=== FCT OP-CT Pipeline RUN (ONE SHOT) ===")
     log(f"[INFO] MP workers = {MAX_WORKERS}")
-    log(f"[INFO] month filter = {current_yyyymm()} | recent={RECENT_SECONDS}s | stable_buf={STABLE_DATA_SEC}s")
+    log(f"[INFO] month filter = {current_yyyymm()} | stable_buf={STABLE_DATA_SEC}s | loop=5s | bootstrap={BOOTSTRAP_LOOKBACK_MINUTES}m")
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
     engine = get_engine(DB_CONFIG)
 
-    df_raw = load_source_df(engine)
+    df_raw = load_source_df_incremental(engine)
     if df_raw is None or len(df_raw) == 0:
-        log("[SKIP] 최근 데이터 없음 -> 저장 생략")
+        log("[SKIP] 신규 데이터 없음 -> 저장 생략")
         return
 
-    summary_df = build_summary_df(df_raw)
+    summary_df  = build_summary_df(df_raw)
     summary_df2 = build_plotly_json_column(df_raw, summary_df)
     final_df_86 = build_final_df_86(summary_df2)
 
-    # 누적 저장의 “최신” 식별용
     inserted_at = datetime.now()
     summary_df2["inserted_at"] = inserted_at
     final_df_86["inserted_at"] = inserted_at
 
-    log("[6/6] DB 저장 단계 시작...(APPEND 누적, 중복 허용)")
+    log("[6/6] DB 저장 단계 시작...(APPEND 누적)")
     save_df_append(summary_df2, TARGET_SCHEMA, TBL_OPCT, engine)
     save_df_append(final_df_86, TARGET_SCHEMA, TBL_WHOLE, engine)
+
+    # ✅ 저장 성공 이후에만 cursor 갱신
+    cur_update = df_raw.groupby(["station", "remark"])["end_ts"].max().reset_index()
+    for _, r in cur_update.iterrows():
+        upsert_cursor(engine, r["station"], r["remark"], r["end_ts"])
+        log(f"[CURSOR] {r['station']}/{r['remark']} -> {r['end_ts']}")
 
     log("=== DONE (ONE SHOT) ===")
 
@@ -529,7 +583,7 @@ def main_once():
 def realtime_loop():
     log("=== FCT OP-CT Realtime Loop START ===")
     log(f"[INFO] windows={[(s.strftime('%H:%M:%S'), e.strftime('%H:%M:%S')) for s,e in WINDOWS]}")
-    log(f"[INFO] LOOP_INTERVAL_SEC={LOOP_INTERVAL_SEC} | workers={MAX_WORKERS}")
+    log(f"[INFO] LOOP_INTERVAL_SEC={LOOP_INTERVAL_SEC} | workers={MAX_WORKERS} | ENABLE_HTML={ENABLE_HTML}")
 
     loop_count = 0
     while True:
@@ -537,7 +591,6 @@ def realtime_loop():
         loop_start = time_mod.perf_counter()
         now_dt = datetime.now()
 
-        # 윈도우 밖이면 1초 대기
         if not now_in_windows(now_dt):
             if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
                 log(f"[IDLE] {now_dt:%Y-%m-%d %H:%M:%S} (out of window)")
@@ -547,14 +600,12 @@ def realtime_loop():
                 time_mod.sleep(sleep_sec)
             continue
 
-        # 윈도우 안: 1회 실행
         try:
             log(f"[RUN] {now_dt:%Y-%m-%d %H:%M:%S} (in window)")
             main_once()
         except Exception as e:
             log(f"[ERROR] {type(e).__name__}: {e}")
 
-        # 1초 주기 유지
         elapsed = time_mod.perf_counter() - loop_start
         sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
         if sleep_sec > 0:

@@ -29,22 +29,120 @@ MES 불량 소요 시간 계산 (Vision1/Vision2) - Realtime Loop Version
   최근 120초 범위의 이벤트만 메모리 버퍼에 유지하고,
   윈도우 내 1초마다 "버퍼→그룹→MP 처리→DROP/CREATE/INSERT" 수행
 
-중요:
-- Tail-follow를 쓰려면 Vision 머신 로그 "원본 파일 경로"가 필요합니다.
-  아래 BASE_DIR_VISION은 기존 Machine Log 경로를 기준으로 설정해두었습니다.
-  폴더 구조가 다르면 BASE_DIR_VISION만 맞추면 됩니다.
+[Nuitka/EXE 콘솔 강제 종료 방지(가능한 범위)]
+- Ctrl+C / Ctrl+Break: 즉시 종료 대신 STOP_REQUESTED 플래그로 정상 종료 유도
+- 콘솔 X 닫기/로그오프/시스템 종료 이벤트: 가능한 경우 STOP_REQUESTED로 유도
+  (Windows 정책상 '완전 차단'은 불가할 수 있으나, 대부분 케이스에서 정상 종료 루트로 유도)
+- 어떤 종료 경로에서도 pause_console()로 콘솔이 바로 닫히지 않게 유지
 """
 
+import os
 import re
+import sys
+import signal
 import time as pytime
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 import urllib.parse
+
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 from multiprocessing import Pool, freeze_support
+
+
+# ============================================
+# 공용: 로그/콘솔 유지
+# ============================================
+def log(msg: str):
+    print(msg, flush=True)
+
+
+def pause_console():
+    """
+    EXE/Nuitka에서 콘솔이 즉시 닫히는 걸 막기 위한 '마지막 멈춤'.
+    """
+    try:
+        input("\n[END] 작업이 종료되었습니다. 콘솔을 닫으려면 Enter를 누르세요...")
+    except Exception:
+        pass
+
+
+# ============================================
+# [Nuitka/EXE] 종료 신호 처리 (강제 종료 방지/정상 종료 유도)
+# ============================================
+STOP_REQUESTED = False
+
+
+def _request_stop(reason: str = ""):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    if reason:
+        log(f"[STOP-REQ] {reason}")
+
+
+def _install_signal_handlers():
+    # Ctrl+C
+    try:
+        signal.signal(signal.SIGINT, lambda s, f: _request_stop("SIGINT(Ctrl+C)"))
+    except Exception:
+        pass
+
+    # Ctrl+Break (Windows)
+    try:
+        signal.signal(signal.SIGBREAK, lambda s, f: _request_stop("SIGBREAK(Ctrl+Break)"))
+    except Exception:
+        pass
+
+    # (가능한 환경에서) SIGTERM
+    try:
+        signal.signal(signal.SIGTERM, lambda s, f: _request_stop("SIGTERM"))
+    except Exception:
+        pass
+
+
+def _install_windows_console_ctrl_handler():
+    """
+    Windows 콘솔 닫기/로그오프/시스템종료 이벤트 처리.
+    - Windows 정책상 완전 차단은 불가할 수 있습니다.
+    - 가능한 경우 STOP_REQUESTED로 전환해 루프가 정상 종료되도록 유도합니다.
+    """
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        CTRL_C_EVENT = 0
+        CTRL_BREAK_EVENT = 1
+        CTRL_CLOSE_EVENT = 2
+        CTRL_LOGOFF_EVENT = 5
+        CTRL_SHUTDOWN_EVENT = 6
+
+        HandlerRoutine = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+
+        def _handler(ctrl_type):
+            if ctrl_type == CTRL_C_EVENT:
+                _request_stop("CTRL_C_EVENT")
+                return True
+            if ctrl_type == CTRL_BREAK_EVENT:
+                _request_stop("CTRL_BREAK_EVENT")
+                return True
+            if ctrl_type == CTRL_CLOSE_EVENT:
+                _request_stop("CTRL_CLOSE_EVENT(콘솔닫기)")
+                return True
+            if ctrl_type == CTRL_LOGOFF_EVENT:
+                _request_stop("CTRL_LOGOFF_EVENT")
+                return True
+            if ctrl_type == CTRL_SHUTDOWN_EVENT:
+                _request_stop("CTRL_SHUTDOWN_EVENT")
+                return True
+            return False
+
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(HandlerRoutine(_handler), True)
+    except Exception:
+        pass
 
 
 # ============================================
@@ -123,22 +221,13 @@ def _seconds_until_next_window(t: dtime) -> int:
 # ============================================
 # [2] Tail-Follow 설정 (Vision 원본 파일)
 # ============================================
-# ✅ 반드시 실제 Vision 머신로그 파일이 저장되는 폴더로 맞추세요.
-# 일반적으로: \\192.168.108.155\FCT LogFile\Machine Log\Vision\YYYY\MM\....
-# 사용자 기존 코드의 BASE_DIR이 \\...\Machine Log 였던 점을 고려해 기본값을 아래처럼 둠.
 BASE_DIR_VISION = Path(r"\\192.168.108.155\FCT LogFile\Machine Log")
 
-# 파일명 패턴: 20251230_Vision1_Machine_Log.txt / 20251230_Vision2_Machine_Log.txt
 VISION_FILE_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
 
-# 라인 패턴: [HH:MM:SS.xx]  (기존 코드와 동일)
 VISION_LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
 
-
-# tail-follow 오프셋: path -> last byte offset
 FILE_OFFSETS: dict[str, int] = {}
-
-# 파일별 마지막 이벤트 fingerprint(중복 라인 방어)
 LAST_FP: dict[str, tuple[str, str, str]] = {}
 
 
@@ -178,11 +267,22 @@ def tail_read_new_lines(path_str: str) -> list[str]:
         return []
 
 
+def _walk_fast(base: Path):
+    """
+    os.walk 래퍼 (예외 안전)
+    """
+    import os as _os
+    try:
+        for root, dirs, files in _os.walk(str(base)):
+            yield root, dirs, files
+    except Exception:
+        return
+
+
 def list_today_vision_files(today_ymd: str) -> dict[str, str]:
     """
     오늘자 Vision1/Vision2 파일 경로 탐색
-    - 폴더 구조가 YYYY/MM 또는 YYYY/MM/DD 등 어떤 형태여도 일단 전체 순회
-    - 운영 환경에서 파일이 매우 많다면, 여기만 구조에 맞춰 최적화하면 됨
+    - 폴더 구조가 YYYY/MM 또는 YYYY/MM/DD 등 어떤 형태여도 전체 순회
     """
     out: dict[str, str] = {}
     if not BASE_DIR_VISION.exists():
@@ -200,7 +300,6 @@ def list_today_vision_files(today_ymd: str) -> dict[str, str]:
             st = f"Vision{no}"
             full = str(Path(root) / fn)
 
-            # 같은 station 파일이 여러 개면 최신 mtime 우선
             if st not in out:
                 out[st] = full
             else:
@@ -211,27 +310,6 @@ def list_today_vision_files(today_ymd: str) -> dict[str, str]:
                     pass
 
     return out
-
-
-def _walk_fast(base: Path):
-    """
-    os.walk 대체 (Path 기반)
-    - 예외 안전
-    """
-    try:
-        for p in base.rglob("*"):
-            # rglob은 느릴 수 있어, 환경이 크면 BASE_DIR를 더 좁혀야 함.
-            # 그래도 '기존 기능 유지 + 경로 미확정' 상태에선 가장 안전한 방식.
-            if p.is_dir():
-                continue
-    except Exception:
-        pass
-
-    # rglob 대신 os.walk가 더 낫지만, 외부 의존 없이 안전하게 구현
-    # -> 여기서는 표준 os.walk를 사용
-    import os
-    for root, dirs, files in os.walk(str(base)):
-        yield root, dirs, files
 
 
 # ============================================
@@ -274,10 +352,6 @@ def filter_shift_boundary(df: pd.DataFrame) -> pd.DataFrame:
 # [4] 그룹 처리(멀티프로세스 워커) - 기존 그대로
 # ============================================
 def process_one_group(args):
-    """
-    args = ((station, end_day), group_df)
-    return: rows(list[dict]) - 결과 레코드들
-    """
     (station, end_day), g = args
     g = g.sort_values("end_time").reset_index(drop=True).copy()
 
@@ -390,10 +464,9 @@ class EventRow:
     station: str
     end_time: str
     contents: str
-    ts_epoch: float  # event time (오늘 날짜 기준)
+    ts_epoch: float
 
 
-# station별 최근 이벤트 버퍼
 BUFFER: dict[str, list[EventRow]] = {
     "Vision1": [],
     "Vision2": [],
@@ -401,9 +474,6 @@ BUFFER: dict[str, list[EventRow]] = {
 
 
 def _event_epoch(today_ymd: str, end_time_str: str) -> float | None:
-    """
-    end_day(today_ymd) + end_time_str(HH:MM:SS.xx) -> epoch seconds
-    """
     try:
         dt = datetime.strptime(f"{today_ymd} {end_time_str}", "%Y%m%d %H:%M:%S.%f")
         return dt.timestamp()
@@ -412,10 +482,6 @@ def _event_epoch(today_ymd: str, end_time_str: str) -> float | None:
 
 
 def _append_events_from_lines(station: str, today_ymd: str, file_path: str, lines: list[str]):
-    """
-    tail-read 라인 -> EventRow로 변환하여 BUFFER에 추가
-    + 입력 중복(SELECT DISTINCT 효과) 1차 방어: (end_day,station,end_time,contents) 중복 제거
-    """
     if not lines:
         return
 
@@ -453,23 +519,14 @@ def _append_events_from_lines(station: str, today_ymd: str, file_path: str, line
 
 
 def _prune_buffer(now_epoch: float):
-    """
-    (5) 실시간: 현재 시간 기준 120초 이내 데이터만 처리
-    -> BUFFER에서 now-120초 이전은 제거
-    """
     cutoff = now_epoch - REALTIME_WINDOW_SEC
-    for st, rows in BUFFER.items():
+    for st, rows in list(BUFFER.items()):
         if not rows:
             continue
-        # 오래된 것 제거
         BUFFER[st] = [r for r in rows if r.ts_epoch >= cutoff]
 
 
 def _buffer_to_dataframe(today_ymd: str) -> pd.DataFrame:
-    """
-    BUFFER -> DataFrame
-    + (4) DISTINCT 효과: drop_duplicates
-    """
     rows = []
     for st, lst in BUFFER.items():
         for r in lst:
@@ -486,7 +543,6 @@ def _buffer_to_dataframe(today_ymd: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     # (3) 오늘 기준 같은 월만 (YYYYMM%)
-    # tail-follow는 오늘 파일만 읽으므로 사실상 항상 만족하지만, 요구사항 유지
     yyyymm = datetime.now().strftime("%Y%m")
     df = df[df["end_day"].astype(str).str.startswith(yyyymm)].copy()
 
@@ -504,23 +560,18 @@ def run_once(engine):
     today_ymd = now.strftime("%Y%m%d")
     now_epoch = now.timestamp()
 
-    # FORCE_CUTOFF_TS 지원(기존 요구사항 유지)
     if FORCE_CUTOFF_TS is not None:
-        # 강제 cutoff를 쓰면, now_epoch 대신 강제 시점 기준으로 prune
         now_epoch = float(FORCE_CUTOFF_TS) + REALTIME_WINDOW_SEC
 
-    # 1) 오늘 파일 경로 찾기
     station_files = list_today_vision_files(today_ymd)
     v1 = station_files.get("Vision1")
     v2 = station_files.get("Vision2")
 
-    # 파일이 하나도 없으면 결과 0 저장
     if not v1 and not v2:
         recreate_out_table(engine)
-        print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)", flush=True)
+        log(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)")
         return
 
-    # 2) tail-follow로 새 라인만 버퍼에 적재
     if v1:
         lines = tail_read_new_lines(v1)
         _append_events_from_lines("Vision1", today_ymd, v1, lines)
@@ -528,20 +579,17 @@ def run_once(engine):
         lines = tail_read_new_lines(v2)
         _append_events_from_lines("Vision2", today_ymd, v2, lines)
 
-    # 3) 버퍼 prune (최근 120초만 유지)
     _prune_buffer(now_epoch)
 
-    # 4) DF 변환 + 교대 경계 제거
     df = _buffer_to_dataframe(today_ymd)
     if df.empty:
         recreate_out_table(engine)
-        print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)", flush=True)
+        log(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)")
         return
 
     df = filter_shift_boundary(df)
     df = df.sort_values(["station", "end_day", "end_time"]).reset_index(drop=True)
 
-    # 5) group -> MP=2 처리
     group_items = [((st, day), g.copy()) for (st, day), g in df.groupby(["station", "end_day"], sort=False)]
     with Pool(processes=WORKERS) as pool:
         results = pool.map(process_one_group, group_items)
@@ -550,28 +598,21 @@ def run_once(engine):
 
     if not flat_rows:
         recreate_out_table(engine)
-        print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)", flush=True)
+        log(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows=0)")
         return
 
     result_df = pd.DataFrame(flat_rows)
 
-    # end_day CHAR(8) 정규화
     result_df["end_day"] = (
         result_df["end_day"].astype(str)
         .str.replace(",", "", regex=False)
         .str.zfill(8)
     )
 
-    # (4) 결과 단계 DISTINCT 효과(2차)
-    distinct_cols = [
-        "end_day", "station",
-        "from_contents", "from_time",
-        "to_contents", "to_time",
-    ]
+    distinct_cols = ["end_day", "station", "from_contents", "from_time", "to_contents", "to_time"]
     result_df = result_df.drop_duplicates(subset=distinct_cols, keep="first").reset_index(drop=True)
     result_df.insert(0, "id", result_df.index + 1)
 
-    # 6) DROP → CREATE → INSERT (기존 유지)
     recreate_out_table(engine)
     result_df.to_sql(
         OUT_TABLE_NAME,
@@ -581,29 +622,30 @@ def run_once(engine):
         index=False
     )
 
-    print(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows={len(result_df)})", flush=True)
+    log(f"[DONE] saved: {OUT_TABLE_SCHEMA}.{OUT_TABLE_NAME} (rows={len(result_df)})")
 
 
 # ============================================
 # [8] main: 타임윈도우 기반 1초 루프 (기존 유지)
 # ============================================
 def main_loop():
-    engine = get_engine()
-    print("[INFO] MES fail wasted time scheduled realtime loop start", flush=True)
-    print(f"[INFO] workers={WORKERS}, realtime_window={REALTIME_WINDOW_SEC}s, force_cutoff_ts={FORCE_CUTOFF_TS}", flush=True)
-    print("[INFO] run_windows =", RUN_WINDOWS, flush=True)
-    print("[INFO] tail-follow BASE_DIR_VISION =", str(BASE_DIR_VISION), flush=True)
+    global STOP_REQUESTED
 
-    while True:
+    engine = get_engine()
+    log("[INFO] MES fail wasted time scheduled realtime loop start")
+    log(f"[INFO] workers={WORKERS}, realtime_window={REALTIME_WINDOW_SEC}s, force_cutoff_ts={FORCE_CUTOFF_TS}")
+    log(f"[INFO] run_windows = {RUN_WINDOWS}")
+    log(f"[INFO] tail-follow BASE_DIR_VISION = {str(BASE_DIR_VISION)}")
+    log("[INFO] 종료: Ctrl+C 또는 Ctrl+Break 를 누르면 '정상 종료'로 빠집니다. (콘솔 유지됨)")
+
+    while not STOP_REQUESTED:
         now_t = _now_time()
 
-        # 윈도우 밖이면 대기
         if not _is_in_run_window(now_t):
             wait_sec = _seconds_until_next_window(now_t)
-            print(f"[WAIT] now={now_t} -> next window in {wait_sec}s", flush=True)
+            log(f"[WAIT] now={now_t} -> next window in {wait_sec}s")
 
-            # 정확히 시작 시각에 맞추기 위해 1초 단위 체크
-            while wait_sec > 0:
+            while wait_sec > 0 and not STOP_REQUESTED:
                 pytime.sleep(1)
                 wait_sec -= 1
                 now_t = _now_time()
@@ -611,15 +653,36 @@ def main_loop():
                     break
             continue
 
-        # 윈도우 안: 1초마다 실행
         try:
             run_once(engine)
         except Exception as e:
-            print("[ERROR]", repr(e), flush=True)
+            log("[ERROR] " + repr(e))
 
-        pytime.sleep(1)
+        # 윈도우 안에서 1초 템포
+        for _ in range(1):
+            if STOP_REQUESTED:
+                break
+            pytime.sleep(1)
+
+    log("[STOP] 정상 종료 루트로 루프를 종료합니다.")
+
+
+def main():
+    _install_signal_handlers()
+    _install_windows_console_ctrl_handler()
+    main_loop()
 
 
 if __name__ == "__main__":
     freeze_support()
-    main_loop()
+    try:
+        main()
+    except Exception as e:
+        log("\n[ERROR] 예외가 발생했습니다.")
+        log(f"  - {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        pause_console()
+        sys.exit(1)
+    else:
+        pause_console()
