@@ -42,7 +42,7 @@ from psycopg2.extras import execute_values
 # 0) 설정
 # =========================
 DB_CONFIG = {
-    "host": "localhost",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",

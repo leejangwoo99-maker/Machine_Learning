@@ -1,35 +1,54 @@
 # -*- coding: utf-8 -*-
 """
-FCT OP-CT Boxplot Summary + UPH(병렬합산) + PostgreSQL 저장 (MP 적용, Realtime Window 실행)
-- 증분 로딩: (station, remark)별 cursor(last_end_ts) 이후 신규 데이터만 로드
-- 5초 주기 실행
-- 윈도우 시간(08:27~08:29:59, 20:27~20:29:59)에서만 실행
-- 현재달(YYYYMM)만 처리
-- 안정화 버퍼: end_ts <= now - 2초
-- 저장(APPEND): e1_FCT_ct.fct_op_ct / e1_FCT_ct.fct_whole_op_ct (inserted_at 포함)
-- 커서 테이블: e1_FCT_ct.fct_opct_cursor (저장 성공 후 갱신)
-- ✅ (추천) 커서 NULL이면 now()-10분만 읽고 시작(첫 실행 폭주 방지)
+e1_1_FCT_op_ct_factory_schedule.py
 
-주의:
-- e1 집계는 DB 기반이므로 파일 미완성 방지 대신 안정화 버퍼로 “방금 들어온 미확정 row” 회피
+[스케줄 실행 방식]
+- 매일 08:22:00에 1회 실행 (오늘 데이터 전체 대상) -> 계산/UPSERT
+- 매일 20:22:00에 1회 실행 (오늘 데이터 전체 대상) -> 계산/UPSERT
+- 그 외 시간에는 대기만 함
+- 2회 모두 완료되면 종료
+
+[정책]
+- LATEST: 키 기준 UPSERT (최신값 갱신)
+- HIST  : 하루 1개 롤링
+  * UNIQUE(snapshot_day, station, remark, month) 유지
+  * INSERT = ON CONFLICT DO UPDATE (DO NOTHING 아님)
+
+[id NULL 해결]
+- id 컬럼 없으면 생성
+- 시퀀스 없으면 생성
+- id default nextval 강제
+- 기존 NULL id는 nextval로 채움
+- setval 동기화
+
+[멀티프로세스]
+- MP=2 고정
+  * p1: FCT1,FCT2
+  * p2: FCT3,FCT4
+
+[기존 기능 유지]
+- boxplot html 저장
+- plotly_json 저장
+- UPH(left/right/whole) 계산
+- DataFrame 콘솔 출력 없음(로그만)
 """
 
 import sys
-from pathlib import Path
+import time
 import urllib.parse
-from datetime import datetime, time as dtime
-import time as time_mod
-from multiprocessing import freeze_support
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, date, time as dtime
+
+from multiprocessing import get_context
+from pathlib import Path
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
-
-from sqlalchemy import create_engine, text
-
 import plotly.express as px
+
 import psycopg2
 from psycopg2 import sql
+from sqlalchemy import create_engine, text
 from pandas.api.types import CategoricalDtype
 
 
@@ -47,40 +66,30 @@ DB_CONFIG = {
 SRC_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
 SRC_TABLE  = "fct_vision_testlog_txt_processing_history"
 
+# 스키마 대소문자 유지 (요구사항)
 TARGET_SCHEMA = "e1_FCT_ct"
-TBL_OPCT      = "fct_op_ct"
-TBL_WHOLE     = "fct_whole_op_ct"
 
-# Cursor table (증분 로딩)
-CURSOR_SCHEMA = "e1_FCT_ct"
-CURSOR_TABLE  = "fct_opct_cursor"
+# 최신 갱신 테이블
+TBL_OPCT_LATEST  = "fct_op_ct"
+TBL_WHOLE_LATEST = "fct_whole_op_ct"
 
-# ✅ (추천) 커서 NULL이면 최근 N분만 읽고 시작 (첫 실행 폭주 방지)
-BOOTSTRAP_LOOKBACK_MINUTES = 10
+# 누적(하루 1개 롤링) 테이블
+TBL_OPCT_HIST  = "fct_op_ct_hist"
+TBL_WHOLE_HIST = "fct_whole_op_ct_hist"
 
-# boxplot html 저장 폴더(현재 스크립트 기준)
+# boxplot html 저장 폴더(기존 기능 유지)
 OUT_DIR = Path("./fct_opct_boxplot_html")
-ENABLE_HTML = False   # EXE 운용 안정성 위해 기본 OFF. 필요 시 True.
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # op_ct 필터
 OPCT_MAX_SEC = 600
 
-# =========================
-# Realtime Loop 사양
-# =========================
-MAX_WORKERS = 2
-LOOP_INTERVAL_SEC = 5.0     # ✅ 5초 주기
-STABLE_DATA_SEC = 2         # 안정화 버퍼
+# 실행 스케줄
+RUN_TIME = dtime(0, 10, 0)  # 매월 1일 00:10:00 (Task Scheduler)
 
-WINDOWS = [
-    (dtime(8, 27, 0),  dtime(8, 29, 59)),
-    (dtime(20, 27, 0), dtime(20, 29, 59)),
-]
-
-HEARTBEAT_EVERY_LOOPS = 12  # 5초*12=60초마다 idle 로그
-
-STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]
-REMARKS  = ["PD", "Non-PD"]
+# 멀티프로세스 분담
+PROC_1_STATIONS = ["FCT1", "FCT2"]
+PROC_2_STATIONS = ["FCT3", "FCT4"]
 
 
 # =========================
@@ -89,15 +98,27 @@ REMARKS  = ["PD", "Non-PD"]
 def log(msg: str):
     print(msg, flush=True)
 
-def now_in_windows(now_dt: datetime) -> bool:
-    t = now_dt.time()
-    for s, e in WINDOWS:
-        if s <= t <= e:
-            return True
-    return False
 
-def current_yyyymm() -> str:
-    return datetime.now().strftime("%Y%m")
+def today_yyyymmdd() -> str:
+    return date.today().strftime("%Y%m%d")
+
+
+def is_monthly_run_time(now: datetime) -> bool:
+    """매월 1일 00:10에만 실행(스케줄러 트리거 전용)."""
+    return (now.day == 1) and (now.hour == 0) and (now.minute == 10)
+
+
+def prev_month_yyyymm(now: datetime) -> str:
+    """실행 시점(now)이 매월 1일일 때, '직전월(YYYYMM)'을 반환.
+    예) 2026-02-01 실행 -> '202601'
+        2026-01-01 실행 -> '202512'
+    """
+    y = now.year
+    m = now.month
+    if m == 1:
+        return f"{y-1}12"
+    return f"{y}{(m-1):02d}"
+
 
 def get_engine(config=DB_CONFIG):
     pw = urllib.parse.quote_plus(config["password"])
@@ -107,215 +128,290 @@ def get_engine(config=DB_CONFIG):
     )
     return create_engine(conn_str, pool_pre_ping=True)
 
-def ensure_schema(conn, schema_name: str):
-    with conn.cursor() as cur:
-        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema_name)))
-    conn.commit()
 
-def safe_cat_to_str(df: pd.DataFrame) -> pd.DataFrame:
+def _cast_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
     out = df.copy()
+    if "month" in out.columns:
+        out["month"] = out["month"].astype(str)
     for c in out.columns:
         if isinstance(out[c].dtype, CategoricalDtype):
             out[c] = out[c].astype(str)
     return out
 
-def save_df_append(df: pd.DataFrame, schema_name: str, table_name: str, engine):
+
+def _next_run_datetimes(now_dt: datetime) -> List[datetime]:
     """
-    테이블 없으면 생성, 있으면 append 누적.
-    중복 허용 (요구사항). 다만 소스 로딩은 cursor로 신규만 읽어 중복을 실질 차단.
+    오늘 기준으로 남아있는 실행 타임(08:22, 20:22)을 반환.
+    이미 지난 타임은 제외.
     """
-    if df is None or len(df) == 0:
-        log(f"[SKIP] {schema_name}.{table_name}: df가 비어있습니다.")
-        return
+    d = now_dt.date()
+    cands = [
+        datetime(d.year, d.month, d.day, RUN_TIME_1.hour, RUN_TIME_1.minute, RUN_TIME_1.second),
+        datetime(d.year, d.month, d.day, RUN_TIME_2.hour, RUN_TIME_2.minute, RUN_TIME_2.second),
+    ]
+    return [t for t in cands if t >= now_dt]
 
-    df_to_save = df.copy()
 
-    if "month" in df_to_save.columns:
-        df_to_save["month"] = df_to_save["month"].astype(str)
+def _sleep_until(target_dt: datetime):
+    """
+    target_dt까지 대기. (초 단위 sleep)
+    """
+    while True:
+        now = datetime.now()
+        if now >= target_dt:
+            return
+        sec = (target_dt - now).total_seconds()
+        # 너무 짧게 쪼개지 않도록 1~30초 정도로 슬립
+        time.sleep(min(max(sec, 1.0), 30.0))
 
-    df_to_save = safe_cat_to_str(df_to_save)
 
-    # schema 보장
+# =========================
+# 2) 테이블/인덱스/ID 보정
+# =========================
+def ensure_schema(conn, schema_name: str):
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema_name)))
+    conn.commit()
+
+
+def ensure_tables_and_indexes():
+    """
+    - 스키마 생성
+    - 테이블 생성(없으면)
+    - created_at/updated_at 컬럼 없으면 추가 (LATEST용)
+    - UNIQUE 인덱스 보장
+    - id 자동채번/NULL 보정
+    """
     with psycopg2.connect(**DB_CONFIG) as conn:
-        ensure_schema(conn, schema_name)
+        ensure_schema(conn, TARGET_SCHEMA)
 
-    log(f"[APPEND] {schema_name}.{table_name} to_sql append (rows={len(df_to_save)})")
-    df_to_save.to_sql(
-        name=table_name,
-        con=engine,
-        schema=schema_name,
-        if_exists="append",
-        index=False,
-        method="multi",
-        chunksize=5000
-    )
-    log(f"[OK] append 완료: {schema_name}.{table_name} (+{len(df_to_save)})")
+        with conn.cursor() as cur:
+            # -------------------------
+            # LATEST: fct_op_ct
+            # -------------------------
+            cur.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {}.{} (
+                    id BIGINT,
+                    station TEXT NOT NULL,
+                    remark  TEXT NOT NULL,
+                    month   TEXT NOT NULL,
+                    sample_amount INT,
+                    op_ct_lower_outlier TEXT,
+                    q1 NUMERIC(12,2),
+                    median NUMERIC(12,2),
+                    q3 NUMERIC(12,2),
+                    op_ct_upper_outlier TEXT,
+                    del_out_op_ct_av NUMERIC(12,2),
+                    plotly_json TEXT
+                );
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
+
+            cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now();""")
+                        .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
+            cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();""")
+                        .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
+
+            cur.execute(sql.SQL("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_fct_op_ct_key
+                ON {}.{} (station, remark, month);
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
+
+            # -------------------------
+            # LATEST: fct_whole_op_ct
+            # -------------------------
+            cur.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {}.{} (
+                    id BIGINT,
+                    station TEXT NOT NULL,
+                    remark  TEXT NOT NULL,
+                    month   TEXT NOT NULL,
+                    ct_eq NUMERIC(12,2),
+                    uph   NUMERIC(12,2),
+                    final_ct NUMERIC(12,2)
+                );
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
+
+            cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now();""")
+                        .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
+            cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();""")
+                        .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
+
+            cur.execute(sql.SQL("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_fct_whole_op_ct_key
+                ON {}.{} (station, remark, month);
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
+
+            # -------------------------
+            # HIST: fct_op_ct_hist (하루 1개 롤링)
+            # -------------------------
+            cur.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {}.{} (
+                    id BIGINT,
+                    snapshot_day TEXT NOT NULL,
+                    snapshot_ts  TIMESTAMP DEFAULT now(),
+                    station TEXT NOT NULL,
+                    remark  TEXT NOT NULL,
+                    month   TEXT NOT NULL,
+                    sample_amount INT,
+                    op_ct_lower_outlier TEXT,
+                    q1 NUMERIC(12,2),
+                    median NUMERIC(12,2),
+                    q3 NUMERIC(12,2),
+                    op_ct_upper_outlier TEXT,
+                    del_out_op_ct_av NUMERIC(12,2),
+                    plotly_json TEXT
+                );
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_HIST)))
+
+            cur.execute(sql.SQL("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_fct_op_ct_hist_day_key
+                ON {}.{} (snapshot_day, station, remark, month);
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_HIST)))
+
+            # -------------------------
+            # HIST: fct_whole_op_ct_hist (하루 1개 롤링)
+            # -------------------------
+            cur.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {}.{} (
+                    id BIGINT,
+                    snapshot_day TEXT NOT NULL,
+                    snapshot_ts  TIMESTAMP DEFAULT now(),
+                    station TEXT NOT NULL,
+                    remark  TEXT NOT NULL,
+                    month   TEXT NOT NULL,
+                    ct_eq NUMERIC(12,2),
+                    uph   NUMERIC(12,2),
+                    final_ct NUMERIC(12,2)
+                );
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_HIST)))
+
+            cur.execute(sql.SQL("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_fct_whole_op_ct_hist_day_key
+                ON {}.{} (snapshot_day, station, remark, month);
+            """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_HIST)))
+
+        conn.commit()
+
+    # id 자동채번/NULL 보정 (4개 테이블 모두)
+    fix_id_sequence(TARGET_SCHEMA, TBL_OPCT_LATEST,  "fct_op_ct_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_WHOLE_LATEST, "fct_whole_op_ct_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_OPCT_HIST,    "fct_op_ct_hist_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_WHOLE_HIST,   "fct_whole_op_ct_hist_id_seq")
+
+    log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"')
 
 
-# =========================
-# 1-1) Cursor 테이블
-# =========================
-def ensure_cursor_table():
-    ddl = f"""
-    CREATE SCHEMA IF NOT EXISTS {CURSOR_SCHEMA};
+def fix_id_sequence(schema: str, table: str, seq_name: str):
+    """
+    - id 컬럼 없으면 추가
+    - 시퀀스 없으면 생성
+    - id default nextval 강제
+    - id NULL인 기존 행은 nextval로 채움
+    - 시퀀스 setval = max(id)+1 로 동기화
+    """
+    do_sql = f"""
+    DO $$
+    DECLARE
+      v_schema TEXT := {schema!r};
+      v_table  TEXT := {table!r};
+      v_seq    TEXT := {seq_name!r};
+      v_full_table TEXT := quote_ident(v_schema) || '.' || quote_ident(v_table);
+      v_full_seq   TEXT := quote_ident(v_schema) || '.' || quote_ident(v_seq);
+      v_max BIGINT;
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = v_schema
+          AND table_name = v_table
+          AND column_name = 'id'
+      ) THEN
+        EXECUTE 'ALTER TABLE ' || v_full_table || ' ADD COLUMN id BIGINT';
+      END IF;
 
-    CREATE TABLE IF NOT EXISTS {CURSOR_SCHEMA}.{CURSOR_TABLE} (
-        station     TEXT NOT NULL,
-        remark      TEXT NOT NULL,
-        last_end_ts TIMESTAMP NULL,
-        updated_at  TIMESTAMP NOT NULL DEFAULT now(),
-        PRIMARY KEY (station, remark)
-    );
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'S'
+          AND n.nspname = v_schema
+          AND c.relname = v_seq
+      ) THEN
+        EXECUTE 'CREATE SEQUENCE ' || v_full_seq;
+      END IF;
+
+      EXECUTE 'ALTER TABLE ' || v_full_table ||
+              ' ALTER COLUMN id SET DEFAULT nextval(''' || v_full_seq || ''')';
+
+      EXECUTE 'ALTER SEQUENCE ' || v_full_seq ||
+              ' OWNED BY ' || v_full_table || '.id';
+
+      EXECUTE 'UPDATE ' || v_full_table || ' SET id = nextval(''' || v_full_seq || ''') WHERE id IS NULL';
+
+      EXECUTE 'SELECT COALESCE(MAX(id), 0) FROM ' || v_full_table INTO v_max;
+      EXECUTE 'SELECT setval(''' || v_full_seq || ''', ' || (v_max + 1) || ', false)';
+    END $$;
     """
     with psycopg2.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
-            cur.execute(ddl)
+            cur.execute(do_sql)
         conn.commit()
 
-def get_cursors(engine) -> dict:
-    """
-    return: {(station, remark): last_end_ts or None}
-    """
-    ensure_cursor_table()
-    q = text(f"SELECT station, remark, last_end_ts FROM {CURSOR_SCHEMA}.{CURSOR_TABLE}")
-    df = pd.read_sql(q, engine)
-
-    cur_map = {(st, rk): None for st in STATIONS for rk in REMARKS}
-    for _, r in df.iterrows():
-        cur_map[(r["station"], r["remark"])] = r["last_end_ts"]
-    return cur_map
-
-def upsert_cursor(engine, station: str, remark: str, last_end_ts: datetime):
-    ensure_cursor_table()
-    sql_up = text(f"""
-        INSERT INTO {CURSOR_SCHEMA}.{CURSOR_TABLE} (station, remark, last_end_ts, updated_at)
-        VALUES (:station, :remark, :last_end_ts, now())
-        ON CONFLICT (station, remark)
-        DO UPDATE SET last_end_ts = EXCLUDED.last_end_ts,
-                      updated_at  = now()
-    """)
-    with engine.begin() as conn:
-        conn.execute(sql_up, {"station": station, "remark": remark, "last_end_ts": last_end_ts})
-
 
 # =========================
-# 2) 소스 로딩(증분) + op_ct 계산
-#    - 현재달 + 안정화버퍼 + cursor 이후 신규만
-#    ✅ 커서 NULL이면 now()-10분부터만 읽고 시작
+# 3) 소스 로딩 (오늘 데이터 전체) + op_ct 계산
 # =========================
-def load_source_df_incremental(engine) -> pd.DataFrame:
-    yyyymm = current_yyyymm()
-    cursors = get_cursors(engine)
+def load_month_df(engine, stations: List[str], run_month: str) -> pd.DataFrame:
+    """
+    소스 로딩 (해당 월 전체 데이터) + op_ct 계산
 
-    log("[1/6] DB에서 원본 데이터 증분 로딩 시작...(cursor 기반)")
-    dfs = []
-    total_rows = 0
-
+    - run_month: 'YYYYMM'
+    - end_day 컬럼 타입(TEXT/DATE 혼재 가능성을 고려하여 regexp_replace 기반 월 필터 적용
+    """
     sql_query = f"""
-    WITH base AS (
-        SELECT
-            station,
-            remark,
-            btrim(end_day::text)  AS end_day_text,
-            btrim(end_time::text) AS end_time_text,
-            result,
-            goodorbad,
-
-            CASE
-                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN (btrim(end_day::text))::date
-                ELSE NULL
-            END AS end_day_date,
-
-            CASE
-                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
-                 AND btrim(end_time::text) ~ '^\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$'
-                THEN to_timestamp(
-                    btrim(end_day::text) || ' ' || split_part(btrim(end_time::text), '.', 1),
-                    'YYYY-MM-DD HH24:MI:SS'
-                )
-
-                WHEN btrim(end_day::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
-                 AND btrim(end_time::text) ~ '^\\d{{6}}(\\.\\d+)?$'
-                THEN to_timestamp(
-                    btrim(end_day::text) || ' ' ||
-                    substring(btrim(end_time::text) from 1 for 2) || ':' ||
-                    substring(btrim(end_time::text) from 3 for 2) || ':' ||
-                    substring(btrim(end_time::text) from 5 for 2),
-                    'YYYY-MM-DD HH24:MI:SS'
-                )
-                ELSE NULL
-            END AS end_ts
-
-        FROM {SRC_SCHEMA}.{SRC_TABLE}
-        WHERE
-            station = :station
-            AND remark  = :remark
-            AND result <> 'FAIL'
-            AND goodorbad <> 'BadFile'
-    )
     SELECT
         station,
         remark,
-        end_day_text AS end_day,
-        end_time_text AS end_time,
-        result,
-        goodorbad,
-        end_ts
-    FROM base
-    WHERE
-        end_day_date IS NOT NULL
-        AND to_char(end_day_date, 'YYYYMM') = :yyyymm
-        AND end_ts IS NOT NULL
-        AND end_ts <= (now()::timestamp - INTERVAL '{STABLE_DATA_SEC} seconds')
-        AND end_ts > COALESCE(
-            :last_end_ts,
-            (now()::timestamp - INTERVAL '{BOOTSTRAP_LOOKBACK_MINUTES} minutes')
-        )
-    ORDER BY end_ts ASC
+        end_day,
+        end_time
+    FROM {SRC_SCHEMA}.{SRC_TABLE}
+    WHERE station = ANY(:stations)
+      AND remark IN ('PD','Non-PD')
+      AND result <> 'FAIL'
+      AND goodorbad <> 'BadFile'
+      AND substring(regexp_replace(COALESCE(end_day::text,''), '\\D', '', 'g') from 1 for 6) = :run_month
+    ORDER BY station ASC, remark ASC, end_time ASC
     """
 
-    for st in STATIONS:
-        for rk in REMARKS:
-            last_ts = cursors.get((st, rk))
-            df_part = pd.read_sql(
-                text(sql_query),
-                engine,
-                params={
-                    "station": st,
-                    "remark": rk,
-                    "yyyymm": yyyymm,
-                    "last_end_ts": last_ts,
-                },
-            )
-            n = len(df_part)
-            total_rows += n
-            if n > 0:
-                log(f"[INFO] +{st}/{rk}: rows={n} (cursor={last_ts})")
-                dfs.append(df_part)
-            else:
-                log(f"[SKIP] {st}/{rk}: 신규 없음 (cursor={last_ts})")
+    df = pd.read_sql(
+        text(sql_query),
+        engine,
+        params={"stations": stations, "run_month": run_month},
+    )
 
-    if total_rows == 0:
-        log("[OK] 원본 로딩 완료 (rows=0)")
-        return pd.DataFrame()
+    if df.empty:
+        return df
 
-    df = pd.concat(dfs, ignore_index=True)
-    log(f"[OK] 원본 로딩 완료 (rows={len(df)})")
-
-    log("[2/6] 타입 정리 및 op_ct 생성...")
     df["end_day"] = pd.to_datetime(df["end_day"], errors="coerce").dt.date
-    df["end_ts"]  = pd.to_datetime(df["end_ts"], errors="coerce")
+    df["end_time_str"] = df["end_time"].astype(str)
 
+    df["end_ts"] = pd.to_datetime(
+        df["end_day"].astype(str) + " " + df["end_time_str"],
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["end_ts"]).copy()
     df = df.sort_values(["station", "remark", "end_ts"], ascending=True).reset_index(drop=True)
-    df["op_ct"] = df.groupby(["station", "remark"])["end_ts"].diff().dt.total_seconds()
-    df["month"] = pd.to_datetime(df["end_day"].astype(str), errors="coerce").dt.strftime("%Y%m")
 
-    log("[OK] op_ct / month 생성 완료")
+    df["op_ct"] = df.groupby(["station", "remark"])["end_ts"].diff().dt.total_seconds()
+    df["month"] = df["end_ts"].dt.strftime("%Y%m")
+
     return df
 
-
 # =========================
-# 3) Boxplot 요약 + (옵션) HTML 저장 (MP=2)
+# 4) Boxplot 요약 + plotly_json (기존 기능 유지)
 # =========================
 def _range_str(values: pd.Series):
     values = values.dropna()
@@ -325,19 +421,14 @@ def _range_str(values: pd.Series):
     vmax = float(values.max())
     return f"{vmin:.1f}~{vmax:.1f}"
 
-def _summarize_group_worker(args):
-    station, remark, month, op_ct_list, out_dir_str, enable_html = args
-    out_dir = Path(out_dir_str)
 
-    s = pd.Series(op_ct_list).dropna()
+def summarize_group(g: pd.DataFrame) -> Dict:
+    s = g["op_ct"].dropna()
     s = s[s <= OPCT_MAX_SEC]
 
-    sample_amount = int(len(s))
+    sample_amount = len(s)
     if sample_amount == 0:
         return {
-            "station": station,
-            "remark": remark,
-            "month": str(month),
             "sample_amount": 0,
             "op_ct_lower_outlier": None,
             "q1": None,
@@ -345,7 +436,7 @@ def _summarize_group_worker(args):
             "q3": None,
             "op_ct_upper_outlier": None,
             "del_out_op_ct_av": None,
-            "html": None,
+            "plotly_json": None,
         }
 
     q1 = float(s.quantile(0.25))
@@ -362,115 +453,50 @@ def _summarize_group_worker(args):
     s_wo = s[(s >= lower_bound) & (s <= upper_bound)]
     avg_wo = float(s_wo.mean()) if len(s_wo) else None
 
-    html_path = None
-    if enable_html:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        fig = px.box(pd.DataFrame({"op_ct": s}), y="op_ct", points="outliers", title=None)
-        html_name = f"boxplot_{station}_{remark}_{month}.html"
-        html_path = str(out_dir / html_name)
-        fig.write_html(html_path, include_plotlyjs="cdn", full_html=True)
+    station = g["station"].iloc[0]
+    remark = g["remark"].iloc[0]
+    month = g["month"].iloc[0]
+
+    fig = px.box(pd.DataFrame({"op_ct": s}), y="op_ct", points="outliers", title=None)
+
+    html_name = f"boxplot_{station}_{remark}_{month}.html"
+    html_path = OUT_DIR / html_name
+    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
 
     return {
-        "station": station,
-        "remark": remark,
-        "month": str(month),
-        "sample_amount": sample_amount,
+        "sample_amount": int(sample_amount),
         "op_ct_lower_outlier": _range_str(lower_outliers),
         "q1": round(q1, 2),
         "median": round(med, 2),
         "q3": round(q3, 2),
         "op_ct_upper_outlier": _range_str(upper_outliers),
         "del_out_op_ct_av": round(avg_wo, 2) if avg_wo is not None else None,
-        "html": html_path,
+        "plotly_json": fig.to_json(),
     }
 
-def build_summary_df(df_raw: pd.DataFrame) -> pd.DataFrame:
-    log(f"[3/6] (station, remark, month) 요약 생성 시작... (MP={MAX_WORKERS})")
 
-    if df_raw is None or len(df_raw) == 0:
+def build_summary_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
         return pd.DataFrame(columns=[
-            "id","station","remark","month","sample_amount","op_ct_lower_outlier",
-            "q1","median","q3","op_ct_upper_outlier","del_out_op_ct_av","html"
+            "station", "remark", "month",
+            "sample_amount", "op_ct_lower_outlier", "q1", "median", "q3",
+            "op_ct_upper_outlier", "del_out_op_ct_av", "plotly_json"
         ])
 
-    group_items = []
-    for (station, remark, month), g in df_raw.groupby(["station", "remark", "month"], sort=True):
-        op_ct_list = g["op_ct"].dropna().tolist()
-        group_items.append((station, remark, month, op_ct_list, str(OUT_DIR), ENABLE_HTML))
+    groups = list(df_raw.groupby(["station", "remark", "month"], sort=True))
 
-    total = len(group_items)
-    log(f"[INFO] 그룹 수 = {total}")
+    rows = []
+    for (station, remark, month), g in groups:
+        stats = summarize_group(g)
+        rows.append({
+            "station": station,
+            "remark": remark,
+            "month": month,
+            **stats
+        })
 
-    summary_rows = []
-    done = 0
-
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(_summarize_group_worker, item) for item in group_items]
-        for fut in as_completed(futures):
-            res = fut.result()
-            summary_rows.append(res)
-            done += 1
-            if done == 1 or done == total or done % 20 == 0:
-                log(f"[PROGRESS] summary {done}/{total} ...")
-
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df = summary_df.sort_values(["month", "remark", "station"]).reset_index(drop=True)
-    summary_df.insert(0, "id", range(1, len(summary_df) + 1))
-
-    log(f"[OK] 요약 DF 생성 완료 (rows={len(summary_df)})")
-    return summary_df
-
-
-# =========================
-# 4) plotly_json 컬럼 생성 (html 컬럼 제거) (MP=2)
-# =========================
-def _make_boxplot_json_worker(args):
-    idx, op_ct_list = args
-    s = pd.Series(op_ct_list).dropna()
-    s = s[s <= OPCT_MAX_SEC]
-    if len(s) == 0:
-        return idx, None
-
-    fig = px.box(pd.DataFrame({"op_ct": s}), y="op_ct", points="outliers", title=None)
-    return idx, fig.to_json(validate=False)
-
-def build_plotly_json_column(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
-    log(f"[4/6] plotly_json 생성 시작... (MP={MAX_WORKERS})")
-
-    out = summary_df.copy()
-    if len(out) == 0:
-        out["plotly_json"] = []
-        return out
-
-    out["plotly_json"] = None
-
-    group_map = {}
-    for (station, remark, month), g in df_raw.groupby(["station", "remark", "month"], sort=False):
-        s = g["op_ct"].dropna()
-        s = s[s <= OPCT_MAX_SEC]
-        group_map[(station, remark, str(month))] = s.tolist()
-
-    tasks = []
-    for i, r in out.iterrows():
-        key = (r["station"], r["remark"], str(r["month"]))
-        tasks.append((i, group_map.get(key, [])))
-
-    total = len(tasks)
-    done = 0
-
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(_make_boxplot_json_worker, t) for t in tasks]
-        for fut in as_completed(futures):
-            idx, js = fut.result()
-            out.at[idx, "plotly_json"] = js
-            done += 1
-            if done == 1 or done == total or done % 20 == 0:
-                log(f"[PROGRESS] plotly_json {done}/{total} ...")
-
-    if "html" in out.columns:
-        out = out.drop(columns=["html"])
-
-    log("[OK] plotly_json 생성 완료")
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["month", "remark", "station"]).reset_index(drop=True)
     return out
 
 
@@ -484,15 +510,12 @@ def parallel_uph(ct_series: pd.Series) -> float:
         return np.nan
     return 3600.0 * (1.0 / ct).sum()
 
-def build_final_df_86(summary_df2: pd.DataFrame) -> pd.DataFrame:
-    log("[5/6] left/right/whole UPH 계산 시작...")
 
-    need = {"station", "remark", "month", "del_out_op_ct_av"}
-    missing = need - set(summary_df2.columns)
-    if missing:
-        raise KeyError(f"필요 컬럼 누락: {sorted(missing)}")
+def build_final_df_86(summary_df: pd.DataFrame) -> pd.DataFrame:
+    if summary_df is None or summary_df.empty:
+        return pd.DataFrame(columns=["station", "remark", "month", "ct_eq", "uph", "final_ct"])
 
-    b = summary_df2[summary_df2["station"].isin(["FCT1", "FCT2", "FCT3", "FCT4"])].copy()
+    b = summary_df[summary_df["station"].isin(["FCT1", "FCT2", "FCT3", "FCT4"])].copy()
     b["del_out_op_ct_av"] = pd.to_numeric(b["del_out_op_ct_av"], errors="coerce")
 
     side_map = {"FCT1": "left", "FCT2": "left", "FCT3": "right", "FCT4": "right"}
@@ -523,7 +546,7 @@ def build_final_df_86(summary_df2: pd.DataFrame) -> pd.DataFrame:
         np.nan
     )
 
-    final_df_86 = pd.concat(
+    final_df = pd.concat(
         [
             left_right_df[["station", "remark", "month", "ct_eq", "uph", "final_ct"]],
             whole_df[["station", "remark", "month", "ct_eq", "uph", "final_ct"]],
@@ -532,104 +555,274 @@ def build_final_df_86(summary_df2: pd.DataFrame) -> pd.DataFrame:
     )
 
     station_order = pd.CategoricalDtype(["left", "right", "whole"], ordered=True)
-    final_df_86["station"] = final_df_86["station"].astype(station_order)
+    final_df["station"] = final_df["station"].astype(station_order)
+    final_df = final_df.sort_values(["month", "remark", "station"]).reset_index(drop=True)
 
-    final_df_86 = final_df_86.sort_values(["month", "remark", "station"]).reset_index(drop=True)
-    final_df_86.insert(0, "id", range(1, len(final_df_86) + 1))
-
-    log(f"[OK] final_df_86 생성 완료 (rows={len(final_df_86)})")
-    return final_df_86
+    return final_df
 
 
 # =========================
-# 6) 1회 실행(main_once)
+# 6) 저장 (LATEST UPSERT + HIST 하루롤링 UPSERT)
 # =========================
-def main_once():
-    log("=== FCT OP-CT Pipeline RUN (ONE SHOT) ===")
-    log(f"[INFO] MP workers = {MAX_WORKERS}")
-    log(f"[INFO] month filter = {current_yyyymm()} | stable_buf={STABLE_DATA_SEC}s | loop=5s | bootstrap={BOOTSTRAP_LOOKBACK_MINUTES}m")
-
-    engine = get_engine(DB_CONFIG)
-
-    df_raw = load_source_df_incremental(engine)
-    if df_raw is None or len(df_raw) == 0:
-        log("[SKIP] 신규 데이터 없음 -> 저장 생략")
+def upsert_latest_opct(df: pd.DataFrame):
+    if df is None or df.empty:
         return
+    df = _cast_df_for_db(df)
 
-    summary_df  = build_summary_df(df_raw)
-    summary_df2 = build_plotly_json_column(df_raw, summary_df)
-    final_df_86 = build_final_df_86(summary_df2)
+    cols = [
+        "station", "remark", "month",
+        "sample_amount", "op_ct_lower_outlier", "q1", "median", "q3",
+        "op_ct_upper_outlier", "del_out_op_ct_av", "plotly_json"
+    ]
+    df_load = df[cols].copy()
 
-    inserted_at = datetime.now()
-    summary_df2["inserted_at"] = inserted_at
-    final_df_86["inserted_at"] = inserted_at
+    stmt = sql.SQL("""
+        INSERT INTO {}.{} (
+            station, remark, month,
+            sample_amount, op_ct_lower_outlier, q1, median, q3,
+            op_ct_upper_outlier, del_out_op_ct_av, plotly_json,
+            created_at, updated_at
+        )
+        VALUES (
+            %(station)s, %(remark)s, %(month)s,
+            %(sample_amount)s, %(op_ct_lower_outlier)s, %(q1)s, %(median)s, %(q3)s,
+            %(op_ct_upper_outlier)s, %(del_out_op_ct_av)s, %(plotly_json)s,
+            now(), now()
+        )
+        ON CONFLICT (station, remark, month)
+        DO UPDATE SET
+            sample_amount       = EXCLUDED.sample_amount,
+            op_ct_lower_outlier = EXCLUDED.op_ct_lower_outlier,
+            q1                  = EXCLUDED.q1,
+            median              = EXCLUDED.median,
+            q3                  = EXCLUDED.q3,
+            op_ct_upper_outlier = EXCLUDED.op_ct_upper_outlier,
+            del_out_op_ct_av    = EXCLUDED.del_out_op_ct_av,
+            plotly_json         = EXCLUDED.plotly_json,
+            updated_at          = now();
+    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST))
 
-    log("[6/6] DB 저장 단계 시작...(APPEND 누적)")
-    save_df_append(summary_df2, TARGET_SCHEMA, TBL_OPCT, engine)
-    save_df_append(final_df_86, TARGET_SCHEMA, TBL_WHOLE, engine)
+    payload = df_load.to_dict(orient="records")
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(stmt.as_string(conn), payload)
+        conn.commit()
 
-    # ✅ 저장 성공 이후에만 cursor 갱신
-    cur_update = df_raw.groupby(["station", "remark"])["end_ts"].max().reset_index()
-    for _, r in cur_update.iterrows():
-        upsert_cursor(engine, r["station"], r["remark"], r["end_ts"])
-        log(f"[CURSOR] {r['station']}/{r['remark']} -> {r['end_ts']}")
 
-    log("=== DONE (ONE SHOT) ===")
+def upsert_latest_whole(df: pd.DataFrame):
+    if df is None or df.empty:
+        return
+    df = _cast_df_for_db(df)
+
+    cols = ["station", "remark", "month", "ct_eq", "uph", "final_ct"]
+    df_load = df[cols].copy()
+
+    stmt = sql.SQL("""
+        INSERT INTO {}.{} (
+            station, remark, month,
+            ct_eq, uph, final_ct,
+            created_at, updated_at
+        )
+        VALUES (
+            %(station)s, %(remark)s, %(month)s,
+            %(ct_eq)s, %(uph)s, %(final_ct)s,
+            now(), now()
+        )
+        ON CONFLICT (station, remark, month)
+        DO UPDATE SET
+            ct_eq      = EXCLUDED.ct_eq,
+            uph        = EXCLUDED.uph,
+            final_ct   = EXCLUDED.final_ct,
+            updated_at = now();
+    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST))
+
+    payload = df_load.to_dict(orient="records")
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(stmt.as_string(conn), payload)
+        conn.commit()
+
+
+def upsert_hist_opct_daily(df: pd.DataFrame, snapshot_day: str):
+    """
+    HIST: 하루 1개 롤링
+    UNIQUE(snapshot_day, station, remark, month)
+    => ON CONFLICT DO UPDATE
+    """
+    if df is None or df.empty:
+        return
+    df = _cast_df_for_db(df)
+
+    cols = [
+        "station", "remark", "month",
+        "sample_amount", "op_ct_lower_outlier", "q1", "median", "q3",
+        "op_ct_upper_outlier", "del_out_op_ct_av", "plotly_json"
+    ]
+    df_load = df[cols].copy()
+    df_load.insert(0, "snapshot_day", snapshot_day)
+
+    stmt = sql.SQL("""
+        INSERT INTO {}.{} (
+            snapshot_day, snapshot_ts,
+            station, remark, month,
+            sample_amount, op_ct_lower_outlier, q1, median, q3,
+            op_ct_upper_outlier, del_out_op_ct_av, plotly_json
+        )
+        VALUES (
+            %(snapshot_day)s, now(),
+            %(station)s, %(remark)s, %(month)s,
+            %(sample_amount)s, %(op_ct_lower_outlier)s, %(q1)s, %(median)s, %(q3)s,
+            %(op_ct_upper_outlier)s, %(del_out_op_ct_av)s, %(plotly_json)s
+        )
+        ON CONFLICT (snapshot_day, station, remark, month)
+        DO UPDATE SET
+            snapshot_ts         = now(),
+            sample_amount       = EXCLUDED.sample_amount,
+            op_ct_lower_outlier = EXCLUDED.op_ct_lower_outlier,
+            q1                  = EXCLUDED.q1,
+            median              = EXCLUDED.median,
+            q3                  = EXCLUDED.q3,
+            op_ct_upper_outlier = EXCLUDED.op_ct_upper_outlier,
+            del_out_op_ct_av    = EXCLUDED.del_out_op_ct_av,
+            plotly_json         = EXCLUDED.plotly_json;
+    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_HIST))
+
+    payload = df_load.to_dict(orient="records")
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(stmt.as_string(conn), payload)
+        conn.commit()
+
+
+def upsert_hist_whole_daily(df: pd.DataFrame, snapshot_day: str):
+    """
+    HIST: 하루 1개 롤링
+    UNIQUE(snapshot_day, station, remark, month)
+    => ON CONFLICT DO UPDATE
+    """
+    if df is None or df.empty:
+        return
+    df = _cast_df_for_db(df)
+
+    cols = ["station", "remark", "month", "ct_eq", "uph", "final_ct"]
+    df_load = df[cols].copy()
+    df_load.insert(0, "snapshot_day", snapshot_day)
+
+    stmt = sql.SQL("""
+        INSERT INTO {}.{} (
+            snapshot_day, snapshot_ts,
+            station, remark, month,
+            ct_eq, uph, final_ct
+        )
+        VALUES (
+            %(snapshot_day)s, now(),
+            %(station)s, %(remark)s, %(month)s,
+            %(ct_eq)s, %(uph)s, %(final_ct)s
+        )
+        ON CONFLICT (snapshot_day, station, remark, month)
+        DO UPDATE SET
+            snapshot_ts = now(),
+            ct_eq       = EXCLUDED.ct_eq,
+            uph         = EXCLUDED.uph,
+            final_ct    = EXCLUDED.final_ct;
+    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_HIST))
+
+    payload = df_load.to_dict(orient="records")
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(stmt.as_string(conn), payload)
+        conn.commit()
 
 
 # =========================
-# 7) Realtime loop (윈도우 시간에만)
+# 7) 작업 1회 실행(오늘 전체)
 # =========================
-def realtime_loop():
-    log("=== FCT OP-CT Realtime Loop START ===")
-    log(f"[INFO] windows={[(s.strftime('%H:%M:%S'), e.strftime('%H:%M:%S')) for s,e in WINDOWS]}")
-    log(f"[INFO] LOOP_INTERVAL_SEC={LOOP_INTERVAL_SEC} | workers={MAX_WORKERS} | ENABLE_HTML={ENABLE_HTML}")
+def run_once_for_stations(stations: List[str], run_month: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    eng = get_engine(DB_CONFIG)
 
-    loop_count = 0
-    while True:
-        loop_count += 1
-        loop_start = time_mod.perf_counter()
-        now_dt = datetime.now()
+    df_raw = load_month_df(eng, stations, run_month)
+    if df_raw is None or df_raw.empty:
+        return (
+            pd.DataFrame(columns=[
+                "station", "remark", "month",
+                "sample_amount", "op_ct_lower_outlier", "q1", "median", "q3",
+                "op_ct_upper_outlier", "del_out_op_ct_av", "plotly_json"
+            ]),
+            pd.DataFrame(columns=["station", "remark", "month", "ct_eq", "uph", "final_ct"])
+        )
 
-        if not now_in_windows(now_dt):
-            if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
-                log(f"[IDLE] {now_dt:%Y-%m-%d %H:%M:%S} (out of window)")
-            elapsed = time_mod.perf_counter() - loop_start
-            sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-            if sleep_sec > 0:
-                time_mod.sleep(sleep_sec)
-            continue
-
-        try:
-            log(f"[RUN] {now_dt:%Y-%m-%d %H:%M:%S} (in window)")
-            main_once()
-        except Exception as e:
-            log(f"[ERROR] {type(e).__name__}: {e}")
-
-        elapsed = time_mod.perf_counter() - loop_start
-        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-        if sleep_sec > 0:
-            time_mod.sleep(sleep_sec)
+    summary_df = build_summary_df(df_raw)
+    whole_df = build_final_df_86(summary_df)
+    return summary_df, whole_df
 
 
-# =========================
-# 8) 엔트리포인트
-# =========================
-if __name__ == "__main__":
-    freeze_support()
-
-    exit_code = 0
+def worker(stations: List[str], run_month: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     try:
-        realtime_loop()
-    except KeyboardInterrupt:
-        log("\n[ABORT] 사용자 중단(CTRL+C)")
-        exit_code = 130
+        return run_once_for_stations(stations, run_month)
     except Exception as e:
-        log(f"\n[ERROR] Unhandled exception: {repr(e)}")
-        exit_code = 1
-    finally:
-        if getattr(sys, "frozen", False):
-            print("\n[INFO] 프로그램이 종료되었습니다.")
-            input("Press Enter to exit...")
+        return (e, None)
 
-    sys.exit(exit_code)
+
+def run_pipeline_once(label: str, run_month: str):
+    """
+    MP=2로 p1/p2 병렬 실행 후 결과 합쳐서 저장(UPSERT)
+    """
+    snapshot_day = today_yyyymmdd()
+
+    log(f"[RUN] {label} | snapshot_day={snapshot_day} | START")
+
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=2) as pool:
+        tasks = [(PROC_1_STATIONS, run_month), (PROC_2_STATIONS, run_month)]
+        results = pool.starmap(worker, tasks)
+
+    # 에러 검사
+    for r in results:
+        if isinstance(r[0], Exception):
+            raise r[0]
+
+    # 결과 합치기
+    summary_all = pd.concat([r[0] for r in results], ignore_index=True)
+    whole_all = pd.concat([r[1] for r in results], ignore_index=True)
+
+    # 저장 (latest upsert + hist 하루롤링 upsert)
+    upsert_latest_opct(summary_all)
+    upsert_latest_whole(whole_all)
+    upsert_hist_opct_daily(summary_all, snapshot_day=snapshot_day)
+    upsert_hist_whole_daily(whole_all, snapshot_day=snapshot_day)
+
+    log(f"[RUN] {label} | DONE (latest+hist upsert)")
+
+
+# =========================
+# 8) main: 08:22 / 20:22 에만 실행 후 종료
+# =========================
+def main():
+    start_dt = datetime.now()
+    start_perf = time.perf_counter()
+    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+    log("=== FCT OP-CT Pipeline (MONTHLY: 1st day 00:10) ===")
+
+    try:
+        now = datetime.now()
+        if not is_monthly_run_time(now):
+            log("[SKIP] 이 스크립트는 Task Scheduler가 매월 1일 00:10에 호출할 때만 실행합니다.")
+            return
+
+        run_month = prev_month_yyyymm(now)
+        ensure_tables_and_indexes()
+
+        # 월 1회 즉시 실행 후 종료 (대기/루프 없음)
+        run_pipeline_once(label=f"monthly_run_{run_month}", run_month=run_month)
+
+        end_dt = datetime.now()
+        elapsed = time.perf_counter() - start_perf
+        log(f"[END] {end_dt:%Y-%m-%d %H:%M:%S} | elapsed={elapsed:.1f}s")
+
+    except Exception as e:
+        log(f"[FATAL] {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()

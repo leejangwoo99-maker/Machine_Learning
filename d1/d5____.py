@@ -29,7 +29,7 @@ from multiprocessing import Pool, cpu_count, freeze_support
 # [1] DB 설정
 # ============================================
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",

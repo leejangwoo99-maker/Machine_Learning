@@ -1,60 +1,60 @@
 # -*- coding: utf-8 -*-
 """
-Vision RunTime CT (intensity8) 분석 파이프라인 - Realtime Window + MP=2 고정
+Vision RunTime CT (intensity8) 분석 파이프라인 - SCHEDULE(08:22/20:22) + MP=2 고정 + LATEST/HIST 저장
 
-- Source: a3_vision_table.vision_table
-- Filter(기본):
-  * barcode_information LIKE 'B%'
-  * station IN ('Vision1','Vision2')
-  * remark IN ('PD','Non-PD')
-  * step_description = 'intensity8'
-  * result <> 'FAIL'
-  * ORDER BY end_day, end_time
+[Source]
+- a3_vision_table.vision_table
 
-- Summary (station, remark, month):
-  * sample_amount
-  * IQR 기반 outlier 범위 문자열
-  * q1/median/q3
-  * outlier 제거 평균(del_out_run_time_av)
-  * plotly_json (boxplot)
+[Filter(기본)]
+- barcode_information LIKE 'B%'
+- station IN ('Vision1','Vision2')
+- remark IN ('PD','Non-PD')
+- step_description = 'intensity8'
+- result <> 'FAIL'
+- end_day: "현재 날짜(오늘)" 데이터 전체 대상
+- end_day: "현재 달(YYYYMM)" 제한 유지
 
-- Save:
-  * e2_vision_ct.vision_run_time_ct
-  * PRIMARY KEY (station, remark, month)
-  * ON CONFLICT DO UPDATE (UPSERT)
+[Summary (station, remark, month)]
+- sample_amount
+- IQR 기반 outlier 범위 문자열
+- q1/median/q3
+- outlier 제거 평균(del_out_run_time_av)
+- plotly_json (boxplot, validate=False)
 
-요구사항(추가 반영):
-- DataFrame 콘솔 출력 없음
-- 진행상황만 표시
-- [멀티프로세스] 2개 고정
-- [무한 루프] 1초마다 재실행
-- [실행 윈도우]
-  * 08:27:00 시작 ~ 08:29:59 종료
-  * 20:27:00 시작 ~ 20:29:59 종료
-- [유효 날짜 범위] end_day가 "현재 날짜 기준의 달(YYYYMM)"만
-- [실시간] 현재 시간 기준 120초 이내 데이터만 반영
-  * DB에서 end_day(YYYYMM)로 1차 제한 후,
-  * python에서 end_dt(end_day+end_time) 생성하여 now-120s ~ now-STABLE_DATA_SEC 범위만 유지
-- [미완성 방지 역할 분리]
-  * 본 스크립트는 파일을 직접 파싱하지 않고 DB만 조회합니다.
-  * 따라서 "파일 크기 0.2초 간격 2회 동일 / mtime 안정 / lock 파일 체크"는 파서(적재)쪽에서 수행
-  * 본 스크립트에서는 DB 안전 조회를 위해 STABLE_DATA_SEC(기본 2초) 버퍼 적용
-- EXE(onefile)에서 plotly validators 오류 방지 (validate=False)
-- EXE에서 콘솔이 강제로 닫히지 않도록 유지 (frozen일 때만)
+[Save 정책] (e1/e2 통일)
+1) LATEST: e2_vision_ct.vision_run_time_ct
+   - UNIQUE (station, remark, month)
+   - INSERT = ON CONFLICT DO UPDATE (최신값 갱신)
+   - created_at/updated_at 포함
+
+2) HIST(하루 1개 롤링): e2_vision_ct.vision_run_time_ct_hist
+   - UNIQUE (snapshot_day, station, remark, month)
+   - INSERT = ON CONFLICT DO UPDATE (그날 마지막 값만 유지)
+   - snapshot_ts 포함
+
+[id NULL 해결]
+- latest/hist 모두 id 자동채번 보정(컬럼/시퀀스/default/NULL 채움/setval)
+
+[Schedule]
+- 08:22:00, 20:22:00 에만 실행
+- 트리거 시점에 "오늘 데이터 전체" 대상으로 계산/UPSERT 후 종료
+- 오늘 남은 스케줄이 없으면 즉시 종료
 """
 
+import os
 import sys
 import urllib.parse
-from datetime import datetime, time as dtime
+from datetime import datetime, date, time as dtime
 import time as time_mod
-from multiprocessing import freeze_support
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 
 import numpy as np
 import pandas as pd
-
 from sqlalchemy import create_engine, text
+
 import plotly.graph_objects as go
+import psycopg2
+from psycopg2.extras import execute_values
 
 
 # =========================
@@ -72,49 +72,51 @@ SRC_SCHEMA = "a3_vision_table"
 SRC_TABLE  = "vision_table"
 
 TARGET_SCHEMA = "e2_vision_ct"
-TARGET_TABLE  = "vision_run_time_ct"
+
+# LATEST/HIST 테이블
+TBL_LATEST = "vision_run_time_ct"
+TBL_HIST   = "vision_run_time_ct_hist"
 
 STEP_DESC = "intensity8"
 
 # =========================
-# Realtime/Loop 사양(요청 반영)
+# MP=2 고정 (Vision1 / Vision2 분담)
 # =========================
-# ✅ MP 2개 고정
-MAX_WORKERS = 2
+PROC_1_STATIONS = ["Vision1"]
+PROC_2_STATIONS = ["Vision2"]
 
-# ✅ 1초 루프
-LOOP_INTERVAL_SEC = 1.0
-
-# ✅ 최근 120초
-RECENT_SECONDS = 120
-
-# ✅ DB 안정화 버퍼(방금 적재된 row 회피)
-STABLE_DATA_SEC = 2
-
-# ✅ 실행 윈도우
-WINDOWS = [
-    (dtime(8, 27, 0),  dtime(8, 29, 59)),
-    (dtime(20, 27, 0), dtime(20, 29, 59)),
-]
-
-HEARTBEAT_EVERY_LOOPS = 30
-
-
+# =========================
+# 스케줄 (하루 2회만)
+# =========================
+RUN_TIME = dtime(0, 10, 0)  # 매월 1일 00:10:00 (Task Scheduler)
 # =========================
 # 1) 유틸
 # =========================
 def log(msg: str):
     print(msg, flush=True)
 
+def today_yyyymmdd() -> str:
+    return date.today().strftime("%Y%m%d")
+
 def current_yyyymm() -> str:
     return datetime.now().strftime("%Y%m")
 
-def now_in_windows(now_dt: datetime) -> bool:
-    t = now_dt.time()
-    for s, e in WINDOWS:
-        if s <= t <= e:
-            return True
-    return False
+
+def is_monthly_run_time(now: datetime) -> bool:
+    """매월 1일 00:10에만 실행(스케줄러 트리거 전용)."""
+    return (now.day == 1) and (now.hour == 0) and (now.minute == 10)
+
+
+def prev_month_yyyymm(now: datetime) -> str:
+    """실행 시점(now)이 매월 1일일 때, '직전월(YYYYMM)'을 반환.
+    예) 2026-02-01 실행 -> '202601'
+        2026-01-01 실행 -> '202512'
+    """
+    y = now.year
+    m = now.month
+    if m == 1:
+        return f"{y-1}12"
+    return f"{y}{(m-1):02d}"
 
 def get_engine(cfg=DB_CONFIG):
     user = cfg["user"]
@@ -125,342 +127,477 @@ def get_engine(cfg=DB_CONFIG):
     conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
     return create_engine(conn_str, pool_pre_ping=True)
 
-def _outlier_range_str(values: pd.Series, lower_fence: float, upper_fence: float):
-    v = values.dropna().astype(float)
-    if v.empty:
-        return None, None
-
-    lower_out = v[v < lower_fence]
-    upper_out = v[v > upper_fence]
-
-    lower_str = f"{lower_out.min():.2f}~{lower_fence:.2f}" if len(lower_out) > 0 else None
-    upper_str = f"{upper_fence:.2f}~{upper_out.max():.2f}" if len(upper_out) > 0 else None
-    return lower_str, upper_str
+def get_conn_pg(cfg=DB_CONFIG):
+    return psycopg2.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
+    )
 
 def _make_plotly_json(values: np.ndarray, name: str) -> str:
     """
-    ★ 중요: EXE(onefile)에서 plotly validators(_validators.json) 찾다가 터지는 문제 방지
-    -> validate=False 강제
+    EXE(onefile)에서 plotly validators 오류 방지 -> validate=False
     """
     fig = go.Figure()
     fig.add_trace(go.Box(y=values.astype(float), name=name, boxpoints=False))
     return fig.to_json(validate=False)
 
+def _next_run_datetimes(now_dt: datetime):
+    d = now_dt.date()
+    cands = [
+        datetime(d.year, d.month, d.day, RUN_TIME_1.hour, RUN_TIME_1.minute, RUN_TIME_1.second),
+        datetime(d.year, d.month, d.day, RUN_TIME_2.hour, RUN_TIME_2.minute, RUN_TIME_2.second),
+    ]
+    return [t for t in cands if t >= now_dt]
+
+def _sleep_until(target_dt: datetime):
+    while True:
+        now = datetime.now()
+        if now >= target_dt:
+            return
+        sec = (target_dt - now).total_seconds()
+        time_mod.sleep(min(max(sec, 1.0), 30.0))
+
 
 # =========================
-# 2) 로딩 (현재달만 1차 제한)
+# 2) 테이블/인덱스/ID 보정
 # =========================
-def load_source(engine) -> pd.DataFrame:
-    yyyymm = current_yyyymm()
+def ensure_tables_and_indexes():
+    """
+    - 스키마 생성
+    - LATEST/HIST 테이블 생성(없으면)
+    - UNIQUE 인덱스 보장
+    - id 자동채번/NULL 보정
+    """
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{TARGET_SCHEMA}";')
 
-    query = text(f"""
+            # LATEST
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_LATEST} (
+                    id BIGINT,
+                    station                TEXT NOT NULL,
+                    remark                 TEXT NOT NULL,
+                    month                  TEXT NOT NULL,
+                    sample_amount          INTEGER,
+                    run_time_lower_outlier TEXT,
+                    q1                     DOUBLE PRECISION,
+                    median                 DOUBLE PRECISION,
+                    q3                     DOUBLE PRECISION,
+                    run_time_upper_outlier TEXT,
+                    del_out_run_time_av    DOUBLE PRECISION,
+                    plotly_json            JSONB,
+                    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute(f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_LATEST}_key
+                ON "{TARGET_SCHEMA}".{TBL_LATEST} (station, remark, month);
+            """)
+
+            # HIST (하루 1개 롤링)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_HIST} (
+                    id BIGINT,
+                    snapshot_day           TEXT NOT NULL,
+                    snapshot_ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    station                TEXT NOT NULL,
+                    remark                 TEXT NOT NULL,
+                    month                  TEXT NOT NULL,
+                    sample_amount          INTEGER,
+                    run_time_lower_outlier TEXT,
+                    q1                     DOUBLE PRECISION,
+                    median                 DOUBLE PRECISION,
+                    q3                     DOUBLE PRECISION,
+                    run_time_upper_outlier TEXT,
+                    del_out_run_time_av    DOUBLE PRECISION,
+                    plotly_json            JSONB
+                );
+            """)
+            cur.execute(f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_HIST}_day_key
+                ON "{TARGET_SCHEMA}".{TBL_HIST} (snapshot_day, station, remark, month);
+            """)
+
+        conn.commit()
+
+    # id 자동채번/NULL 보정
+    fix_id_sequence(TARGET_SCHEMA, TBL_LATEST, "vision_run_time_ct_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_HIST,   "vision_run_time_ct_hist_id_seq")
+
+    log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"')
+
+
+def fix_id_sequence(schema: str, table: str, seq_name: str):
+    """
+    - id 컬럼 없으면 추가
+    - 시퀀스 없으면 생성
+    - id default nextval 강제
+    - id NULL인 기존 행은 nextval로 채움
+    - 시퀀스 setval = max(id)+1 로 동기화
+    """
+    do_sql = f"""
+    DO $$
+    DECLARE
+      v_schema TEXT := {schema!r};
+      v_table  TEXT := {table!r};
+      v_seq    TEXT := {seq_name!r};
+      v_full_table TEXT := quote_ident(v_schema) || '.' || quote_ident(v_table);
+      v_full_seq   TEXT := quote_ident(v_schema) || '.' || quote_ident(v_seq);
+      v_max BIGINT;
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = v_schema
+          AND table_name = v_table
+          AND column_name = 'id'
+      ) THEN
+        EXECUTE 'ALTER TABLE ' || v_full_table || ' ADD COLUMN id BIGINT';
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'S'
+          AND n.nspname = v_schema
+          AND c.relname = v_seq
+      ) THEN
+        EXECUTE 'CREATE SEQUENCE ' || v_full_seq;
+      END IF;
+
+      EXECUTE 'ALTER TABLE ' || v_full_table ||
+              ' ALTER COLUMN id SET DEFAULT nextval(''' || v_full_seq || ''')';
+
+      EXECUTE 'ALTER SEQUENCE ' || v_full_seq ||
+              ' OWNED BY ' || v_full_table || '.id';
+
+      EXECUTE 'UPDATE ' || v_full_table || ' SET id = nextval(''' || v_full_seq || ''') WHERE id IS NULL';
+
+      EXECUTE 'SELECT COALESCE(MAX(id), 0) FROM ' || v_full_table INTO v_max;
+      EXECUTE 'SELECT setval(''' || v_full_seq || ''', ' || (v_max + 1) || ', false)';
+    END $$;
+    """
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(do_sql)
+        conn.commit()
+
+
+# =========================
+# 3) 로딩 (현재달 + 오늘 데이터 전체, station subset)
+# =========================
+def load_source_month(engine, stations: list, run_month: str) -> pd.DataFrame:
+    """
+    로딩 + 전처리 (해당 월 전체, station subset)
+
+    - run_month: 'YYYYMM'
+    - 기존의 현재달/오늘 제한 중 '오늘' 제한을 제거하여 월 전체로 확장
+    """
+    q = text(f"""
     SELECT
+        barcode_information,
         station,
         remark,
-        barcode_information,
         step_description,
         result,
         end_day,
         end_time,
         run_time
     FROM {SRC_SCHEMA}.{SRC_TABLE}
-    WHERE 1=1
-      AND barcode_information LIKE 'B%%'
-      AND station IN ('Vision1', 'Vision2')
-      AND remark IN ('PD', 'Non-PD')
+    WHERE barcode_information LIKE 'B%%'
+      AND station = ANY(:stations)
+      AND remark IN ('PD','Non-PD')
       AND step_description = :step_desc
-      AND result <> 'FAIL'
-      AND substring(regexp_replace(COALESCE(end_day,''), '\\\\D', '', 'g') from 1 for 6) = :yyyymm
+      AND COALESCE(result,'') <> 'FAIL'
+      AND substring(regexp_replace(COALESCE(end_day::text,''), '\\D', '', 'g') from 1 for 6) = :run_month
     ORDER BY end_day ASC, end_time ASC
     """)
 
-    log("[1/6] 원본 데이터 로딩 시작(현재달)...")
-    df = pd.read_sql(query, engine, params={"step_desc": STEP_DESC, "yyyymm": yyyymm})
-    log(f"[OK] 로딩 완료 (rows={len(df)})")
+    df = pd.read_sql(q, engine, params={"stations": stations, "run_month": run_month, "step_desc": STEP_DESC})
+
+    if df.empty:
+        return df
+
+    df["end_day"] = df["end_day"].astype(str).str.replace(r"\D", "", regex=True)
+    df["end_time"] = df["end_time"].astype(str).str.strip()
+    df["run_time"] = pd.to_numeric(df["run_time"], errors="coerce")
+
+    before = len(df)
+    df = df.dropna(subset=["run_time"]).copy()
+    dropped = before - len(df)
+    if dropped:
+        log(f"[INFO] run_time NaN 제거: {dropped} rows")
+
+    # end_dt 생성(정렬 안정용)
+    dt_str = df["end_day"] + " " + df["end_time"].astype(str).str.strip()
+    df["end_dt"] = pd.to_datetime(dt_str, errors="coerce", format="mixed")
+    before_dt = len(df)
+    df = df.dropna(subset=["end_dt"]).copy()
+    dropped_dt = before_dt - len(df)
+    if dropped_dt:
+        log(f"[INFO] end_dt 파싱 실패 drop: {dropped_dt} rows")
+
+    df = df.sort_values(["end_dt", "station", "remark"]).reset_index(drop=True)
+    df["month"] = df["end_dt"].dt.strftime("%Y%m")
+
     return df
 
 
 # =========================
-# 3) 전처리 + 최근 120초 필터(end_dt 기준)
+# 4) 요약 DF 생성
 # =========================
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    log("[2/6] 전처리(month/end_dt 생성) + recent filter...")
-
-    if df is None or df.empty:
-        log("[OK] 입력 df 없음")
-        return pd.DataFrame()
-
-    out = df.copy()
-    out["end_day"] = out["end_day"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
-    out["month"] = out["end_day"].str.slice(0, 6)
-
-    # end_dt 생성(최근 120초를 정확히 자르기 위함)
-    dt_str = out["end_day"] + " " + out["end_time"].astype(str).str.strip()
-    out["end_dt"] = pd.to_datetime(dt_str, errors="coerce", format="mixed")
-
-    before_dt = len(out)
-    out = out.dropna(subset=["end_dt"]).reset_index(drop=True)
-    dropped_dt = before_dt - len(out)
-    if dropped_dt:
-        log(f"[INFO] end_dt 파싱 실패 drop: {dropped_dt} rows")
-
-    out = out.sort_values(["end_dt", "station", "remark"]).reset_index(drop=True)
-
-    out["run_time"] = pd.to_numeric(out["run_time"], errors="coerce")
-    before_rt = len(out)
-    out = out.dropna(subset=["run_time"]).reset_index(drop=True)
-    dropped_rt = before_rt - len(out)
-    if dropped_rt:
-        log(f"[INFO] run_time NaN 제거: {dropped_rt} rows drop")
-
-    # ✅ 최근 120초 + 안정화 버퍼 적용(현재시간 기준)
-    now_dt = datetime.now()
-    lower_dt = now_dt - pd.Timedelta(seconds=RECENT_SECONDS)
-    upper_dt = now_dt - pd.Timedelta(seconds=STABLE_DATA_SEC)
-
-    before_recent = len(out)
-    out = out[(out["end_dt"] >= lower_dt) & (out["end_dt"] <= upper_dt)].copy()
-    log(f"[INFO] recent filter: {before_recent} -> {len(out)} rows (now-120s ~ now-{STABLE_DATA_SEC}s)")
-
-    # 최종 month는 다시 보장(현재달만 남아야 함)
-    out["month"] = out["end_dt"].dt.strftime("%Y%m")
-
-    log("[OK] 전처리 완료")
-    return out
-
-
-# =========================
-# 4) 요약 DF 생성 (MP=2)
-# =========================
-def _summary_worker(args):
-    """
-    args = (station, remark, month, run_time_list)
-    """
-    station, remark, month, rt_list = args
-    rt = np.asarray(rt_list, dtype=float)
-    if rt.size == 0:
+def _summary_from_group(station: str, remark: str, month: str, series: pd.Series) -> dict:
+    vals = series.dropna().astype(float).to_numpy()
+    if vals.size == 0:
         return None
 
-    q1 = float(np.percentile(rt, 25))
-    med = float(np.percentile(rt, 50))
-    q3 = float(np.percentile(rt, 75))
+    q1 = float(np.percentile(vals, 25))
+    med = float(np.percentile(vals, 50))
+    q3 = float(np.percentile(vals, 75))
     iqr = q3 - q1
 
     lower_fence = q1 - 1.5 * iqr
     upper_fence = q3 + 1.5 * iqr
 
-    v = pd.Series(rt)
-    lower_str, upper_str = _outlier_range_str(v, lower_fence, upper_fence)
+    lower_out = vals[vals < lower_fence]
+    upper_out = vals[vals > upper_fence]
 
-    rt_in = rt[(rt >= lower_fence) & (rt <= upper_fence)]
-    del_out_mean = float(rt_in.mean()) if rt_in.size > 0 else np.nan
+    run_time_lower_outlier = f"{lower_out.min():.2f}~{lower_fence:.2f}" if lower_out.size > 0 else None
+    run_time_upper_outlier = f"{upper_fence:.2f}~{upper_out.max():.2f}" if upper_out.size > 0 else None
 
-    plotly_json = _make_plotly_json(rt, name=f"{station}_{remark}_{month}")
+    inliers = vals[(vals >= lower_fence) & (vals <= upper_fence)]
+    del_out_mean = float(np.mean(inliers)) if inliers.size > 0 else np.nan
+
+    plotly_json = _make_plotly_json(vals, name=f"{station}_{remark}_{month}")
 
     return {
         "station": station,
         "remark": remark,
         "month": str(month),
-        "sample_amount": int(rt.size),
-        "run_time_lower_outlier": lower_str,
+        "sample_amount": int(vals.size),
+        "run_time_lower_outlier": run_time_lower_outlier,
         "q1": round(q1, 2),
         "median": round(med, 2),
         "q3": round(q3, 2),
-        "run_time_upper_outlier": upper_str,
+        "run_time_upper_outlier": run_time_upper_outlier,
         "del_out_run_time_av": round(del_out_mean, 2) if not np.isnan(del_out_mean) else None,
         "plotly_json": plotly_json,
     }
 
 def build_summary(df: pd.DataFrame) -> pd.DataFrame:
-    log(f"[3/6] 요약(summary_df) 생성... (MP={MAX_WORKERS})")
-
     if df is None or df.empty:
-        log("[WARN] 입력 df가 비어 summary_df 생성 불가")
-        return pd.DataFrame()
-
-    tasks = []
-    for (station, remark, month), g in df.groupby(["station", "remark", "month"], dropna=False, sort=True):
-        rt_list = g["run_time"].dropna().astype(float).tolist()
-        tasks.append((station, remark, str(month), rt_list))
-
-    total = len(tasks)
-    log(f"[INFO] 그룹 수 = {total}")
-    if total == 0:
-        log("[WARN] 그룹이 없어 summary_df 생성 불가")
         return pd.DataFrame()
 
     rows = []
-    done = 0
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(_summary_worker, t) for t in tasks]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if r is not None:
-                rows.append(r)
-            done += 1
-            if done == 1 or done == total or done % 30 == 0:
-                log(f"[PROGRESS] group {done}/{total} ...")
+    groups = list(df.groupby(["station", "remark", "month"], sort=True))
+    total = len(groups)
+    log(f"[INFO] 그룹 수 = {total}")
 
-    summary_df = pd.DataFrame(rows)
-    if summary_df.empty:
-        log("[WARN] summary_df가 비었습니다(저장할 데이터 없음).")
-        return summary_df
+    for i, ((st, rk, mo), g) in enumerate(groups, start=1):
+        if i == 1 or i == total or i % 20 == 0:
+            log(f"[PROGRESS] group {i}/{total} ... ({st},{rk},{mo})")
+        r = _summary_from_group(st, rk, mo, g["run_time"])
+        if r is not None:
+            rows.append(r)
 
-    summary_df = summary_df.sort_values(["month", "station", "remark"], ascending=True).reset_index(drop=True)
-    summary_df.insert(0, "id", np.arange(1, len(summary_df) + 1))
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
 
-    log(f"[OK] summary_df 생성 완료 (rows={len(summary_df)})")
+    out = out.sort_values(["month", "station", "remark"]).reset_index(drop=True)
+    return out
+
+
+# =========================
+# 5) 저장: LATEST UPSERT + HIST 하루롤링 UPSERT
+# =========================
+def upsert_latest(summary_df: pd.DataFrame):
+    if summary_df is None or summary_df.empty:
+        return
+
+    df = summary_df.where(pd.notnull(summary_df), None).copy()
+
+    cols = [
+        "station", "remark", "month",
+        "sample_amount",
+        "run_time_lower_outlier",
+        "q1", "median", "q3",
+        "run_time_upper_outlier",
+        "del_out_run_time_av",
+        "plotly_json",
+    ]
+    df = df[cols]
+    rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
+
+    insert_sql = f"""
+    INSERT INTO "{TARGET_SCHEMA}".{TBL_LATEST} (
+        station, remark, month,
+        sample_amount,
+        run_time_lower_outlier,
+        q1, median, q3,
+        run_time_upper_outlier,
+        del_out_run_time_av,
+        plotly_json,
+        created_at, updated_at
+    )
+    VALUES %s
+    ON CONFLICT (station, remark, month)
+    DO UPDATE SET
+        sample_amount          = EXCLUDED.sample_amount,
+        run_time_lower_outlier = EXCLUDED.run_time_lower_outlier,
+        q1                     = EXCLUDED.q1,
+        median                 = EXCLUDED.median,
+        q3                     = EXCLUDED.q3,
+        run_time_upper_outlier = EXCLUDED.run_time_upper_outlier,
+        del_out_run_time_av    = EXCLUDED.del_out_run_time_av,
+        plotly_json            = EXCLUDED.plotly_json,
+        updated_at             = now();
+    """
+    template = "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb, now(), now())"
+
+    conn = get_conn_pg(DB_CONFIG)
+    try:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            if rows:
+                execute_values(cur, insert_sql, rows, template=template, page_size=2000)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_hist_daily(summary_df: pd.DataFrame, snapshot_day: str):
+    """
+    UNIQUE(snapshot_day, station, remark, month) 유지
+    ON CONFLICT DO UPDATE 로 하루 1개 롤링
+    """
+    if summary_df is None or summary_df.empty:
+        return
+
+    df = summary_df.where(pd.notnull(summary_df), None).copy()
+
+    cols = [
+        "station", "remark", "month",
+        "sample_amount",
+        "run_time_lower_outlier",
+        "q1", "median", "q3",
+        "run_time_upper_outlier",
+        "del_out_run_time_av",
+        "plotly_json",
+    ]
+    df = df[cols]
+    df.insert(0, "snapshot_day", snapshot_day)
+    rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
+
+    insert_sql = f"""
+    INSERT INTO "{TARGET_SCHEMA}".{TBL_HIST} (
+        snapshot_day, snapshot_ts,
+        station, remark, month,
+        sample_amount,
+        run_time_lower_outlier,
+        q1, median, q3,
+        run_time_upper_outlier,
+        del_out_run_time_av,
+        plotly_json
+    )
+    VALUES %s
+    ON CONFLICT (snapshot_day, station, remark, month)
+    DO UPDATE SET
+        snapshot_ts            = now(),
+        sample_amount          = EXCLUDED.sample_amount,
+        run_time_lower_outlier = EXCLUDED.run_time_lower_outlier,
+        q1                     = EXCLUDED.q1,
+        median                 = EXCLUDED.median,
+        q3                     = EXCLUDED.q3,
+        run_time_upper_outlier = EXCLUDED.run_time_upper_outlier,
+        del_out_run_time_av    = EXCLUDED.del_out_run_time_av,
+        plotly_json            = EXCLUDED.plotly_json;
+    """
+    template = "(%s, now(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)"
+
+    conn = get_conn_pg(DB_CONFIG)
+    try:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            if rows:
+                execute_values(cur, insert_sql, rows, template=template, page_size=2000)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# =========================
+# 6) MP Worker / pipeline
+# =========================
+def worker(stations: list, run_month: str):
+    eng = get_engine(DB_CONFIG)
+    df = load_source_month(eng, stations=stations, run_month=run_month)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    summary_df = build_summary(df)
     return summary_df
 
 
-# =========================
-# 5) DB UPSERT 저장
-# =========================
-def ensure_table(engine):
-    create_schema_sql = text(f'CREATE SCHEMA IF NOT EXISTS "{TARGET_SCHEMA}";')
-    create_table_sql = text(f"""
-    CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}"."{TARGET_TABLE}" (
-        id                     INTEGER,
-        station                TEXT NOT NULL,
-        remark                 TEXT NOT NULL,
-        month                  TEXT NOT NULL,
-        sample_amount          INTEGER,
-        run_time_lower_outlier TEXT,
-        q1                     DOUBLE PRECISION,
-        median                 DOUBLE PRECISION,
-        q3                     DOUBLE PRECISION,
-        run_time_upper_outlier TEXT,
-        del_out_run_time_av    DOUBLE PRECISION,
-        plotly_json            JSONB,
-        updated_at             TIMESTAMPTZ DEFAULT now(),
-        PRIMARY KEY (station, remark, month)
-    );
-    """)
-    with engine.begin() as conn:
-        conn.execute(create_schema_sql)
-        conn.execute(create_table_sql)
+def run_pipeline_once(label: str, run_month: str):
+    snapshot_day = today_yyyymmdd()
+    log(f"[RUN] {label} | snapshot_day={snapshot_day} | START")
 
-    log(f"[OK] ensured {TARGET_SCHEMA}.{TARGET_TABLE}")
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=2) as pool:
+        tasks = [(PROC_1_STATIONS, run_month), (PROC_2_STATIONS, run_month)]
+        results = pool.starmap(worker, tasks)
 
-def upsert_summary(engine, summary_df: pd.DataFrame):
-    if summary_df is None or summary_df.empty:
-        log("[SKIP] upsert 생략 (summary_df empty)")
+    summary_all = pd.concat(results, ignore_index=True)
+
+    if summary_all is None or summary_all.empty:
+        log("[SKIP] summary 없음 -> 저장 생략")
         return
 
-    upsert_sql = text(f"""
-    INSERT INTO "{TARGET_SCHEMA}"."{TARGET_TABLE}" (
-        id, station, remark, month,
-        sample_amount, run_time_lower_outlier, q1, median, q3,
-        run_time_upper_outlier, del_out_run_time_av, plotly_json, updated_at
-    )
-    VALUES (
-        :id, :station, :remark, :month,
-        :sample_amount, :run_time_lower_outlier, :q1, :median, :q3,
-        :run_time_upper_outlier, :del_out_run_time_av, (:plotly_json)::jsonb, now()
-    )
-    ON CONFLICT (station, remark, month)
-    DO UPDATE SET
-        id = EXCLUDED.id,
-        sample_amount = EXCLUDED.sample_amount,
-        run_time_lower_outlier = EXCLUDED.run_time_lower_outlier,
-        q1 = EXCLUDED.q1,
-        median = EXCLUDED.median,
-        q3 = EXCLUDED.q3,
-        run_time_upper_outlier = EXCLUDED.run_time_upper_outlier,
-        del_out_run_time_av = EXCLUDED.del_out_run_time_av,
-        plotly_json = EXCLUDED.plotly_json,
-        updated_at = now();
-    """)
+    upsert_latest(summary_all)
+    upsert_hist_daily(summary_all, snapshot_day=snapshot_day)
 
-    records = summary_df.to_dict(orient="records")
-
-    log(f"[4/6] UPSERT 시작... (records={len(records)})")
-    with engine.begin() as conn:
-        conn.execute(upsert_sql, records)
-
-    log(f"[OK] upserted {len(records)} rows into {TARGET_SCHEMA}.{TARGET_TABLE}")
+    log(f"[RUN] {label} | DONE (latest upsert + hist daily rolling)")
 
 
 # =========================
-# ONE SHOT
+# main: 08:22 / 20:22 에만 실행 후 종료
 # =========================
-def main_once():
-    log("=== Vision RunTime CT Pipeline RUN (ONE SHOT) ===")
-    log(f"[INFO] workers={MAX_WORKERS} | month={current_yyyymm()} | recent={RECENT_SECONDS}s | stable_buf={STABLE_DATA_SEC}s")
+def main():
+    start_dt = datetime.now()
+    start_perf = time.perf_counter()
+    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
+    log("=== Vision RunTime CT (intensity8) Pipeline (MONTHLY: 1st day 00:10) ===")
 
-    engine = get_engine(DB_CONFIG)
-
-    df = load_source(engine)
-    df = preprocess(df)
-    if df is None or df.empty:
-        log("[SKIP] 최근 데이터 없음 -> 저장 생략")
-        return
-
-    summary_df = build_summary(df)
-    if summary_df is None or summary_df.empty:
-        log("[SKIP] summary_df empty -> 저장 생략")
-        return
-
-    ensure_table(engine)
-    upsert_summary(engine, summary_df)
-
-    log("=== DONE (ONE SHOT) ===")
-
-
-# =========================
-# Realtime loop (윈도우 시간에만)
-# =========================
-def realtime_loop():
-    log("=== Vision RunTime CT Realtime Loop START ===")
-    log(f"[INFO] windows={[(s.strftime('%H:%M:%S'), e.strftime('%H:%M:%S')) for s,e in WINDOWS]}")
-    log(f"[INFO] LOOP_INTERVAL_SEC={LOOP_INTERVAL_SEC} | workers={MAX_WORKERS}")
-
-    loop_count = 0
-    while True:
-        loop_count += 1
-        loop_start = time_mod.perf_counter()
-        now_dt = datetime.now()
-
-        if not now_in_windows(now_dt):
-            if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
-                log(f"[IDLE] {now_dt:%Y-%m-%d %H:%M:%S} (out of window)")
-            elapsed = time_mod.perf_counter() - loop_start
-            sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-            if sleep_sec > 0:
-                time_mod.sleep(sleep_sec)
-            continue
-
-        try:
-            log(f"[RUN] {now_dt:%Y-%m-%d %H:%M:%S} (in window)")
-            main_once()
-        except Exception as e:
-            log(f"[ERROR] {type(e).__name__}: {e}")
-
-        elapsed = time_mod.perf_counter() - loop_start
-        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-        if sleep_sec > 0:
-            time_mod.sleep(sleep_sec)
-
-
-# =========================
-# entry
-# =========================
-if __name__ == "__main__":
-    freeze_support()
-
-    exit_code = 0
     try:
-        realtime_loop()
-    except KeyboardInterrupt:
-        log("\n[ABORT] 사용자 중단(CTRL+C)")
-        exit_code = 130
-    except Exception as e:
-        log(f"[ERROR] Unhandled exception: {repr(e)}")
-        exit_code = 1
-    finally:
-        # EXE(Nuitka/pyinstaller) 실행 시 콘솔 유지
-        if getattr(sys, "frozen", False):
-            print("\n[INFO] 프로그램이 종료되었습니다.")
-            input("Press Enter to exit...")
+        now = datetime.now()
+        if not is_monthly_run_time(now):
+            log("[SKIP] 이 스크립트는 Task Scheduler가 매월 1일 00:10에 호출할 때만 실행합니다.")
+            return
 
-    sys.exit(exit_code)
+        run_month = prev_month_yyyymm(now)
+
+        log("[0/3] target table ensure...")
+        ensure_tables_and_indexes()
+
+        log("[1/3] monthly compute+upsert...")
+        run_pipeline_once(label=f"monthly_run_{run_month}", run_month=run_month)
+
+        end_dt = datetime.now()
+        elapsed = time.perf_counter() - start_perf
+        log(f"[END] {end_dt:%Y-%m-%d %H:%M:%S} | elapsed={elapsed:.1f}s")
+
+    except Exception as e:
+        log(f"[FATAL] {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
