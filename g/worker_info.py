@@ -18,8 +18,8 @@ DB_CONFIG = {
 }
 
 SCHEMA = "g_production_film"
-TABLE  = "ct_info"
-CSV_PATH = r"C:\Users\user\Desktop\ct.csv"
+TABLE  = "worker_info"
+CSV_PATH = r"C:\Users\user\Desktop\worker_info.csv"
 
 engine = create_engine(
     f"postgresql+psycopg2://{DB_CONFIG['user']}:{urllib.parse.quote_plus(DB_CONFIG['password'])}"

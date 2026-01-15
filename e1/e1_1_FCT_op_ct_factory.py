@@ -85,7 +85,10 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 OPCT_MAX_SEC = 600
 
 # 실행 스케줄
-RUN_TIME = dtime(0, 10, 0)  # 매월 1일 00:10:00 (Task Scheduler)
+RUN_TIME = dtime(0, 10, 0)  # (legacy) monthly schedule trigger (no longer used)
+LOOP_INTERVAL_SEC = 5  # 실시간 루프 간격(초)
+FETCH_LIMIT = 200000   # 1회 조회 최대 row (과다 메모리/트래픽 방지)
+
 
 # 멀티프로세스 분담
 PROC_1_STATIONS = ["FCT1", "FCT2"]
@@ -101,6 +104,10 @@ def log(msg: str):
 
 def today_yyyymmdd() -> str:
     return date.today().strftime("%Y%m%d")
+
+def current_yyyymm(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    return now.strftime("%Y%m")
 
 
 def is_monthly_run_time(now: datetime) -> bool:
@@ -801,28 +808,163 @@ def main():
     start_dt = datetime.now()
     start_perf = time.perf_counter()
     log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
-    log("=== FCT OP-CT Pipeline (MONTHLY: 1st day 00:10) ===")
+    log("=== REALTIME MODE: current-month incremental + periodic UPSERT ===")
+    log(f"loop_interval={LOOP_INTERVAL_SEC}s | fetch_limit={FETCH_LIMIT}")
 
-    try:
-        now = datetime.now()
-        if not is_monthly_run_time(now):
-            log("[SKIP] 이 스크립트는 Task Scheduler가 매월 1일 00:10에 호출할 때만 실행합니다.")
+    # 0) 대상 테이블/인덱스/시퀀스 보장
+    ensure_tables_and_indexes()
+
+    # 1) 실시간 캐시/상태
+    run_month = current_yyyymm()
+    last_ts = {}  # key=(station, remark) -> last_end_ts (pd.Timestamp)
+    cache_df = None
+
+    def _key_cols(df: pd.DataFrame):
+        if 'opct_fct' in ("opct_fct","opct_vision"):
+            return ["station", "remark", "end_ts"]
+        return ["station", "remark", "barcode_information", "end_day", "end_time"]
+
+    def _fetch_new_rows(eng, stations: list[str], run_month_local: str) -> pd.DataFrame:
+        min_last = None
+        if last_ts:
+            min_last = min([v for v in last_ts.values() if v is not None], default=None)
+
+        if min_last is None:
+            extra_where = ""
+            params = {"stations": stations, "run_month": run_month_local, "limit": FETCH_LIMIT}
+        else:
+            extra_where = " AND ( (COALESCE(end_day::text,'') || ' ' || COALESCE(end_time::text,''))::timestamp > :min_last ) "
+            params = {"stations": stations, "run_month": run_month_local, "min_last": str(min_last), "limit": FETCH_LIMIT}
+
+        if 'opct_fct' in ("opct_fct","opct_vision"):
+            sql_query = f"""
+            SELECT station, remark, end_day, end_time
+            FROM {SRC_SCHEMA}.{SRC_TABLE}
+            WHERE station = ANY(:stations)
+              AND remark IN ('PD','Non-PD')
+              AND result <> 'FAIL'
+              AND goodorbad <> 'BadFile'
+              AND substring(regexp_replace(COALESCE(end_day::text,''), '\D', '', 'g') from 1 for 6) = :run_month
+              {extra_where}
+            ORDER BY station ASC, remark ASC, end_time ASC
+            LIMIT :limit
+            """
+            df = pd.read_sql(text(sql_query), eng, params=params)
+        else:
+            sql_query = f"""
+            SELECT station, remark, barcode_information, end_day, end_time, run_time
+            FROM {SRC_SCHEMA}.{SRC_TABLE}
+            WHERE station = ANY(:stations)
+              AND remark IN ('PD','Non-PD')
+              AND substring(regexp_replace(COALESCE(end_day::text,''), '\D', '', 'g') from 1 for 6) = :run_month
+              {extra_where}
+            ORDER BY station ASC, remark ASC, end_time ASC
+            LIMIT :limit
+            """
+            df = pd.read_sql(text(sql_query), eng, params=params)
+
+        if df is None or df.empty:
+            return df
+
+        df["end_day"] = pd.to_datetime(df["end_day"], errors="coerce").dt.date
+        df["end_time_str"] = df["end_time"].astype(str)
+        df["end_ts"] = pd.to_datetime(df["end_day"].astype(str) + " " + df["end_time_str"], errors="coerce")
+        df = df.dropna(subset=["end_ts"]).copy()
+
+        keep = []
+        for (st, rm), g in df.groupby(["station","remark"], sort=False):
+            lt = last_ts.get((st, rm))
+            if lt is None:
+                keep.append(g)
+            else:
+                keep.append(g[g["end_ts"] > lt])
+        return pd.concat(keep, ignore_index=True) if keep else df.iloc[0:0].copy()
+
+    def _update_last_ts(df_new: pd.DataFrame):
+        if df_new is None or df_new.empty:
             return
+        for (st, rm), g in df_new.groupby(["station","remark"], sort=False):
+            last_ts[(st, rm)] = g["end_ts"].max()
 
-        run_month = prev_month_yyyymm(now)
-        ensure_tables_and_indexes()
+    eng = get_engine(DB_CONFIG)
+    try:
+        while True:
+            now = datetime.now()
+            cur_month = current_yyyymm(now)
+            if cur_month != run_month:
+                log(f"[MONTH ROLLOVER] {run_month} -> {cur_month} (cache reset)")
+                run_month = cur_month
+                last_ts.clear()
+                cache_df = None
 
-        # 월 1회 즉시 실행 후 종료 (대기/루프 없음)
-        run_pipeline_once(label=f"monthly_run_{run_month}", run_month=run_month)
+            stations_all = list(set(PROC_1_STATIONS + PROC_2_STATIONS))
+            df_new = _fetch_new_rows(eng, stations_all, run_month)
 
-        end_dt = datetime.now()
-        elapsed = time.perf_counter() - start_perf
-        log(f"[END] {end_dt:%Y-%m-%d %H:%M:%S} | elapsed={elapsed:.1f}s")
+            if df_new is not None and not df_new.empty:
+                if 'opct_fct' in ("opct_fct","opct_vision"):
+                    # 앵커(각 station/remark 마지막 1행) + 신규로 op_ct 재계산
+                    if cache_df is not None and not cache_df.empty:
+                        anchors = []
+                        for (st, rm), g in cache_df.groupby(["station","remark"], sort=False):
+                            anchors.append(g.sort_values("end_ts").tail(1)[["station","remark","end_day","end_time","end_time_str","end_ts"]])
+                        df_anchor = pd.concat(anchors, ignore_index=True) if anchors else None
+                        df_tmp = pd.concat([df_anchor, df_new], ignore_index=True) if df_anchor is not None else df_new.copy()
+                    else:
+                        df_tmp = df_new.copy()
 
-    except Exception as e:
-        log(f"[FATAL] {e}")
-        raise
+                    df_tmp = df_tmp.sort_values(["station","remark","end_ts"]).reset_index(drop=True)
+                    df_tmp["op_ct"] = df_tmp.groupby(["station","remark"])["end_ts"].diff().dt.total_seconds()
+                    df_tmp["month"] = df_tmp["end_ts"].dt.strftime("%Y%m")
 
+                    df_new_for_cache = df_tmp[df_tmp["end_ts"].isin(df_new["end_ts"])].copy()
+                else:
+                    df_new["month"] = df_new["end_ts"].dt.strftime("%Y%m")
+                    df_new_for_cache = df_new
+
+                if cache_df is None or cache_df.empty:
+                    cache_df = df_new_for_cache.copy()
+                else:
+                    cache_df = pd.concat([cache_df, df_new_for_cache], ignore_index=True)
+                    cache_df = cache_df.drop_duplicates(subset=_key_cols(cache_df), keep="last")
+
+                _update_last_ts(df_new)
+
+                log(f"[NEW] rows={len(df_new_for_cache)} | cache={len(cache_df)} | month={run_month}")
+
+                # 저장/업데이트: 기존 로직 재사용
+                if 'opct_fct' == "opct_fct":
+                    summary_df = build_summary_df(cache_df)
+                    whole_df = build_final_df_86(summary_df)
+                    upsert_latest_opct(summary_df)
+                    upsert_latest_whole(whole_df)
+                    upsert_hist_opct_daily(summary_df, snapshot_day=today_yyyymmdd())
+                    upsert_hist_whole_daily(whole_df, snapshot_day=today_yyyymmdd())
+                elif 'opct_fct' == "runtime_fct":
+                    summary_df = build_summary_df(cache_df)
+                    outlier_df = build_upper_outlier_df(cache_df, summary_df)
+                    upsert_latest_run_time_ct(summary_df)
+                    upsert_hist_run_time_ct_daily(summary_df, snapshot_day=today_yyyymmdd())
+                    insert_outlier_list(outlier_df)
+                elif 'opct_fct' == "opct_vision":
+                    df_marked = mark_only_runs(cache_df)
+                    df_an = build_analysis_df(df_marked)
+                    summary_df = summarize(df_an) if df_an is not None and not df_an.empty else pd.DataFrame()
+                    if summary_df is not None and not summary_df.empty:
+                        upsert_latest(summary_df)
+                        upsert_hist_daily(summary_df, snapshot_day=today_yyyymmdd())
+                elif 'opct_fct' == "runtime_vision":
+                    summary_df = build_summary(cache_df)
+                    if summary_df is not None and not summary_df.empty:
+                        upsert_latest(summary_df)
+                        upsert_hist_daily(summary_df, snapshot_day=today_yyyymmdd())
+
+            time.sleep(LOOP_INTERVAL_SEC)
+
+    finally:
+        try:
+            eng.dispose()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
