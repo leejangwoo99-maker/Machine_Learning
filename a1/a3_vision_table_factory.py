@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
+import os
 import pandas as pd
 import re
 import time
@@ -11,6 +12,12 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 # ==========================
+# ✅ (중요) psycopg2/libpq 에러 메시지 인코딩 때문에 EXE에서 UnicodeDecodeError 방지
+# ==========================
+os.environ.setdefault("PGCLIENTENCODING", "UTF8")
+os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
+
+# ==========================
 # 기본 경로 설정
 # ==========================
 BASE_LOG_DIR = Path(r"\\192.168.108.101\HistoryLog")
@@ -20,7 +27,7 @@ VISION_FOLDER_NAME = "Vision03"
 # PostgreSQL 접속 정보
 # ==========================
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -36,20 +43,162 @@ TABLE_NAME  = "vision_table"
 # ==========================
 # 추가 요구사항 설정
 # ==========================
-NUM_WORKERS = 2                 # ✅ 멀티프로세스 2개 고정
+
+# ✅ 요구사항: 멀티프로세스 = 1개
+NUM_WORKERS = 1
+
 REALTIME_WINDOW_SEC = 120       # ✅ 최근 120초 이내 파일만 처리
 USE_FIXED_CUTOFF_TS = False     # ✅ True면 아래 cutoff_ts 값을 "고정"으로 사용
 FIXED_CUTOFF_TS = 1765501841.4473598
 
 # ✅ DB DISTINCT file_path 재로딩 주기(루프 횟수)
-DB_RELOAD_EVERY_LOOPS = 120     # 약 2분(1초 루프 기준)
+DB_RELOAD_EVERY_LOOPS = 120     # 약 10분(5초 루프 기준)
+
+# ✅ 요구사항: 무한 루프 인터벌 5초
+LOOP_INTERVAL_SEC = 5
+
+# ✅ 요구사항: DB 접속 실패 시 무한 재시도(연결 성공까지 블로킹)
+DB_RETRY_INTERVAL_SEC = 5
+
+# ✅ 요구사항: work_mem 폭증 방지(세션별 cap) - 환경변수로 조정 가능
+#    예) set PG_WORK_MEM=8MB
+WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
+
+# ✅ (추가/권장) 끊긴 TCP 세션을 빠르게 감지하기 위한 keepalive
+PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
+PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
+PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
+PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
+
+# ✅ 요구사항: 백엔드별 상시 연결 1개 고정(풀 최소화)
+_CONN = None
 
 
 # ==========================
 # DB 유틸
 # ==========================
-def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
+def _safe_close(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _reset_conn(reason: str = ""):
+    """커넥션 강제 폐기 + 다음 ensure_conn에서 무한 재연결 유도"""
+    global _CONN
+    try:
+        if reason:
+            print(f"[DB][RESET] {reason}", flush=True)
+    except Exception:
+        pass
+    try:
+        _safe_close(_CONN)
+    except Exception:
+        pass
+    _CONN = None
+
+
+def _is_connection_error(e: Exception) -> bool:
+    """
+    서버 끊김/네트워크/소켓/세션 종료 등 '재연결'이 필요한 오류인지 판단
+    """
+    if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        return True
+
+    msg = (str(e) or "").lower()
+    keywords = [
+        "server closed the connection",
+        "connection not open",
+        "terminating connection",
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+        "ssl connection has been closed",
+        "broken pipe",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+    ]
+    return any(k in msg for k in keywords)
+
+
+def _apply_session_safety(conn):
+    """
+    ✅ work_mem 폭증 방지: 세션에 cap 적용 + 연결 유효성 ping
+    """
+    with conn.cursor() as cur:
+        cur.execute("SET work_mem TO %s;", (WORK_MEM,))
+        cur.execute("SELECT 1;")
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def get_connection_blocking():
+    """
+    ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
+    + (권장) keepalive로 죽은 TCP 세션 감지 가속
+    """
+    while True:
+        try:
+            conn = psycopg2.connect(
+                **DB_CONFIG,
+                connect_timeout=5,
+                application_name="a3_vision_table_realtime",
+
+                # keepalive 옵션 (libpq 지원)
+                keepalives=PG_KEEPALIVES,
+                keepalives_idle=PG_KEEPALIVES_IDLE,
+                keepalives_interval=PG_KEEPALIVES_INTERVAL,
+                keepalives_count=PG_KEEPALIVES_COUNT,
+            )
+            conn.autocommit = False
+            _apply_session_safety(conn)
+            print(
+                f"[DB][OK] connected (work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
+                flush=True
+            )
+            return conn
+        except Exception as e:
+            print(f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}", flush=True)
+            try:
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+            except Exception:
+                pass
+
+
+def ensure_conn():
+    """
+    ✅ 백엔드별 상시 연결 1개 고정(풀 최소화):
+    - 프로세스 전체에서 커넥션 1개만 유지/재사용
+    - 죽었으면 무한 재연결(블로킹)
+    - 실행 중 끊김도 ping에서 감지/복구
+    """
+    global _CONN
+
+    if _CONN is None:
+        _CONN = get_connection_blocking()
+        return _CONN
+
+    if getattr(_CONN, "closed", 1) != 0:
+        _reset_conn("conn.closed != 0")
+        _CONN = get_connection_blocking()
+        return _CONN
+
+    try:
+        _apply_session_safety(_CONN)
+        return _CONN
+    except Exception as e:
+        if _is_connection_error(e):
+            print(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}", flush=True)
+            _reset_conn("ping failed")
+            _CONN = get_connection_blocking()
+            return _CONN
+        raise
 
 
 def ensure_schema_and_table(conn):
@@ -59,75 +208,114 @@ def ensure_schema_and_table(conn):
     - 따라서 중복 판정은:
       ✅ SELECT DISTINCT file_path WHERE end_day=오늘
     - 성능을 위해 file_path, end_day 인덱스 생성
+    - ✅ 실행 중 끊김 포함: 무한 재시도
     """
-    with conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};")
+    while True:
+        conn = ensure_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};")
 
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{TABLE_NAME} (
-                id                  BIGSERIAL PRIMARY KEY,
-                barcode_information TEXT,
-                station             TEXT,
-                run_time            DOUBLE PRECISION,
-                end_day             TEXT,
-                end_time            TEXT,
-                remark              TEXT,
-                step_description    TEXT,
-                value               TEXT,
-                min                 TEXT,
-                max                 TEXT,
-                result              TEXT,
-                file_path           TEXT NOT NULL,
-                processed_at        TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-            """
-        )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{TABLE_NAME} (
+                        id                  BIGSERIAL PRIMARY KEY,
+                        barcode_information TEXT,
+                        station             TEXT,
+                        run_time            DOUBLE PRECISION,
+                        end_day             TEXT,
+                        end_time            TEXT,
+                        remark              TEXT,
+                        step_description    TEXT,
+                        value               TEXT,
+                        min                 TEXT,
+                        max                 TEXT,
+                        result              TEXT,
+                        file_path           TEXT NOT NULL,
+                        processed_at        TIMESTAMP NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
 
-        # (안전) 이미 존재해도 OK
-        cur.execute(
-            f"""
-            ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME}
-            ADD COLUMN IF NOT EXISTS run_time DOUBLE PRECISION;
-            """
-        )
+                # (안전) 이미 존재해도 OK
+                cur.execute(
+                    f"""
+                    ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME}
+                    ADD COLUMN IF NOT EXISTS run_time DOUBLE PRECISION;
+                    """
+                )
 
-        cur.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_file_path
-            ON {SCHEMA_NAME}.{TABLE_NAME} (file_path);
-            """
-        )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_file_path
+                    ON {SCHEMA_NAME}.{TABLE_NAME} (file_path);
+                    """
+                )
 
-        cur.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_end_day
-            ON {SCHEMA_NAME}.{TABLE_NAME} (end_day);
-            """
-        )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_end_day
+                    ON {SCHEMA_NAME}.{TABLE_NAME} (end_day);
+                    """
+                )
 
-    conn.commit()
+            conn.commit()
+            return
+
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] ensure_schema_and_table failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("ensure_schema_and_table connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] ensure_schema_and_table db error: {type(e).__name__}: {repr(e)}", flush=True)
+            raise
+
+        except Exception:
+            raise
 
 
 def get_processed_file_paths_today(conn, end_day: str) -> set:
     """
-    ✅ fct_table과 동일:
-    UNIQUE(file_path)는 불가능하므로,
-    SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별
+    ✅ SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별
+    ✅ 실행 중 끊김 포함: 무한 재시도
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT DISTINCT file_path
-            FROM {SCHEMA_NAME}.{TABLE_NAME}
-            WHERE end_day = %s
-              AND file_path IS NOT NULL
-              AND file_path <> '';
-            """,
-            (end_day,)
-        )
-        rows = cur.fetchall()
-    return {r[0] for r in rows if r and r[0]}
+    while True:
+        conn = ensure_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT file_path
+                    FROM {SCHEMA_NAME}.{TABLE_NAME}
+                    WHERE end_day = %s
+                      AND file_path IS NOT NULL
+                      AND file_path <> '';
+                    """,
+                    (end_day,)
+                )
+                rows = cur.fetchall()
+            return {r[0] for r in rows if r and r[0]}
+
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] get_processed_file_paths_today failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("get_processed_file_paths_today connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] get_processed_file_paths_today db error: {type(e).__name__}: {repr(e)}", flush=True)
+            raise
+
+        except Exception:
+            raise
 
 
 def insert_main_rows(conn, rows):
@@ -252,13 +440,13 @@ def parse_data_lines(lines):
         rows.append({"value": value, "min": min_val, "max": max_val, "result": result})
 
     if not rows:
-        return pd.DataFrame(columns=["value", "min", "max", "result"])
+        return pd.DataFrame(columns=["value", "min", "max, result"])
 
     return pd.DataFrame(rows, index=index_list)
 
 
 # ==========================
-# 멀티프로세싱 워커
+# 워커(멀티프로세스/단일 공용)
 # ==========================
 def _worker_process_file(file_str: str):
     file_path = Path(file_str)
@@ -266,7 +454,7 @@ def _worker_process_file(file_str: str):
         with file_path.open("r", encoding="cp949", errors="ignore") as f:
             lines = f.readlines()
     except Exception:
-        print("[ERROR] 파일 읽기 오류:", file_str)
+        print("[ERROR] 파일 읽기 오류:", file_str, flush=True)
         return []
 
     if len(lines) < 19:
@@ -312,7 +500,7 @@ def _worker_process_file(file_str: str):
 def run_once(conn, processed_set: set, today_str: str):
     vision_root = BASE_LOG_DIR / VISION_FOLDER_NAME
     if not vision_root.exists():
-        print(f"[ERROR] {VISION_FOLDER_NAME} 폴더가 없음: {vision_root}")
+        print(f"[ERROR] {VISION_FOLDER_NAME} 폴더가 없음: {vision_root}", flush=True)
         return
 
     # cutoff_ts 결정
@@ -326,7 +514,7 @@ def run_once(conn, processed_set: set, today_str: str):
 
     today_dir = vision_root / today_str
     if not today_dir.exists():
-        print(f"[INFO] 오늘 폴더 없음: {today_dir} (today={today_str})")
+        print(f"[INFO] 오늘 폴더 없음: {today_dir} (today={today_str})", flush=True)
         return
 
     for sub_name in ["GoodFile", "BadFile"]:
@@ -349,12 +537,12 @@ def run_once(conn, processed_set: set, today_str: str):
             target_files.append(str(fp))
 
     total = len(target_files)
-    print(f"[INFO] 오늘({today_str}) & 최근{REALTIME_WINDOW_SEC}초 대상 파일 수: {total}개 (cutoff_ts={cutoff_ts})")
+    print(f"[INFO] 오늘({today_str}) & 최근{REALTIME_WINDOW_SEC}초 대상 파일 수: {total}개 (cutoff_ts={cutoff_ts})", flush=True)
     if total == 0:
-        print("[INFO] 대상 파일 없음.")
+        print("[INFO] 대상 파일 없음.", flush=True)
         return
 
-    # ✅ fct_table과 동일: 이미 적재된 file_path(오늘 end_day)면 스킵
+    # ✅ 이미 적재된 file_path(오늘 end_day)면 스킵
     files_to_process = [f for f in target_files if f not in processed_set]
 
     # (추가) 이번 사이클 내 중복 file_path 제거
@@ -367,19 +555,20 @@ def run_once(conn, processed_set: set, today_str: str):
         uniq.append(f)
     files_to_process = uniq
 
-    print(f"[INFO] DB DISTINCT file_path(end_day=오늘) 중복 스킵: {total - len(files_to_process)}개")
-    print(f"[INFO] 실제 처리 대상: {len(files_to_process)}개")
+    print(f"[INFO] DB DISTINCT file_path(end_day=오늘) 중복 스킵: {total - len(files_to_process)}개", flush=True)
+    print(f"[INFO] 실제 처리 대상: {len(files_to_process)}개", flush=True)
 
     if not files_to_process:
-        print("[INFO] 처리할 신규 파일 없음.")
+        print("[INFO] 처리할 신규 파일 없음.", flush=True)
         return
 
-    # 3) 멀티프로세스 파싱 (2개 고정)
+    # 3) 파싱 (✅ 요구사항: 멀티프로세스 = 1개)
     max_workers = NUM_WORKERS
     chunksize = max(20, len(files_to_process) // (max_workers * 8) or 1)
 
     all_new_rows = []
 
+    # 기존 기능(프로세스 풀 기반 구조) 유지하되, worker=1로 실행
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         for idx, rows in enumerate(
             executor.map(_worker_process_file, files_to_process, chunksize=chunksize),
@@ -393,65 +582,100 @@ def run_once(conn, processed_set: set, today_str: str):
                 print(
                     f"[진행] {idx}/{len(files_to_process)} "
                     f"(누적 신규 row: {len(all_new_rows)}) "
-                    f"[workers={max_workers}, chunksize={chunksize}]"
+                    f"[workers={max_workers}, chunksize={chunksize}]",
+                    flush=True
                 )
 
     if not all_new_rows:
-        print("[INFO] 신규 파싱된 데이터가 없습니다.")
+        print("[INFO] 신규 파싱된 데이터가 없습니다.", flush=True)
         return
 
-    # 4) INSERT + COMMIT
-    try:
-        insert_main_rows(conn, all_new_rows)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    # 4) INSERT + COMMIT (✅ 실행 중 끊김 포함: 무한 재시도)
+    while True:
+        conn = ensure_conn()
+        try:
+            insert_main_rows(conn, all_new_rows)
+            conn.commit()
+            break
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] insert/commit failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("insert/commit connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] insert/commit db error: {type(e).__name__}: {repr(e)}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     # ✅ 이번에 적재한 file_path는 processed_set에 즉시 반영
     new_file_paths = {r["file_path"] for r in all_new_rows}
     processed_set.update(new_file_paths)
 
-    print(f"[완료] 신규 파일 {len(new_file_paths)}개, 신규 row {len(all_new_rows)}개 PostgreSQL 파싱 완료.")
+    print(f"[완료] 신규 파일 {len(new_file_paths)}개, 신규 row {len(all_new_rows)}개 PostgreSQL 파싱 완료.", flush=True)
 
 
 # ==========================
-# 무한 루프 (1초)
+# 무한 루프 (✅ 5초)
 # ==========================
 def main():
     mp.freeze_support()
 
-    with get_connection() as conn:
-        ensure_schema_and_table(conn)
+    # ✅ 상시 연결 1개 유지(접속 실패 시 여기서부터 무한 블로킹 재시도)
+    conn = ensure_conn()
 
-        current_day = datetime.now().strftime("%Y%m%d")
-        processed_set = get_processed_file_paths_today(conn, current_day)
-        print(f"[DB] Loaded DISTINCT file_path WHERE end_day={current_day}: {len(processed_set)}")
+    ensure_schema_and_table(conn)
 
-        loop_count = 0
+    current_day = datetime.now().strftime("%Y%m%d")
+    processed_set = get_processed_file_paths_today(conn, current_day)
+    print(f"[DB] Loaded DISTINCT file_path WHERE end_day={current_day}: {len(processed_set)}", flush=True)
 
-        while True:
-            loop_count += 1
-            try:
-                today_str = datetime.now().strftime("%Y%m%d")
+    loop_count = 0
 
-                # 자정 날짜 변경 감지: 오늘 processed_set 재로딩
-                if today_str != current_day:
-                    current_day = today_str
-                    processed_set = get_processed_file_paths_today(conn, current_day)
-                    print(f"[DAY-CHANGE] end_day={current_day} | reload db_paths={len(processed_set)}")
+    while True:
+        loop_count += 1
+        try:
+            today_str = datetime.now().strftime("%Y%m%d")
 
-                # 주기적 DB 재동기화(다른 프로세스 적재 반영)
-                if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
-                    processed_set = get_processed_file_paths_today(conn, current_day)
-                    print(f"[DB-RELOAD] end_day={current_day} | db_paths={len(processed_set)}")
+            # 자정 날짜 변경 감지: 오늘 processed_set 재로딩
+            if today_str != current_day:
+                current_day = today_str
+                processed_set = get_processed_file_paths_today(conn, current_day)
+                print(f"[DAY-CHANGE] end_day={current_day} | reload db_paths={len(processed_set)}", flush=True)
 
-                run_once(conn, processed_set, current_day)
+            # 주기적 DB 재동기화(다른 프로세스 적재 반영)
+            if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
+                processed_set = get_processed_file_paths_today(conn, current_day)
+                print(f"[DB-RELOAD] end_day={current_day} | db_paths={len(processed_set)}", flush=True)
 
-            except Exception as e:
-                print("[ERROR] run_once 중 예외 발생:", e)
+            run_once(conn, processed_set, current_day)
 
-            time.sleep(1)
+        except psycopg2.Error as e:
+            # ✅ 루프 바깥에서 터져도(드물지만) 연결 문제면 무한 재연결 유도
+            if _is_connection_error(e):
+                print("[DB][RETRY] loop-level connection error:", repr(e), flush=True)
+                _reset_conn("loop-level connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print("[DB][FATAL] loop-level db error:", repr(e), flush=True)
+            raise
+
+        except Exception as e:
+            print("[ERROR] run_once 중 예외 발생:", repr(e), flush=True)
+
+        time.sleep(LOOP_INTERVAL_SEC)
 
 
 if __name__ == "__main__":

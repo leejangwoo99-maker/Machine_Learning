@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-pd_worst.py
+pd_worst_service.py
 
 - pd_cal_test_ct_summary에서 test_contents(예: 1.36_dark_curr_check) 최신 upper_outlier 1건을 boundary_run_time으로 사용
 - a2_fct_table.fct_table에서 (end_day=YYYYMMDD text, remark='PD') 대상 중 run_time > boundary_run_time 필터

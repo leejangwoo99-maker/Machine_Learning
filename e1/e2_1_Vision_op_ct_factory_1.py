@@ -1,55 +1,126 @@
 # -*- coding: utf-8 -*-
 """
 Vision OP-CT 분석 파이프라인 - current-month incremental + periodic UPSERT
-- (기존) MP=2 고정  -> ✅ MP=1 고정
+- MP=1 고정
 - LATEST/HIST 저장
 - id/sequence 자동 보정
 - 테이블 스키마 자동 동기화(ALTER TABLE ... ADD COLUMN IF NOT EXISTS)
 
-핵심 수정:
-- cache_df에는 end_ts 컬럼을 유지(절대 rename하지 않음)
-- 분석 직전 df_for_analysis = cache_df.rename({"end_ts":"end_dt"})로만 변환
-- KeyError: 'end_ts' 해결
-
-추가(기존 유지):
-1) only-run 판정 로직을 "시간순(end_day,end_time 오름차순) 연속 10개 이상"으로 정확히 변경
-2) IDLE(신규 없음) 상태에서도 하트비트 로그 출력
-3) fetch/analysis 단계 소요시간 로그
-
-✅ 요청 반영(핵심 사양):
-- ✅ 멀티프로세스 = 1개
-- ✅ 무한 루프(5초) 사용 금지: main()은 매일 08:22 / 20:22 에만 1회 실행 후 종료
-- ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공할 때까지 블로킹)
-- ✅ 백엔드별 상시 연결을 1개로 고정(풀 최소화)
-  * SQLAlchemy engine: pool_size=1, max_overflow=0
-  * psycopg2: 1개 연결을 재사용(동일 프로세스 내) + 끊김 감지 시 재연결
-- ✅ work_mem 폭증 방지
-  * SQLAlchemy 세션: SET work_mem
-  * psycopg2 세션: SET work_mem
-
-(이번 반영 포인트)
-- run_pipeline_once() 수행 중 DB가 끊기면:
-  - SQLAlchemy: dispose/rebuild 후 무한 재시도
-  - psycopg2: 연결 상태 확인 후 재연결 + 재시도
-  - UPSERT 또한 연결끊김 시 재시도(트랜잭션 롤백/커밋 안전)
+추가:
+- ✅ 로그파일 TEE (콘솔+파일 동시 기록)
+- ✅ "서비스 상주" 모드:
+  * 프로세스 종료하지 않고 계속 실행
+  * 매일 08:22 / 20:22 각각 하루 1회 실행
+  * 슬롯 실행 완료 후 다음 슬롯까지 대기(하트비트 출력)
 """
 
 import os
 import sys
 import warnings
 import urllib.parse
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 import time as time_mod
+import atexit
+import traceback
 
 import numpy as np
 import pandas as pd
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError, DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import OperationalError, DBAPIError
 
 import plotly.graph_objects as go
 import psycopg2
 from psycopg2.extras import execute_values
+
+
+# =========================
+# 0-0) LOG TEE (콘솔 + 파일)
+# =========================
+def _safe_makedirs(path: str):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+def _default_log_path() -> str:
+    p = (os.getenv("VISION_OPCT_LOG") or "").strip()
+    if p:
+        return p
+    if os.name == "nt":
+        return r"C:\AptivAgent\logs\vision_opct.log"
+    return os.path.join(os.getcwd(), "logs", "vision_opct.log")
+
+LOG_PATH = _default_log_path()
+_safe_makedirs(os.path.dirname(LOG_PATH) or ".")
+
+class _TeeStream:
+    def __init__(self, path: str, stream):
+        self.path = path
+        self.stream = stream
+        self.f = open(path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, s):
+        try:
+            self.stream.write(s)
+        except Exception:
+            pass
+        try:
+            self.f.write(s)
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+        try:
+            self.f.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+try:
+    sys.stdout = _TeeStream(LOG_PATH, sys.__stdout__)
+    sys.stderr = _TeeStream(LOG_PATH, sys.__stderr__)
+except Exception:
+    pass
+
+def _log_banner(kind: str):
+    try:
+        print(
+            f"\n[{kind}] {datetime.now():%Y-%m-%d %H:%M:%S} | pid={os.getpid()} | log={LOG_PATH}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+@atexit.register
+def _on_exit():
+    _log_banner("EXIT")
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    try:
+        _log_banner("UNHANDLED_EXCEPTION")
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+    finally:
+        try:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+try:
+    sys.excepthook = _excepthook
+except Exception:
+    pass
+
+_log_banner("BOOT")
 
 
 # =========================
@@ -80,32 +151,28 @@ SRC_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
 SRC_TABLE  = "fct_vision_testlog_txt_processing_history"
 
 TARGET_SCHEMA = "e2_vision_ct"
-
 TBL_LATEST = "vision_op_ct"
 TBL_HIST   = "vision_op_ct_hist"
 
 OPCT_MAX_SEC = 600
 ONLY_RUN_MIN_LEN = 10
 
-# ✅ MP=1: station 전체를 단일 프로세스에서 처리
 STATIONS_ALL = ["Vision1", "Vision2"]
 
-# ✅ 스케줄 실행 시간 (요구사항)
+# 스케줄 실행 시간
 RUN_TIME_1 = dtime(8, 22, 0)
 RUN_TIME_2 = dtime(20, 22, 0)
 
-WAIT_INTERVAL_SEC = 5
-FETCH_LIMIT = 200000
-
+# 상주 루프 하트비트/슬립
 IDLE_HEARTBEAT = True
+HEARTBEAT_EVERY_SEC = int(os.getenv("HEARTBEAT_EVERY_SEC", "60"))  # 60초마다 하트비트
+
 TIMING_LOG = True
 
-# ✅ 안정화/리소스 제한
 DB_RETRY_INTERVAL_SEC = 5
 CONNECT_TIMEOUT_SEC = 5
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
-# ✅ keepalive (환경변수로 조정 가능)
 PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
 PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
@@ -118,70 +185,23 @@ PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 def log(msg: str):
     print(msg, flush=True)
 
-
-def _hard_pause_console():
-    if os.environ.get("NO_PAUSE", "").strip() == "1":
-        return
-
-    try:
-        if sys.stdin and sys.stdin.isatty():
-            input("\n[PAUSE] 종료하려면 Enter를 누르세요...")
-            return
-    except Exception:
-        pass
-
-    try:
-        if os.name == "nt":
-            os.system("pause")
-            return
-    except Exception:
-        pass
-
-    try:
-        time_mod.sleep(30)
-    except Exception:
-        pass
-
-
-def pause_on_exit(exit_code: int = 0):
-    try:
-        if getattr(sys, "frozen", False):
-            _hard_pause_console()
-    finally:
-        raise SystemExit(exit_code)
-
-
 def today_yyyymmdd() -> str:
     return date.today().strftime("%Y%m%d")
-
 
 def current_yyyymm(now: datetime | None = None) -> str:
     if now is None:
         now = datetime.now()
     return now.strftime("%Y%m")
 
-
-def _next_run_datetimes(now_dt: datetime):
-    d = now_dt.date()
-    cands = [
-        datetime(d.year, d.month, d.day, RUN_TIME_1.hour, RUN_TIME_1.minute, RUN_TIME_1.second),
-        datetime(d.year, d.month, d.day, RUN_TIME_2.hour, RUN_TIME_2.minute, RUN_TIME_2.second),
-    ]
-    return cands
-
-
-def _sleep_until(target_dt: datetime):
-    while True:
-        now = datetime.now()
-        if now >= target_dt:
-            return
-        sec = (target_dt - now).total_seconds()
-        time_mod.sleep(min(max(sec, 1.0), 30.0))
-
-
 def _is_conn_error(e: Exception) -> bool:
     if isinstance(e, (OperationalError, DBAPIError)):
         return True
+    try:
+        if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            return True
+    except Exception:
+        pass
+
     msg = (str(e) or "").lower()
     keys = [
         "server closed the connection",
@@ -196,8 +216,54 @@ def _is_conn_error(e: Exception) -> bool:
         "connection reset",
         "network is unreachable",
         "no route to host",
+        "connection already closed",
     ]
     return any(k in msg for k in keys)
+
+def _slot_dt_for(day: date, t: dtime) -> datetime:
+    return datetime(day.year, day.month, day.day, t.hour, t.minute, t.second)
+
+def _next_slot_target(now: datetime, ran_1_day: date | None, ran_2_day: date | None) -> datetime:
+    """
+    다음 실행 타겟 시간 반환.
+    - 오늘 RUN_TIME_1/2 중 아직 안 한 것 우선
+    - 오늘 다 했으면 내일 RUN_TIME_1
+    """
+    today = now.date()
+    t1 = _slot_dt_for(today, RUN_TIME_1)
+    t2 = _slot_dt_for(today, RUN_TIME_2)
+
+    candidates = []
+    if ran_1_day != today:
+        candidates.append(t1)
+    if ran_2_day != today:
+        candidates.append(t2)
+
+    # 후보가 없으면 내일 08:22
+    if not candidates:
+        tomorrow = today + timedelta(days=1)
+        return _slot_dt_for(tomorrow, RUN_TIME_1)
+
+    # 아직 안한 것 중 "가장 가까운 미래"를 우선
+    # 단, 이미 시간이 지난 슬롯이라도 아직 실행 안 했으면 즉시 실행되도록 now 이하도 허용
+    return min(candidates)
+
+def _sleep_with_heartbeat_until(target_dt: datetime, ran_1: bool, ran_2: bool):
+    """
+    target_dt까지 슬립. HEARTBEAT_EVERY_SEC마다 상태 출력.
+    """
+    last_hb = 0.0
+    while True:
+        now = datetime.now()
+        if now >= target_dt:
+            return
+        now_ts = time_mod.time()
+        if IDLE_HEARTBEAT and (now_ts - last_hb >= HEARTBEAT_EVERY_SEC):
+            last_hb = now_ts
+            log(f"[WAIT] now={now:%Y-%m-%d %H:%M:%S} | next={target_dt:%Y-%m-%d %H:%M:%S} | ran_1={ran_1} ran_2={ran_2}")
+        # 너무 길게 안 자고, 깨어나서 시간 체크 반복
+        remaining = (target_dt - now).total_seconds()
+        time_mod.sleep(min(max(remaining, 1.0), 10.0))
 
 
 # =========================
@@ -205,7 +271,6 @@ def _is_conn_error(e: Exception) -> bool:
 # =========================
 _ENGINE = None
 _PG_CONN = None
-
 
 def _build_engine(config=DB_CONFIG):
     user = config["user"]
@@ -231,10 +296,9 @@ def _build_engine(config=DB_CONFIG):
             "keepalives_idle": PG_KEEPALIVES_IDLE,
             "keepalives_interval": PG_KEEPALIVES_INTERVAL,
             "keepalives_count": PG_KEEPALIVES_COUNT,
-            "application_name": "vision_opct_schedule",
+            "application_name": "vision_opct_service",
         },
     )
-
 
 def _dispose_engine():
     global _ENGINE
@@ -244,7 +308,6 @@ def _dispose_engine():
     except Exception:
         pass
     _ENGINE = None
-
 
 def get_engine_blocking():
     global _ENGINE
@@ -261,7 +324,6 @@ def get_engine_blocking():
             _dispose_engine()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
-
 def _pg_conn_is_alive(conn) -> bool:
     try:
         if conn is None:
@@ -273,7 +335,6 @@ def _pg_conn_is_alive(conn) -> bool:
         return True
     except Exception:
         return False
-
 
 def get_conn_pg_blocking():
     global _PG_CONN
@@ -297,7 +358,7 @@ def get_conn_pg_blocking():
                     keepalives_idle=PG_KEEPALIVES_IDLE,
                     keepalives_interval=PG_KEEPALIVES_INTERVAL,
                     keepalives_count=PG_KEEPALIVES_COUNT,
-                    application_name="vision_opct_schedule",
+                    application_name="vision_opct_service",
                 )
                 _PG_CONN.autocommit = False
                 with _PG_CONN.cursor() as cur:
@@ -314,7 +375,6 @@ def get_conn_pg_blocking():
             _PG_CONN = None
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
-
 def close_db():
     global _ENGINE, _PG_CONN
     try:
@@ -327,7 +387,6 @@ def close_db():
     except Exception:
         pass
     _PG_CONN = None
-
     _dispose_engine()
 
 
@@ -402,7 +461,6 @@ def ensure_tables_and_indexes():
                 cur.execute(f"""ALTER TABLE "{TARGET_SCHEMA}".{TBL_HIST} ALTER COLUMN snapshot_ts SET DEFAULT now();""")
                 cur.execute(f"""ALTER TABLE "{TARGET_SCHEMA}".{TBL_HIST} ALTER COLUMN snapshot_ts SET NOT NULL;""")
 
-                # UNIQUE INDEX
                 cur.execute(f"""
                     CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_LATEST}_key
                     ON "{TARGET_SCHEMA}".{TBL_LATEST} (station, remark, month);
@@ -428,7 +486,6 @@ def ensure_tables_and_indexes():
     fix_id_sequence(TARGET_SCHEMA, TBL_HIST,   "vision_op_ct_hist_id_seq")
 
     log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"')
-
 
 def fix_id_sequence(schema: str, table: str, seq_name: str):
     do_sql = f"""
@@ -515,13 +572,11 @@ def boxplot_stats(values: np.ndarray) -> dict:
         "sample_amount": int(len(values)),
     }
 
-
 def make_plotly_box_json(values: np.ndarray, title: str) -> str:
     fig = go.Figure()
     fig.add_trace(go.Box(y=values.astype(float), boxpoints=False, name=title))
     fig.update_layout(title=title, showlegend=False)
     return fig.to_json(validate=False)
-
 
 def fmt_range(a: float, b: float) -> str:
     return f"{a:.2f}~{b:.2f}"
@@ -531,12 +586,6 @@ def fmt_range(a: float, b: float) -> str:
 # 4) only_run 판정/분석/summarize
 # =========================
 def mark_only_runs(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ✅ only-run 판정 로직:
-    - 시간순(end_dt 오름차순)으로 정렬 후
-    - station 변경 지점마다 run_id 부여
-    - run_len >= ONLY_RUN_MIN_LEN 이면서 Vision station 이면 only-run
-    """
     out = df.copy()
     if out is None or out.empty:
         out = pd.DataFrame(columns=list(df.columns) if df is not None else [])
@@ -554,7 +603,6 @@ def mark_only_runs(df: pd.DataFrame) -> pd.DataFrame:
     out["is_vision_only_run"] = is_vision_station & (out["run_len"] >= ONLY_RUN_MIN_LEN)
     return out
 
-
 def build_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -565,7 +613,6 @@ def build_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
     df_an = d.dropna(subset=["op_ct"]).copy()
     df_an = df_an[df_an["op_ct"] <= OPCT_MAX_SEC].copy()
     return df_an
-
 
 def summarize(df_an: pd.DataFrame) -> pd.DataFrame:
     if df_an is None or df_an.empty:
@@ -638,12 +685,6 @@ def summarize(df_an: pd.DataFrame) -> pd.DataFrame:
 # 5) 저장 (끊김 감지 + 무한 재시도)
 # =========================
 def _execute_values_retry(sql_text: str, rows: list, template: str, page_size: int = 2000):
-    """
-    ✅ psycopg2 재사용 연결에서:
-    - 실행 중 끊김/오류 발생 시 rollback
-    - 연결이 죽었으면 재연결
-    - 성공할 때까지 무한 재시도
-    """
     while True:
         conn = None
         try:
@@ -660,7 +701,6 @@ def _execute_values_retry(sql_text: str, rows: list, template: str, page_size: i
                     conn.rollback()
             except Exception:
                 pass
-            # 연결이 죽었으면 global conn 폐기 후 재연결
             if _is_conn_error(e):
                 try:
                     if conn:
@@ -670,7 +710,6 @@ def _execute_values_retry(sql_text: str, rows: list, template: str, page_size: i
                 global _PG_CONN
                 _PG_CONN = None
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
-
 
 def upsert_latest(summary_df: pd.DataFrame):
     if summary_df is None or summary_df.empty:
@@ -715,7 +754,6 @@ def upsert_latest(summary_df: pd.DataFrame):
     """
     template = "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb, now(), now())"
     _execute_values_retry(insert_sql, rows, template=template, page_size=2000)
-
 
 def upsert_hist_daily(summary_df: pd.DataFrame, snapshot_day: str):
     if summary_df is None or summary_df.empty:
@@ -764,17 +802,11 @@ def upsert_hist_daily(summary_df: pd.DataFrame, snapshot_day: str):
 
 
 # =========================
-# 6) 1회 실행 파이프라인 (스케줄 타임에만 호출)
+# 6) 1회 실행 파이프라인
 # =========================
 def run_pipeline_once(label: str):
-    """
-    - ✅ 무한루프 제거: '현재 월 데이터' 1회 계산/UPSERT
-    - ✅ 실행 중 DB 끊김 -> 무한 재시도(연결 복구 후 계속)
-    - ✅ cache_df/end_ts 보존 정책 유지
-    """
     log(f"[RUN] {label} | START")
 
-    # 엔진/PG 연결 확보(블로킹)
     eng = get_engine_blocking()
     get_conn_pg_blocking()
 
@@ -792,7 +824,6 @@ def run_pipeline_once(label: str):
     ORDER BY end_day ASC, end_time ASC
     """
 
-    # (1) 소스 로딩: ✅ 끊기면 dispose/rebuild 후 무한 재시도
     t0 = time_mod.time()
     while True:
         try:
@@ -819,7 +850,6 @@ def run_pipeline_once(label: str):
         log(f"[RUN] {label} | no rows in month={run_month} -> SKIP")
         return
 
-    # (2) end_ts 생성 (cache_df는 end_ts 유지)
     df["end_day"] = df["end_day"].astype(str).str.replace(r"\D", "", regex=True)
     df["end_time_str"] = df["end_time"].astype(str).str.strip()
     df["end_ts"] = pd.to_datetime(df["end_day"] + " " + df["end_time_str"], errors="coerce", format="mixed")
@@ -828,21 +858,18 @@ def run_pipeline_once(label: str):
         log(f"[RUN] {label} | all rows dropped by end_ts parse -> SKIP")
         return
 
-    # (3) op_ct/month 계산 (station,remark 기준)
     t1 = time_mod.time()
     cache_df = df[["station", "remark", "end_day", "end_time_str", "end_ts"]].copy()
     cache_df = cache_df.sort_values(["station", "remark", "end_ts"], kind="mergesort").reset_index(drop=True)
     cache_df["op_ct"] = cache_df.groupby(["station", "remark"])["end_ts"].diff().dt.total_seconds()
     cache_df["month"] = cache_df["end_ts"].dt.strftime("%Y%m")
 
-    # (4) 분석 직전 view에서만 end_dt로 변환
     df_for_analysis = cache_df.rename(columns={"end_ts": "end_dt"}).copy()
 
     df_marked = mark_only_runs(df_for_analysis)
     df_an = build_analysis_df(df_marked)
     summary_df = summarize(df_an) if df_an is not None and not df_an.empty else pd.DataFrame()
 
-    # (5) 저장: ✅ psycopg2 연결이 끊겨도 내부에서 무한 재시도
     if summary_df is not None and not summary_df.empty:
         upsert_latest(summary_df)
         upsert_hist_daily(summary_df, snapshot_day=today_yyyymmdd())
@@ -855,59 +882,48 @@ def run_pipeline_once(label: str):
 
 
 # =========================
-# main: 08:22 / 20:22 에만 실행 후 종료(2회 완료되면 종료)
+# main: ✅ 상주 서비스 모드 (매일 08:22/20:22 실행, 종료하지 않음)
 # =========================
 def main():
     start_dt = datetime.now()
     log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
-    log("=== SCHEDULE MODE: run only at 08:22 and 20:22 then exit ===")
-    log(f"wait_interval={WAIT_INTERVAL_SEC}s | fetch_limit={FETCH_LIMIT} | work_mem={WORK_MEM}")
-    log(
-        f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT} "
-        f"| sqlalchemy pool_size=1 max_overflow=0"
-    )
+    log("=== SERVICE MODE: stay resident; run daily at 08:22 and 20:22 ===")
+    log(f"work_mem={WORK_MEM} | keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}")
+    log(f"[LOG] tee_path={LOG_PATH}")
 
-    # ✅ DB 준비(블로킹) + 스키마/테이블 보장
+    # DB 준비(블로킹) + 테이블 보장
     get_engine_blocking()
     get_conn_pg_blocking()
     ensure_tables_and_indexes()
 
-    ran_1 = False
-    ran_2 = False
+    # 오늘 RUN_08_22 / RUN_20_22 실행 여부(날짜로 추적)
+    ran_1_day: date | None = None
+    ran_2_day: date | None = None
 
     try:
         while True:
             now = datetime.now()
-            t1_dt, t2_dt = _next_run_datetimes(now)
+            today = now.date()
 
-            # now가 이미 지난 경우라도 아직 실행 안 했으면 즉시 실행
-            if (not ran_1) and (now >= t1_dt):
+            t1_dt = _slot_dt_for(today, RUN_TIME_1)
+            t2_dt = _slot_dt_for(today, RUN_TIME_2)
+
+            # 이미 시간이 지났는데 오늘 실행 안 했으면 즉시 실행
+            if now >= t1_dt and ran_1_day != today:
                 run_pipeline_once("RUN_08_22")
-                ran_1 = True
+                ran_1_day = today
 
-            if (not ran_2) and (now >= t2_dt):
+            if now >= t2_dt and ran_2_day != today:
                 run_pipeline_once("RUN_20_22")
-                ran_2 = True
+                ran_2_day = today
 
-            if ran_1 and ran_2:
-                log("[DONE] both schedules executed -> exit")
-                return
+            # 다음 목표시간 계산
+            next_dt = _next_slot_target(now, ran_1_day, ran_2_day)
+            ran_1 = (ran_1_day == today)
+            ran_2 = (ran_2_day == today)
 
-            next_targets = []
-            if not ran_1:
-                next_targets.append(t1_dt)
-            if not ran_2:
-                next_targets.append(t2_dt)
-
-            if not next_targets:
-                log("[DONE] no remaining targets -> exit")
-                return
-
-            next_dt = min(next_targets)
-            if IDLE_HEARTBEAT:
-                log(f"[WAIT] now={now:%H:%M:%S} | next={next_dt:%H:%M:%S} | ran_1={ran_1} ran_2={ran_2}")
-
-            _sleep_until(next_dt)
+            # 다음 실행까지 대기(하트비트 포함)
+            _sleep_with_heartbeat_until(next_dt, ran_1, ran_2)
 
     finally:
         close_db()
@@ -918,12 +934,8 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         log("[INTERRUPT] 사용자 중단")
-        pause_on_exit(0)
+        raise
     except Exception:
         log("\n[ERROR] 예외 발생")
-        import traceback
         traceback.print_exc()
-        pause_on_exit(1)
-    else:
-        if getattr(sys, "frozen", False):
-            _hard_pause_console()
+        raise

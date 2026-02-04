@@ -20,6 +20,17 @@ e5_pd_board_check.py  (SCHEDULED LOOP VERSION)
    - robust threshold(MAD) + status + 연속경보(streak)
    - e4_predictive_maintenance.pd_board_check 에
      (station,end_day) PK로 UPSERT 저장
+
+✅ 이번 요청 추가 반영(핵심)
+- ✅ 실행 중 서버 연결이 끊겨도(네트워크/서버 재시작 등)
+     - SELECT/READ/UPSERT/DDL 전 구간에서 "연결 복구까지 무한 재시도"
+     - SQLAlchemy engine dispose/rebuild 후 재시도
+- ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
+- ✅ 백엔드별 상시 연결 1개로 고정(풀 최소화)
+  * SQLAlchemy engine: pool_size=1, max_overflow=0
+  * 엔진은 프로세스에서 1개만 생성/유지(죽으면 폐기 후 재생성)
+- ✅ work_mem 폭증 방지: 세션마다 SET work_mem 적용
+- ✅ 무한 루프 인터벌 5초: 반영하지 않음(기존 1초 루프 + 50초 실행 유지)
 """
 
 import json
@@ -30,13 +41,14 @@ from datetime import datetime, timezone, date, timedelta, time as dtime
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError, DBAPIError, SQLAlchemyError
 
 
 # =========================
 # 0) DB 설정
 # =========================
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -52,6 +64,17 @@ TARGET_TABLE = "pd_board_check"
 PATTERN_TABLE = "predictive_maintenance"
 NORMAL_PATTERN_NAME = "pd_board_normal_ref"
 ABN_PATTERN_NAME = "pd_board_degradation_ref"
+
+# ✅ 연결/리소스 제한
+DB_RETRY_INTERVAL_SEC = 5
+CONNECT_TIMEOUT_SEC = 5
+WORK_MEM = "4MB"  # 필요 시 더 낮춰도 됨(예: 2MB)
+
+# ✅ keepalive(선택): 끊김을 빠르게 감지하고 재연결 유도
+PG_KEEPALIVES = 1
+PG_KEEPALIVES_IDLE = 30
+PG_KEEPALIVES_INTERVAL = 10
+PG_KEEPALIVES_COUNT = 3
 
 
 # =========================
@@ -76,7 +99,7 @@ WIN2_END   = dtime(20, 29, 59)
 # 윈도우 내 "실제 실행" 간격(초)
 RUN_EVERY_SEC = 50
 
-# 루프 대기(초)
+# 루프 대기(초)  ✅ 기존대로 유지(1초 루프)
 SLEEP_SEC = 1
 
 
@@ -91,16 +114,291 @@ def yyyymmdd_today() -> str:
     return date.today().strftime("%Y%m%d")
 
 
-def get_engine(cfg=DB_CONFIG):
+def _is_conn_error(e: Exception) -> bool:
+    """
+    연결 끊김/네트워크/DB 재시작 계열 오류 감지(넓게).
+    """
+    if isinstance(e, (OperationalError, DBAPIError)):
+        return True
+    msg = (str(e) or "").lower()
+    keys = [
+        "server closed the connection",
+        "terminating connection",
+        "connection not open",
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+        "ssl connection has been closed",
+        "broken pipe",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+        "admin shutdown",
+        "the database system is starting up",
+        "the database system is in recovery mode",
+    ]
+    return any(k in msg for k in keys)
+
+
+# =========================
+# 2-1) DB 연결: 상시 1개 + 무한 재시도 + work_mem 제한
+# =========================
+_ENGINE = None
+
+
+def _build_engine(cfg=DB_CONFIG):
     user = cfg["user"]
     password = urllib.parse.quote_plus(cfg["password"])
     host = cfg["host"]
     port = cfg["port"]
     dbname = cfg["dbname"]
-    conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
-    return create_engine(conn_str, pool_pre_ping=True)
+
+    # connect_timeout은 URL 파라미터로 전달
+    conn_str = (
+        f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+        f"?connect_timeout={CONNECT_TIMEOUT_SEC}"
+    )
+
+    # ✅ 풀 최소화: 상시 1개(overflow 0)
+    return create_engine(
+        conn_str,
+        pool_pre_ping=True,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=30,
+        pool_recycle=300,
+        future=True,
+        connect_args={
+            "connect_timeout": CONNECT_TIMEOUT_SEC,
+            "keepalives": PG_KEEPALIVES,
+            "keepalives_idle": PG_KEEPALIVES_IDLE,
+            "keepalives_interval": PG_KEEPALIVES_INTERVAL,
+            "keepalives_count": PG_KEEPALIVES_COUNT,
+            "application_name": "e5_pd_board_check",
+        },
+    )
 
 
+def _dispose_engine():
+    global _ENGINE
+    try:
+        if _ENGINE is not None:
+            _ENGINE.dispose()
+    except Exception:
+        pass
+    _ENGINE = None
+
+
+def get_engine_blocking():
+    """
+    - DB 접속 성공할 때까지 무한 재시도(블로킹)
+    - 성공 후에도 engine 1개를 계속 재사용
+    - work_mem은 연결마다 보장(아래 helper로 세팅)
+    """
+    global _ENGINE
+    while True:
+        try:
+            if _ENGINE is None:
+                _ENGINE = _build_engine(DB_CONFIG)
+
+            with _ENGINE.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text("SELECT 1"))
+            return _ENGINE
+
+        except Exception as e:
+            log(f"[DB][RETRY] engine connect failed: {type(e).__name__}: {repr(e)}")
+            _dispose_engine()
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def exec_with_work_mem_blocking(engine, sql_text, params=None):
+    """
+    ✅ 모든 execute를 "연결 복구까지 무한 재시도"로 감싼 wrapper
+    - work_mem 강제
+    - connection error면 engine dispose 후 재획득
+    """
+    eng = engine
+    while True:
+        try:
+            with eng.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                return conn.execute(sql_text, params or {})
+        except Exception as e:
+            log(f"[DB][RETRY] exec failed: {type(e).__name__}: {repr(e)}")
+            if _is_conn_error(e):
+                _dispose_engine()
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+            eng = get_engine_blocking()
+
+
+def read_sql_with_work_mem_blocking(engine, sql_text, params=None):
+    """
+    ✅ pd.read_sql도 "연결 복구까지 무한 재시도"
+    """
+    eng = engine
+    while True:
+        try:
+            with eng.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                return pd.read_sql(sql_text, conn, params=params or {})
+        except Exception as e:
+            log(f"[DB][RETRY] read_sql failed: {type(e).__name__}: {repr(e)}")
+            if _is_conn_error(e):
+                _dispose_engine()
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+            eng = get_engine_blocking()
+
+
+# (기존 이름 유지가 필요하면 alias)
+def exec_with_work_mem(engine, sql_text, params=None):
+    return exec_with_work_mem_blocking(engine, sql_text, params=params)
+
+
+def read_sql_with_work_mem(engine, sql_text, params=None):
+    return read_sql_with_work_mem_blocking(engine, sql_text, params=params)
+
+
+# =========================
+# 3) 패턴 로드
+# =========================
+def load_pattern(engine, station, step_desc, pattern_name):
+    q = text(f"""
+        SELECT euclid_graph
+        FROM {TARGET_SCHEMA}.{PATTERN_TABLE}
+        WHERE station=:station
+          AND step_description=:step_desc
+          AND pattern_name=:pattern_name
+    """)
+    row = exec_with_work_mem(engine, q, {
+        "station": station,
+        "step_desc": step_desc,
+        "pattern_name": pattern_name
+    }).fetchone()
+
+    if row is None:
+        raise ValueError(f"[ERROR] Pattern not found: station={station}, pattern={pattern_name}")
+
+    g = row[0]
+    if isinstance(g, str):
+        g = json.loads(g)
+    return g
+
+
+# =========================
+# 4) last_date 산출 + start_day/end_day 자동 계산
+# =========================
+def get_last_date_from_source(engine, stations, step_desc) -> str:
+    """
+    소스 테이블에서 조건에 맞는 최신 end_day(YYYYMMDD)를 산출.
+    end_day가 TEXT일 수 있으므로 숫자만 남긴 후 max로 구함(YYYYMMDD는 문자열 max == 날짜 max).
+    """
+    q = text(f"""
+        SELECT
+            MAX(substring(regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') from 1 for 8)) AS last_day
+        FROM {SRC_SCHEMA}.{SRC_TABLE}
+        WHERE trim(station) = ANY(:stations)
+          AND step_description = :step_desc
+          AND regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') ~ '^[0-9]{{8}}'
+    """)
+
+    row = exec_with_work_mem(engine, q, {"stations": stations, "step_desc": step_desc}).fetchone()
+
+    last_day = row[0] if row else None
+    if last_day is None or str(last_day).strip() == "":
+        raise ValueError("[ERROR] last_date not found in source (조건 불일치 또는 end_day 포맷 문제).")
+
+    last_day = str(last_day).strip()[:8]
+    if len(last_day) != 8:
+        raise ValueError(f"[ERROR] invalid last_date={last_day}")
+
+    return last_day
+
+
+def calc_start_end_days(engine) -> tuple[str, str, str]:
+    """
+    start_day = last_date - 7일
+    end_day   = 오늘 날짜
+    last_date = 소스 최신일
+    """
+    end_day = yyyymmdd_today()
+    last_date = get_last_date_from_source(engine, STATIONS, STEP_DESC)
+
+    last_dt = datetime.strptime(last_date, "%Y%m%d").date()
+    start_dt = last_dt - timedelta(days=7)
+    start_day = start_dt.strftime("%Y%m%d")
+
+    return start_day, last_date, end_day
+
+
+# =========================
+# 5) 원천 데이터 조회 → 일자 평균 (YYYYMMDD 기준으로 통일)
+# =========================
+def load_avg_df(engine, stations, start_day, end_day, step_desc):
+    """
+    반환: station, end_day_norm(YYYYMMDD), value_avg, sample_amount
+    """
+    sql = text(f"""
+        SELECT
+            trim(end_day)   AS end_day_raw,
+            trim(station)   AS station,
+            value
+        FROM {SRC_SCHEMA}.{SRC_TABLE}
+        WHERE trim(station) = ANY(:stations)
+          AND step_description = :step_desc
+          AND regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') >= :start_day
+          AND regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') <= :end_day
+        ORDER BY station, end_day_raw
+    """)
+
+    raw = read_sql_with_work_mem(engine, sql, params={
+        "stations": stations,
+        "start_day": start_day,
+        "end_day": end_day,
+        "step_desc": step_desc
+    })
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    if raw.empty:
+        raise ValueError("[ERROR] raw is empty. (station/date/step_description 조건 불일치)")
+
+    # value 숫자화
+    raw["value_num"] = pd.to_numeric(raw["value"], errors="coerce")
+    if raw["value_num"].notna().sum() == 0:
+        raw["value_num"] = raw["value"].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
+        raw["value_num"] = pd.to_numeric(raw["value_num"], errors="coerce")
+
+    raw = raw.dropna(subset=["value_num"]).copy()
+    if raw.empty:
+        raise ValueError("[ERROR] value_num is empty after numeric parsing. (value 포맷 확인 필요)")
+
+    # end_day 정규화(숫자 8자리)
+    raw["end_day_norm"] = (
+        raw["end_day_raw"]
+        .astype(str)
+        .str.replace(r"[^0-9]", "", regex=True)
+        .str.zfill(8)
+        .str.slice(0, 8)
+    )
+    raw = raw[raw["end_day_norm"].str.match(r"^\d{8}$", na=False)].copy()
+    if raw.empty:
+        raise ValueError("[ERROR] end_day_norm empty after normalization. (end_day 포맷 확인 필요)")
+
+    avg_df = (
+        raw.groupby(["station", "end_day_norm"], as_index=False)
+           .agg(value_avg=("value_num", "mean"),
+                sample_amount=("value_num", "count"))
+           .sort_values(["station", "end_day_norm"])
+           .reset_index(drop=True)
+    )
+    avg_df["value_avg"] = avg_df["value_avg"].round(4)
+    return avg_df
+
+
+# =========================
+# 6) compare_df 생성
+# =========================
 def window_vector_from_values(values):
     """일자 평균 시계열 → 5차원 특성 벡터"""
     values = np.asarray(values, dtype=float)
@@ -178,147 +476,6 @@ def make_ts_json(df_station: pd.DataFrame, x_col: str, y_col: str, th_value=None
     return sanitize_for_json(payload)
 
 
-def in_any_window(now: datetime) -> bool:
-    t = now.time()
-    return (WIN1_START <= t <= WIN1_END) or (WIN2_START <= t <= WIN2_END)
-
-
-# =========================
-# 3) 패턴 로드
-# =========================
-def load_pattern(engine, station, step_desc, pattern_name):
-    q = text(f"""
-        SELECT euclid_graph
-        FROM {TARGET_SCHEMA}.{PATTERN_TABLE}
-        WHERE station=:station
-          AND step_description=:step_desc
-          AND pattern_name=:pattern_name
-    """)
-    with engine.begin() as conn:
-        row = conn.execute(q, {"station": station, "step_desc": step_desc, "pattern_name": pattern_name}).fetchone()
-    if row is None:
-        raise ValueError(f"[ERROR] Pattern not found: station={station}, pattern={pattern_name}")
-
-    g = row[0]
-    if isinstance(g, str):
-        g = json.loads(g)
-    return g
-
-
-# =========================
-# 4) last_date 산출 + start_day/end_day 자동 계산
-# =========================
-def get_last_date_from_source(engine, stations, step_desc) -> str:
-    """
-    소스 테이블에서 조건에 맞는 최신 end_day(YYYYMMDD)를 산출.
-    end_day가 TEXT일 수 있으므로 숫자만 남긴 후 max로 구함(YYYYMMDD는 문자열 max == 날짜 max).
-    """
-    q = text(f"""
-        SELECT
-            MAX(substring(regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') from 1 for 8)) AS last_day
-        FROM {SRC_SCHEMA}.{SRC_TABLE}
-        WHERE trim(station) = ANY(:stations)
-          AND step_description = :step_desc
-          AND regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') ~ '^[0-9]{{8}}'
-    """)
-    with engine.begin() as conn:
-        row = conn.execute(q, {"stations": stations, "step_desc": step_desc}).fetchone()
-
-    last_day = row[0] if row else None
-    if last_day is None or str(last_day).strip() == "":
-        raise ValueError("[ERROR] last_date not found in source (조건 불일치 또는 end_day 포맷 문제).")
-
-    last_day = str(last_day).strip()[:8]
-    if len(last_day) != 8:
-        raise ValueError(f"[ERROR] invalid last_date={last_day}")
-
-    return last_day
-
-
-def calc_start_end_days(engine) -> tuple[str, str, str]:
-    """
-    start_day = last_date - 7일
-    end_day   = 오늘 날짜
-    last_date = 소스 최신일
-    """
-    end_day = yyyymmdd_today()
-    last_date = get_last_date_from_source(engine, STATIONS, STEP_DESC)
-
-    last_dt = datetime.strptime(last_date, "%Y%m%d").date()
-    start_dt = last_dt - timedelta(days=7)
-    start_day = start_dt.strftime("%Y%m%d")
-
-    return start_day, last_date, end_day
-
-
-# =========================
-# 5) 원천 데이터 조회 → 일자 평균 (YYYYMMDD 기준으로 통일)
-# =========================
-def load_avg_df(engine, stations, start_day, end_day, step_desc):
-    """
-    반환: station, end_day_norm(YYYYMMDD), value_avg, sample_amount
-    """
-    sql = text(f"""
-        SELECT
-            trim(end_day)   AS end_day_raw,
-            trim(station)   AS station,
-            value
-        FROM {SRC_SCHEMA}.{SRC_TABLE}
-        WHERE trim(station) = ANY(:stations)
-          AND step_description = :step_desc
-          AND regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') >= :start_day
-          AND regexp_replace(trim(COALESCE(end_day,'')), '\\D', '', 'g') <= :end_day
-        ORDER BY station, end_day_raw
-    """)
-
-    with engine.begin() as conn:
-        raw = pd.read_sql(sql, conn, params={
-            "stations": stations,
-            "start_day": start_day,
-            "end_day": end_day,
-            "step_desc": step_desc
-        })
-
-    raw.columns = [str(c).strip() for c in raw.columns]
-    if raw.empty:
-        raise ValueError("[ERROR] raw is empty. (station/date/step_description 조건 불일치)")
-
-    # value 숫자화
-    raw["value_num"] = pd.to_numeric(raw["value"], errors="coerce")
-    if raw["value_num"].notna().sum() == 0:
-        raw["value_num"] = raw["value"].astype(str).str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
-        raw["value_num"] = pd.to_numeric(raw["value_num"], errors="coerce")
-
-    raw = raw.dropna(subset=["value_num"]).copy()
-    if raw.empty:
-        raise ValueError("[ERROR] value_num is empty after numeric parsing. (value 포맷 확인 필요)")
-
-    # end_day 정규화(숫자 8자리)
-    raw["end_day_norm"] = (
-        raw["end_day_raw"]
-        .astype(str)
-        .str.replace(r"[^0-9]", "", regex=True)
-        .str.zfill(8)
-        .str.slice(0, 8)
-    )
-    raw = raw[raw["end_day_norm"].str.match(r"^\d{8}$", na=False)].copy()
-    if raw.empty:
-        raise ValueError("[ERROR] end_day_norm empty after normalization. (end_day 포맷 확인 필요)")
-
-    avg_df = (
-        raw.groupby(["station", "end_day_norm"], as_index=False)
-           .agg(value_avg=("value_num", "mean"),
-                sample_amount=("value_num", "count"))
-           .sort_values(["station", "end_day_norm"])
-           .reset_index(drop=True)
-    )
-    avg_df["value_avg"] = avg_df["value_avg"].round(4)
-    return avg_df
-
-
-# =========================
-# 6) compare_df 생성
-# =========================
 def build_compare_df(avg_df_all: pd.DataFrame,
                      V_normal: np.ndarray,
                      A_ref: np.ndarray,
@@ -459,55 +616,108 @@ def build_dfi_and_summary(compare_df: pd.DataFrame, start_day: str, end_day: str
 
 
 # =========================
-# 8) pd_board_check 테이블 생성 + UPSERT
+# 8) pd_board_check 테이블 생성 + UPSERT (연결 끊김에도 무한 재시도)
 # =========================
 def ensure_pd_board_check(engine):
-    with engine.begin() as conn:
-        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA};"))
+    exec_with_work_mem(engine, text(f"CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA};"))
 
-        conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.{TARGET_TABLE} (
-                station TEXT NOT NULL,
-                start_day TEXT NOT NULL,
-                last_date TEXT,
-                end_day TEXT NOT NULL,
+    exec_with_work_mem(engine, text(f"""
+        CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.{TARGET_TABLE} (
+            station TEXT NOT NULL,
+            start_day TEXT NOT NULL,
+            last_date TEXT,
+            end_day TEXT NOT NULL,
 
-                last_status TEXT,
-                last_score NUMERIC(12,4),
-                th_score   NUMERIC(12,4),
-                last_cos   NUMERIC(12,6),
-                max_score  NUMERIC(12,4),
-                max_cos    NUMERIC(12,6),
-                max_streak INT,
-                crit_days  INT,
-                warn_days  INT,
+            last_status TEXT,
+            last_score NUMERIC(12,4),
+            th_score   NUMERIC(12,4),
+            last_cos   NUMERIC(12,6),
+            max_score  NUMERIC(12,4),
+            max_cos    NUMERIC(12,6),
+            max_streak INT,
+            crit_days  INT,
+            warn_days  INT,
 
-                cosine_similarity JSONB,
-                score_from_normal JSONB,
+            cosine_similarity JSONB,
+            score_from_normal JSONB,
 
-                run_start_ts TIMESTAMPTZ,
-                run_end_ts   TIMESTAMPTZ,
+            run_start_ts TIMESTAMPTZ,
+            run_end_ts   TIMESTAMPTZ,
 
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (station, end_day)
-            );
-        """))
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (station, end_day)
+        );
+    """))
 
-        cols = conn.execute(text("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = :s AND table_name = :t
-        """), {"s": TARGET_SCHEMA, "t": TARGET_TABLE}).fetchall()
-        existing = {c[0] for c in cols}
+    cols = exec_with_work_mem(engine, text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = :s AND table_name = :t
+    """), {"s": TARGET_SCHEMA, "t": TARGET_TABLE}).fetchall()
+    existing = {c[0] for c in cols}
 
-        def add_col_if_missing(col_name: str, ddl: str):
-            if col_name not in existing:
-                conn.execute(text(f"ALTER TABLE {TARGET_SCHEMA}.{TARGET_TABLE} ADD COLUMN {ddl};"))
+    def add_col_if_missing(col_name: str, ddl: str):
+        if col_name not in existing:
+            exec_with_work_mem(engine, text(f"ALTER TABLE {TARGET_SCHEMA}.{TARGET_TABLE} ADD COLUMN {ddl};"))
 
-        add_col_if_missing("cosine_similarity", "cosine_similarity JSONB")
-        add_col_if_missing("score_from_normal", "score_from_normal JSONB")
-        add_col_if_missing("run_start_ts", "run_start_ts TIMESTAMPTZ")
-        add_col_if_missing("run_end_ts", "run_end_ts TIMESTAMPTZ")
+    add_col_if_missing("cosine_similarity", "cosine_similarity JSONB")
+    add_col_if_missing("score_from_normal", "score_from_normal JSONB")
+    add_col_if_missing("run_start_ts", "run_start_ts TIMESTAMPTZ")
+    add_col_if_missing("run_end_ts", "run_end_ts TIMESTAMPTZ")
+
+
+def _upsert_pd_board_check_blocking(engine, payloads: list[dict], end_day: str):
+    upsert_sql = text(f"""
+        INSERT INTO {TARGET_SCHEMA}.{TARGET_TABLE} (
+            station, start_day, last_date, end_day,
+            last_status, last_score, th_score, last_cos,
+            max_score, max_cos, max_streak, crit_days, warn_days,
+            cosine_similarity, score_from_normal,
+            run_start_ts, run_end_ts,
+            updated_at
+        ) VALUES (
+            :station, :start_day, :last_date, :end_day,
+            :last_status, :last_score, :th_score, :last_cos,
+            :max_score, :max_cos, :max_streak, :crit_days, :warn_days,
+            CAST(:cosine_similarity AS JSONB),
+            CAST(:score_from_normal AS JSONB),
+            :run_start_ts, :run_end_ts,
+            NOW()
+        )
+        ON CONFLICT (station, end_day)
+        DO UPDATE SET
+            start_day = EXCLUDED.start_day,
+            last_date = EXCLUDED.last_date,
+            last_status = EXCLUDED.last_status,
+            last_score = EXCLUDED.last_score,
+            th_score = EXCLUDED.th_score,
+            last_cos = EXCLUDED.last_cos,
+            max_score = EXCLUDED.max_score,
+            max_cos = EXCLUDED.max_cos,
+            max_streak = EXCLUDED.max_streak,
+            crit_days = EXCLUDED.crit_days,
+            warn_days = EXCLUDED.warn_days,
+            cosine_similarity = EXCLUDED.cosine_similarity,
+            score_from_normal = EXCLUDED.score_from_normal,
+            run_start_ts = EXCLUDED.run_start_ts,
+            run_end_ts   = EXCLUDED.run_end_ts,
+            updated_at = NOW();
+    """)
+
+    eng = engine
+    while True:
+        try:
+            with eng.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(upsert_sql, payloads)
+            log(f"[OK] pd_board_check UPSERT done | end_day={end_day} | rows={len(payloads)}")
+            return
+        except Exception as e:
+            log(f"[DB][RETRY] upsert failed: {type(e).__name__}: {repr(e)}")
+            if _is_conn_error(e):
+                _dispose_engine()
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+            eng = get_engine_blocking()
 
 
 def upsert_pd_board_check(engine, dfi: pd.DataFrame, summary: pd.DataFrame,
@@ -555,47 +765,7 @@ def upsert_pd_board_check(engine, dfi: pd.DataFrame, summary: pd.DataFrame,
             "run_end_ts": run_end_ts,
         })
 
-    upsert_sql = text(f"""
-        INSERT INTO {TARGET_SCHEMA}.{TARGET_TABLE} (
-            station, start_day, last_date, end_day,
-            last_status, last_score, th_score, last_cos,
-            max_score, max_cos, max_streak, crit_days, warn_days,
-            cosine_similarity, score_from_normal,
-            run_start_ts, run_end_ts,
-            updated_at
-        ) VALUES (
-            :station, :start_day, :last_date, :end_day,
-            :last_status, :last_score, :th_score, :last_cos,
-            :max_score, :max_cos, :max_streak, :crit_days, :warn_days,
-            CAST(:cosine_similarity AS JSONB),
-            CAST(:score_from_normal AS JSONB),
-            :run_start_ts, :run_end_ts,
-            NOW()
-        )
-        ON CONFLICT (station, end_day)
-        DO UPDATE SET
-            start_day = EXCLUDED.start_day,
-            last_date = EXCLUDED.last_date,
-            last_status = EXCLUDED.last_status,
-            last_score = EXCLUDED.last_score,
-            th_score = EXCLUDED.th_score,
-            last_cos = EXCLUDED.last_cos,
-            max_score = EXCLUDED.max_score,
-            max_cos = EXCLUDED.max_cos,
-            max_streak = EXCLUDED.max_streak,
-            crit_days = EXCLUDED.crit_days,
-            warn_days = EXCLUDED.warn_days,
-            cosine_similarity = EXCLUDED.cosine_similarity,
-            score_from_normal = EXCLUDED.score_from_normal,
-            run_start_ts = EXCLUDED.run_start_ts,
-            run_end_ts   = EXCLUDED.run_end_ts,
-            updated_at = NOW();
-    """)
-
-    with engine.begin() as conn:
-        conn.execute(upsert_sql, payloads)
-
-    log(f"[OK] pd_board_check UPSERT done | end_day={end_day} | rows={len(payloads)}")
+    _upsert_pd_board_check_blocking(engine, payloads, end_day=end_day)
 
 
 # =========================
@@ -604,11 +774,11 @@ def upsert_pd_board_check(engine, dfi: pd.DataFrame, summary: pd.DataFrame,
 def run_once(engine):
     run_start_ts = datetime.now(timezone.utc)
 
-    # 날짜 자동 산출
+    # ✅ 날짜 자동 산출(이 과정도 연결 끊기면 무한 재시도)
     start_day, last_date, end_day = calc_start_end_days(engine)
     log(f"[INFO] start_day={start_day} | last_date={last_date} | end_day(today)={end_day}")
 
-    # 패턴 로드 (FCT2 기준)
+    # ✅ 패턴 로드(끊김 시 무한 재시도)
     g_normal = load_pattern(engine, "FCT2", STEP_DESC, NORMAL_PATTERN_NAME)
     g_abn = load_pattern(engine, "FCT2", STEP_DESC, ABN_PATTERN_NAME)
 
@@ -616,7 +786,7 @@ def run_once(engine):
     V_normal = np.array([g_normal["reference_pattern"][k] for k in FEATURES], dtype=float)
     A_ref = np.array([g_abn["reference_pattern"][k] for k in FEATURES], dtype=float)
 
-    # 원천 → 일자 평균
+    # ✅ 원천 → 일자 평균(끊김 시 무한 재시도)
     avg_df_all = load_avg_df(engine, STATIONS, start_day, end_day, STEP_DESC)
 
     # compare_df
@@ -627,7 +797,7 @@ def run_once(engine):
 
     run_end_ts = datetime.now(timezone.utc)
 
-    # 저장(UPSERT)
+    # ✅ 저장(UPSERT) (끊김 시 무한 재시도)
     upsert_pd_board_check(
         engine, dfi, summary,
         start_day=start_day,
@@ -638,12 +808,19 @@ def run_once(engine):
 
 
 # =========================
-# 10) 스케줄 루프
+# 10) 스케줄 루프 (기존 스펙 그대로)
 # =========================
+def in_any_window(now: datetime) -> bool:
+    t = now.time()
+    return (WIN1_START <= t <= WIN1_END) or (WIN2_START <= t <= WIN2_END)
+
+
 def main():
-    engine = get_engine()
-    log("[OK] engine ready")
+    # ✅ DB 접속 성공할 때까지 블로킹 + 엔진 1개 상시 유지
+    engine = get_engine_blocking()
+    log("[OK] engine ready (blocking ensured)")
     log(f"[SCHEDULE] WIN1={WIN1_START}~{WIN1_END}, WIN2={WIN2_START}~{WIN2_END} | run_every={RUN_EVERY_SEC}s")
+    log(f"[DB] pool_size=1 max_overflow=0 | work_mem={WORK_MEM}")
 
     last_exec_dt = None
     was_in_window = False
@@ -655,7 +832,6 @@ def main():
         if not inside:
             # 윈도우 밖: 대기만
             if was_in_window:
-                # 윈도우를 벗어나면 다음 윈도우에서 즉시 실행 가능하도록 리셋
                 last_exec_dt = None
                 was_in_window = False
                 log("[INFO] left run window -> reset interval state")
@@ -678,13 +854,25 @@ def main():
 
         if do_run:
             last_exec_dt = now
+
+            # ✅ 실행 중간에 DB가 끊겨도 run_once 내부에서 무한 복구하지만,
+            #    시작 전에 가볍게 ping을 넣어 더 빨리 감지하도록 함.
             try:
+                with engine.connect() as conn:
+                    conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                    conn.execute(text("SELECT 1"))
+
                 log(f"[RUN] start at {now.strftime('%Y-%m-%d %H:%M:%S')}")
                 run_once(engine)
                 log(f"[RUN] end   at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
             except Exception as e:
-                # 어떤 예외도 루프를 멈추지 않음
-                log(f"[ERROR] run_once failed: {repr(e)}")
+                log(f"[ERROR] run_once failed: {type(e).__name__}: {repr(e)}")
+                # ✅ 연결 오류라면 엔진을 폐기하고 "연결 성공까지" 다시 확보
+                if _is_conn_error(e):
+                    _dispose_engine()
+                engine = get_engine_blocking()
+                log("[DB] engine re-acquired after failure (blocking ensured)")
 
         time.sleep(SLEEP_SEC)
 

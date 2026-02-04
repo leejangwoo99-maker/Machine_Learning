@@ -1,36 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-Factory Realtime - FCT Non Operation Time Inspector (cursor incremental)
+Factory Realtime - Vision Non Operation Time Inspector (cursor incremental)
 
 목적
-- d1_machine_log.FCT1~4_machine_log 에서
-  a) "TEST RESULT :: OK|NG" 이후
-  b) "TEST AUTO MODE START" 까지의 시간차를 no_operation_time(초)로 계산
-- (변경) g_production_film.fct_op_criteria 의 임계값(upper_outlier max)과 비교하여
-  no_operation_time > threshold 인 경우만 이벤트로 확정(real_no_operation_time=1)
-- 이벤트를 g_production_film.fct_non_operation_time 로 UPSERT 저장
-- (end_day, station)별로 마지막 처리 end_ts 를 커서 테이블에 저장하여 중복 처리 방지
-
-임계값 사양(확정 반영)
-- 스키마: g_production_film, 테이블: fct_op_criteria
-- 컬럼 month: TEXT(yyyymm)
-- 1) KST 기준 "이전 달" month를 우선 선택
-- 2) 해당 month 행들의 upper_outlier(double precision) 중 최댓값을 임계값으로 사용
-- 3) (C) 이전 달이 없으면 테이블에 존재하는 최신 month(MAX(month))로 fallback 후,
-       그 month의 upper_outlier 최댓값을 사용
-- 4) station 컬럼 없음 → FCT1~4 모두 동일 임계값 적용(초 단위)
+- d1_machine_log.Vision1~2_machine_log 에서
+  a) "검사 양품 신호 출력" 또는 "검사 불량 신호 출력" 이후
+  b) "바코드 스캔 신호 수신" 까지의 시간차를 no_operation_time(초)로 계산
+- g_production_film.op_ct_gap 의 del_out_av(Vision1/Vision2) 임계값과 비교하여
+  no_operation_time > del_out_av 인 경우만 이벤트로 확정(real_no_operation_time=1)
+- 이벤트를 g_production_film.vision_non_operation_time 로 UPSERT 저장
+- (end_day, station)별 커서(last_end_ts) 테이블로 중복 처리 방지
 
 요청 반영(수정/추가)
 - DB: 100.105.75.47:5432/postgres
-- 멀티프로세스: 1개 (단일 프로세스 순차 처리)
+- 멀티프로세스: 1개 (병렬 계산 제거/단일 프로세스 순차 처리)
 - 무한 루프: 5초 주기
 - ✅ 실행 중간에 서버가 끊겨도, "연결 성공할 때까지" 무한 재접속(블로킹) + 정상 복구 후 재개
-- 풀 최소화: pool_size=1, max_overflow=0
+- 백엔드별 상시 연결을 1개로 고정(풀 최소화: pool_size=1, max_overflow=0)
 - work_mem 폭증 방지: 세션 단위 SET work_mem 적용 (+옵션 statement_timeout)
 - 콘솔: 매 루프 시작/종료 시간 출력, EXE 실행 시 콘솔 자동 종료 방지
 
-주의
-- end_time 포맷은 "%H:%M:%S" 또는 "%H:%M:%S.%f" 를 모두 허용
+추가(진단/디버그)
+- 실행 폴더에 diag_YYYYMMDD_HHMMSS.log 로그 파일 생성
+- 시작 시 ping/port/psycopg2/SQLAlchemy 진단
+- EXE 환경에서 multiprocessing 안정화(freeze_support)
 """
 
 import os
@@ -41,8 +34,6 @@ import traceback
 import subprocess
 import multiprocessing as mp
 from datetime import datetime
-from zoneinfo import ZoneInfo
-
 import urllib.parse
 
 import numpy as np
@@ -55,7 +46,7 @@ from sqlalchemy.exc import OperationalError, DBAPIError
 # 0) 설정
 # =========================
 DB_CONFIG = {
-    "host": "100.105.75.47",   # ✅ 여기로 고정
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -63,40 +54,33 @@ DB_CONFIG = {
 }
 
 SRC_SCHEMA = "d1_machine_log"
-FCT_TABLES = {
-    "FCT1": "FCT1_machine_log",
-    "FCT2": "FCT2_machine_log",
-    "FCT3": "FCT3_machine_log",
-    "FCT4": "FCT4_machine_log",
+VISION_TABLES = {
+    "Vision1": "Vision1_machine_log",
+    "Vision2": "Vision2_machine_log",
 }
 
-# 저장 대상
 SAVE_SCHEMA = "g_production_film"
-SAVE_TABLE  = "fct_non_operation_time"
+SAVE_TABLE  = "vision_non_operation_time"
 
-# 커서(중복방지)
 CURSOR_SCHEMA = "g_production_film"
-CURSOR_TABLE  = "fct_non_operation_time_cursor"
+CURSOR_TABLE  = "vision_non_operation_time_cursor"
 
-# Realtime
-MAX_WORKERS = 1              # ✅ 멀티프로세스=1 (단일 프로세스/순차 처리)
-LOOP_INTERVAL_SEC = 5.0      # ✅ 무한 루프 5초
-STABLE_DATA_SEC = 2.0        # 방금 적재된 row 회피용(선택적)
+# ✅ 요청 반영
+MAX_WORKERS = 1             # 멀티프로세스 1개 (사실상 순차 처리)
+LOOP_INTERVAL_SEC = 5.0     # 무한 루프 5초
+STABLE_DATA_SEC = 2.0
 
 # DB 재연결/재시도
 DB_CONNECT_TIMEOUT_SEC = 5
 RETRY_SLEEP_SEC = 10
 
-# ✅ work_mem 폭증 방지
-WORK_MEM = "4MB"             # 필요 시 2MB~16MB 등으로 조정
-STATEMENT_TIMEOUT_MS = None  # 예: 60000 (1분). 미사용이면 None
-
-# ✅ 임계값 기준 시간대: KST
-KST = ZoneInfo("Asia/Seoul")
+# ✅ work_mem 폭증 방지 (필요 시 조정)
+WORK_MEM = "4MB"
+STATEMENT_TIMEOUT_MS = None  # 예: 60000 (1분) / 미사용이면 None
 
 
 # =========================
-# 0-1) DIAG + FILE LOG (EXE 꺼짐 방지용)
+# 0-1) DIAG + FILE LOG
 # =========================
 def _now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -173,6 +157,12 @@ def psycopg2_quick_test(host, port, dbname, user, password, timeout_sec=5):
         log("[PSYCOPG2] FAIL err={0}: {1}".format(type(e).__name__, e))
         return False
 
+def build_db_url(cfg):
+    pw = urllib.parse.quote_plus(cfg["password"])
+    return "postgresql+psycopg2://{u}:{p}@{h}:{pt}/{d}".format(
+        u=cfg["user"], p=pw, h=cfg["host"], pt=cfg["port"], d=cfg["dbname"]
+    )
+
 def sqlalchemy_quick_test(db_url: str, timeout_sec=5):
     try:
         from sqlalchemy import create_engine as _create_engine, text as _text
@@ -197,12 +187,6 @@ def sqlalchemy_quick_test(db_url: str, timeout_sec=5):
     except Exception as e:
         log("[SQLA] FAIL err={0}: {1}".format(type(e).__name__, e))
         return False
-
-def build_db_url(cfg):
-    pw = urllib.parse.quote_plus(cfg["password"])
-    return "postgresql+psycopg2://{u}:{p}@{h}:{pt}/{d}".format(
-        u=cfg["user"], p=pw, h=cfg["host"], pt=cfg["port"], d=cfg["dbname"]
-    )
 
 def print_env_header():
     log("=" * 110)
@@ -236,7 +220,7 @@ def run_diagnostics():
 
 
 # =========================
-# 1) 공통 유틸
+# 1) 유틸
 # =========================
 def today_yyyymmdd() -> str:
     return datetime.now().strftime("%Y%m%d")
@@ -255,9 +239,6 @@ def _print_end_banner(tag: str, start_dt: datetime, end_dt: datetime):
     log("-" * 110)
 
 def parse_ts(end_day: str, end_time: str) -> pd.Timestamp:
-    """
-    end_day(YYYYMMDD) + end_time(HH:MM:SS[.fff]) -> Timestamp
-    """
     d = str(end_day).strip()
     t = str(end_time).strip()
     ts = pd.to_datetime("{0} {1}".format(d, t), format="%Y%m%d %H:%M:%S.%f", errors="coerce")
@@ -295,37 +276,9 @@ def is_db_disconnect_error(e: Exception) -> bool:
     ]
     return any(h in msg for h in hints)
 
-def _make_engine_one_pool():
-    """
-    pool_size=1, max_overflow=0 로 상시 연결 1개 수준으로 제한.
-    work_mem 옵션은 connect_args(options)로 세션 기본값을 낮춤.
-    """
-    db_url = build_db_url(DB_CONFIG)
-
-    opt = "-c work_mem={0}".format(WORK_MEM)
-    if STATEMENT_TIMEOUT_MS is not None:
-        opt += " -c statement_timeout={0}".format(int(STATEMENT_TIMEOUT_MS))
-
-    connect_args = {
-        "connect_timeout": int(DB_CONNECT_TIMEOUT_SEC),
-        "application_name": "fct_nonop_realtime",
-        "options": opt,
-    }
-
-    eng = create_engine(
-        db_url,
-        pool_pre_ping=True,   # 끊긴 커넥션이면 자동 감지
-        pool_recycle=300,
-        pool_size=1,
-        max_overflow=0,
-        pool_timeout=30,
-        connect_args=connect_args,
-    )
-    return eng
-
 def _session_guard(conn):
     """
-    work_mem/timeout을 세션에서 한번 더 고정(옵션 무시되는 환경 대비).
+    work_mem/timeout을 세션에서 한번 더 고정(옵션 무시/세션변경 대비).
     """
     try:
         conn.execute(text("SET work_mem TO '{0}';".format(WORK_MEM)))
@@ -334,10 +287,35 @@ def _session_guard(conn):
     except Exception:
         pass
 
+def _make_engine_one_pool():
+    """
+    pool_size=1, max_overflow=0 로 상시 연결 1개 수준으로 제한.
+    work_mem은 options로 기본값을 낮춤.
+    """
+    db_url = build_db_url(DB_CONFIG)
+
+    opt = "-c work_mem={0}".format(WORK_MEM)
+    if STATEMENT_TIMEOUT_MS is not None:
+        opt = opt + " -c statement_timeout={0}".format(int(STATEMENT_TIMEOUT_MS))
+
+    eng = create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=30,
+        connect_args={
+            "connect_timeout": int(DB_CONNECT_TIMEOUT_SEC),
+            "application_name": "vision_nonop_realtime",
+            "options": opt,
+        },
+    )
+    return eng
+
 def init_engine_blocking():
     """
     ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
-    - 엔진 생성 후 SELECT 1 및 세션 가드 적용
     """
     while True:
         eng = None
@@ -361,17 +339,15 @@ def init_engine_blocking():
 
 def engine_health_check_blocking(engine):
     """
-    ✅ 루프 중간/업무 중간에 연결이 끊긴 경우를 빠르게 감지하고,
-    끊겼으면 '연결 성공할 때까지' 블로킹 재접속하도록 유도.
+    ✅ 루프 중간/업무 중간에 연결이 끊긴 경우를 빠르게 감지.
+    끊김/장애면 예외를 발생시켜 상위 복구 루틴을 타게 함.
     """
     try:
         with engine.connect() as conn:
             _session_guard(conn)
             conn.execute(text("SELECT 1"))
         return True
-    except Exception as e:
-        if is_db_disconnect_error(e):
-            raise
+    except Exception:
         raise
 
 def recover_engine_and_thresholds_blocking():
@@ -380,14 +356,12 @@ def recover_engine_and_thresholds_blocking():
     """
     while True:
         engine = init_engine_blocking()
+
         th_map = None
         while th_map is None:
             try:
                 th_map = load_thresholds(engine)
-                # 보기 좋게 로그(운영 확인용)
-                log("[OK] thresholds loaded: value={0} sec | month={1} | fallback={2}".format(
-                    th_map.get("ALL"), th_map.get("month"), th_map.get("fallback")
-                ))
+                log("[OK] thresholds loaded: {0}".format(th_map))
             except Exception as e:
                 if is_db_disconnect_error(e):
                     log("[WARN] thresholds load hit DB disconnect -> re-init engine (blocking)")
@@ -396,7 +370,7 @@ def recover_engine_and_thresholds_blocking():
                     except Exception:
                         pass
                     engine = None
-                    break
+                    break  # 바깥 while로 재접속
                 log("[ERROR] load_thresholds failed: {0}: {1}".format(type(e).__name__, e))
                 log(traceback.format_exc())
                 log("[RETRY] sleep {0}s then retry thresholds".format(RETRY_SLEEP_SEC))
@@ -425,9 +399,6 @@ def ensure_cursor_table(engine):
         conn.execute(ddl)
 
 def load_cursors(engine, end_day: str) -> dict:
-    """
-    return: {station: last_end_ts or None} for the given end_day
-    """
     ensure_cursor_table(engine)
     q = text("""
         SELECT station, last_end_ts
@@ -436,10 +407,9 @@ def load_cursors(engine, end_day: str) -> dict:
     """.format(schema=CURSOR_SCHEMA, table=CURSOR_TABLE))
     df = pd.read_sql(q, engine, params={"end_day": end_day})
 
-    cur = {"FCT1": None, "FCT2": None, "FCT3": None, "FCT4": None}
+    cur = {"Vision1": None, "Vision2": None}
     for _, r in df.iterrows():
-        st = str(r["station"])
-        cur[st] = r["last_end_ts"]
+        cur[str(r["station"])] = r["last_end_ts"]
     return cur
 
 def upsert_cursor(engine, end_day: str, station: str, last_end_ts: datetime):
@@ -457,97 +427,36 @@ def upsert_cursor(engine, end_day: str, station: str, last_end_ts: datetime):
 
 
 # =========================
-# 3) 임계값 로드 (NEW: fct_op_criteria)
+# 3) 임계값 로드(op_ct_gap)
 # =========================
-def prev_month_yyyymm_kst(now: datetime | None = None) -> str:
-    """
-    KST 기준 전월 YYYYMM 계산
-    예) 2026-02-01 -> 202601
-    """
-    if now is None:
-        now = datetime.now(tz=KST)
-    else:
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=KST)
-        else:
-            now = now.astimezone(KST)
-
-    y = now.year
-    m = now.month
-    if m == 1:
-        y -= 1
-        m = 12
-    else:
-        m -= 1
-    return f"{y:04d}{m:02d}"
-
 def load_thresholds(engine):
-    """
-    NEW SPEC (확정):
-    - g_production_film.fct_op_criteria
-    - month(TEXT, 'YYYYMM') = KST 기준 전월
-    - 해당 month에서 MAX(upper_outlier)를 threshold로 사용
-    - (C) 전월 month가 없으면 테이블의 최신 month(MAX(month))로 fallback
-    return: {"ALL": float_threshold, "month": used_month, "fallback": bool}
-    """
-    target_month = prev_month_yyyymm_kst()
-
-    q_max = text("""
-        SELECT MAX(upper_outlier) AS mx
-        FROM g_production_film.fct_op_criteria
-        WHERE month = :month
+    q = text("""
+        SELECT station, del_out_av
+        FROM g_production_film.op_ct_gap
+        WHERE station IN ('Vision1', 'Vision2')
     """)
-
-    # 1) 전월 우선
-    df = pd.read_sql(q_max, engine, params={"month": target_month})
-    mx = None
-    if not df.empty:
-        mx = df.loc[0, "mx"]
-
-    if mx is not None and pd.notna(mx):
-        return {"ALL": float(mx), "month": str(target_month), "fallback": False}
-
-    # 2) (C) fallback: 최신 month 사용
-    q_latest_month = text("""
-        SELECT MAX(month) AS latest_month
-        FROM g_production_film.fct_op_criteria
-    """)
-    dfm = pd.read_sql(q_latest_month, engine)
-    latest_month = None
-    if not dfm.empty:
-        latest_month = dfm.loc[0, "latest_month"]
-
-    if latest_month is None or str(latest_month).strip() == "":
-        raise RuntimeError("[ERROR] g_production_film.fct_op_criteria 테이블에 month 데이터가 없습니다.")
-
-    latest_month = str(latest_month).strip()
-
-    df2 = pd.read_sql(q_max, engine, params={"month": latest_month})
-    mx2 = None
-    if not df2.empty:
-        mx2 = df2.loc[0, "mx"]
-
-    if mx2 is None or pd.isna(mx2):
-        raise RuntimeError(
-            f"[ERROR] fct_op_criteria month={latest_month} 행은 있으나 upper_outlier MAX가 NULL 입니다."
-        )
-
-    return {"ALL": float(mx2), "month": latest_month, "fallback": True}
-
-def threshold_for_station(th_map: dict, station: str) -> float:
-    # station 컬럼이 없으므로 모든 FCT에 동일 임계값 적용
-    return float(th_map["ALL"])
+    df = pd.read_sql(q, engine)
+    if df.empty:
+        raise RuntimeError("[ERROR] g_production_film.op_ct_gap 에서 ('Vision1','Vision2') 데이터를 찾지 못했습니다.")
+    df["del_out_av"] = pd.to_numeric(df["del_out_av"], errors="coerce")
+    th_map = {}
+    for st, v in zip(df["station"].astype(str), df["del_out_av"]):
+        try:
+            th_map[st] = float(v)
+        except Exception:
+            th_map[st] = np.nan
+    return th_map
 
 
 # =========================
 # 4) 소스 로딩(증분)
 # =========================
-def load_fct_incremental(engine, end_day: str, station: str, last_end_ts):
-    """
-    해당 station(FCT1~4)의 테이블에서 오늘(end_day) 데이터만,
-    last_end_ts 이후(>) 데이터만 로드.
-    """
-    tbl = FCT_TABLES[station]
+A_PREFIXES = ("검사 양품 신호 출력", "검사 불량 신호 출력")
+B_PREFIX = "바코드 스캔 신호 수신"
+VALID_PREFIXES = A_PREFIXES + (B_PREFIX,)
+
+def load_vision_incremental(engine, end_day: str, station: str, last_end_ts):
+    tbl = VISION_TABLES[station]
     q = text("""
         SELECT end_day, :station AS station, contents, end_time
         FROM {schema}."{tbl}"
@@ -565,11 +474,9 @@ def load_fct_incremental(engine, end_day: str, station: str, last_end_ts):
     df["_ts"] = ts_list
     df = df[df["_ts"].notna()].copy()
 
-    # 안정화 버퍼(선택): now-2초 이전만
     stable_cut = pd.Timestamp(now_ts() - pd.Timedelta(seconds=STABLE_DATA_SEC))
     df = df[df["_ts"] <= stable_cut].copy()
 
-    # cursor filter
     if last_end_ts is not None and pd.notna(last_end_ts):
         df = df[df["_ts"] > pd.Timestamp(last_end_ts)].copy()
 
@@ -577,12 +484,8 @@ def load_fct_incremental(engine, end_day: str, station: str, last_end_ts):
 
 
 # =========================
-# 5) 이벤트 계산(Station 1개 처리) - 단일 프로세스/순차
+# 5) 이벤트 계산(Station 1개 처리) - 순차 처리
 # =========================
-RESULT_PREFIXES = ("TEST RESULT :: OK", "TEST RESULT :: NG")
-AUTO_START_PREFIX = "TEST AUTO MODE START"
-VALID_PREFIXES = RESULT_PREFIXES + (AUTO_START_PREFIX,)
-
 def compute_events_for_station(station: str, df_station: pd.DataFrame, th_map: dict):
     """
     return:
@@ -597,9 +500,7 @@ def compute_events_for_station(station: str, df_station: pd.DataFrame, th_map: d
     df = df[df["contents"].str.startswith(VALID_PREFIXES)].copy()
 
     if df.empty:
-        mx = None
-        if "_ts" in df_station.columns and not df_station.empty:
-            mx = df_station["_ts"].max()
+        mx = df_station["_ts"].max() if ("_ts" in df_station.columns and not df_station.empty) else None
         mx_out = mx.to_pydatetime() if (mx is not None and pd.notna(mx)) else None
         return station, mx_out, pd.DataFrame(columns=["end_day", "station", "from_time", "to_time", "no_operation_time"])
 
@@ -610,12 +511,12 @@ def compute_events_for_station(station: str, df_station: pd.DataFrame, th_map: d
     i = 0
     while i < len(df):
         c = df.at[i, "contents"]
-        if c.startswith(RESULT_PREFIXES):
+        if c.startswith(A_PREFIXES):
             last_a_idx = i
             i += 1
             continue
 
-        if c.startswith(AUTO_START_PREFIX):
+        if c.startswith(B_PREFIX):
             if last_a_idx is not None:
                 t_a = df.at[last_a_idx, "_ts"]
                 t_b = df.at[i, "_ts"]
@@ -624,10 +525,14 @@ def compute_events_for_station(station: str, df_station: pd.DataFrame, th_map: d
             last_a_idx = None
         i += 1
 
-    th_val = threshold_for_station(th_map, station)
-    df["threshold"] = th_val
+    thr = th_map.get(station, np.nan)
+    try:
+        thr_val = float(thr)
+    except Exception:
+        thr_val = np.nan
+
     df["real_no_operation_time"] = np.where(
-        df["no_operation_time"].notna() & (df["no_operation_time"] > df["threshold"]),
+        df["no_operation_time"].notna() & (df["no_operation_time"] > thr_val),
         1, 0
     )
 
@@ -671,6 +576,7 @@ def upsert_events(engine, df_events: pd.DataFrame) -> int:
         return 0
 
     ensure_target_table(engine)
+
     upsert_sql = text("""
         INSERT INTO {schema}.{table}
         (end_day, station, from_time, to_time, no_operation_time)
@@ -700,9 +606,10 @@ def main_once(engine, th_map):
     total_loaded = 0
 
     for st, last_ts in cursors.items():
-        df_st = load_fct_incremental(engine, end_day=end_day, station=st, last_end_ts=last_ts)
+        df_st = load_vision_incremental(engine, end_day=end_day, station=st, last_end_ts=last_ts)
         station_dfs[st] = df_st
         total_loaded += len(df_st)
+
         if len(df_st) > 0:
             log("[LOAD] {0} {1}: rows={2} (cursor={3})".format(end_day, st, len(df_st), last_ts))
         else:
@@ -716,19 +623,19 @@ def main_once(engine, th_map):
     all_events = []
     cursor_updates = []
 
-    # ✅ 멀티프로세스 제거: 순차 처리
     for st in station_dfs.keys():
         st_df = station_dfs.get(st)
         st_name, max_ts, ev = compute_events_for_station(st, st_df, th_map)
+
         if ev is not None and not ev.empty:
             all_events.append(ev)
             log("[EVT] {0}: events={1}".format(st_name, len(ev)))
         else:
             log("[EVT] {0}: events=0".format(st_name))
+
         if max_ts is not None:
             cursor_updates.append((st_name, max_ts))
 
-    inserted = 0
     if len(all_events) > 0:
         df_save = pd.concat(all_events, ignore_index=True)
         inserted = upsert_events(engine, df_save)
@@ -745,20 +652,20 @@ def main_once(engine, th_map):
 
 
 # =========================
-# 8) Realtime loop
+# 8) Realtime loop (DB 끊김 포함: 블로킹 재접속)
 # =========================
 def realtime_loop():
     log("[BOOT] realtime_loop start")
     run_diagnostics()
 
-    # ✅ 최초 엔진/threshold: “연결 성공할 때까지” 블로킹
+    # ✅ 최초 엔진/threshold: 연결 성공까지 블로킹
     engine, th_map = recover_engine_and_thresholds_blocking()
 
     while True:
         loop_t0 = now_ts()
 
         try:
-            # ✅ 루프 시작 시점 헬스체크: 중간에 끊겨도 즉시 감지 -> 블로킹 복구
+            # ✅ 루프 시작 시점 헬스체크(중간 끊김 즉시 감지)
             engine_health_check_blocking(engine)
 
             # 1) 본 실행
@@ -768,7 +675,7 @@ def realtime_loop():
             log("[ERROR] loop failed: {0}: {1}".format(type(e).__name__, e))
             log(traceback.format_exc())
 
-            # ✅ 실행 중간 끊김 포함 모든 DB 계열 문제는 여기서 "연결 성공할 때까지" 복구
+            # ✅ DB 끊김/장애 포함: 여기서 "연결 성공할 때까지" 복구
             try:
                 if engine is not None:
                     engine.dispose()
@@ -804,7 +711,7 @@ def main():
         hold_console(exit_code=1)
 
 if __name__ == "__main__":
-    # Windows EXE + multiprocessing 안정화 (요청은 1개지만, EXE에서 안전하게 유지)
+    # Windows EXE + multiprocessing 안정화
     try:
         mp.freeze_support()
         mp.set_start_method("spawn", force=True)

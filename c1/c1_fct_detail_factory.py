@@ -4,36 +4,25 @@ c1_fct_detail_loader_factory.py
 ============================================
 FCT Detail TXT Parser -> PostgreSQL 적재 (공장용 최종본)
 
-핵심 요구사항 반영 (최종)
+[기존 핵심 요구사항 유지]
 1) ✅ mtime(수정시간) 완전 미사용 (UNC/NAS 환경에서 신뢰 불가)
 2) ✅ 파일명 끝 토큰 "_HHMMSS(.fff)" = "시작시간" 으로 해석하여 후보를 선별
-3) ✅ 시험 종료시점이 불명확하므로, "파일 완료 판정"을 mtime이 아니라 "파일 크기 안정화"로 수행
-   - 같은 파일 size가 연속 STABLE_REQUIRED 회 동일하면 "완료(안정화)"로 간주하고 파싱/적재
-4) ✅ 자정 전 시작→자정 후 종료로 인해 동일 run이 2개 폴더(시작일/종료일)에 남는 케이스 대응
-   - run_id를 파일명으로 생성: run_id = "{barcode}_{yyyymmdd}_{hhmmss}"
-   - 동일 run_id에 대해 여러 경로가 발견되면 "안정화된 것 우선 + size 큰 것 우선"으로 1개만 처리
-5) ✅ DB 중복 방지 (운영 안정장치)
-   - fct_detail 테이블에 run_id 컬럼 자동 추가
-   - UNIQUE INDEX (run_id, test_time, contents) 자동 보장
-   - INSERT ... ON CONFLICT DO NOTHING 으로 중복 자동 무시
-6) ✅ 멀티프로세스 2개 고정, 1초 루프
+3) ✅ 파일 완료 판정 = "파일 크기 안정화"
+4) ✅ 자정 전 시작→자정 후 종료로 인해 동일 run이 2개 폴더에 남는 케이스 대응(run_id 기반 + best path 선택)
+5) ✅ DB 중복 방지: run_id 컬럼 + UNIQUE(run_id,test_time,contents) + ON CONFLICT DO NOTHING
+6) ✅ 루프 기반 실시간 처리
 
-테이블 스키마(기존 유지 + run_id 추가)
-- barcode_information TEXT
-- remark              TEXT
-- end_day             DATE
-- end_time            TIME
-- contents            VARCHAR(80)
-- test_ct             DOUBLE PRECISION
-- test_time           VARCHAR(12)   # 원본 "[hh:mm:ss.xx]"에서 앞 12글자 유지 (기존 유지)
-- file_path           TEXT
-- run_id              TEXT          # 신규 추가
-
-주의/권장 운영값
-- CANDIDATE_WINDOW_SEC: 시작시간 기준 "최근 N초" 후보 탐색 폭 (처음에는 넉넉히 3600 권장)
-- STABLE_REQUIRED: 파일 size 안정화 연속 횟수 (UNC 지연 있으면 3~5 권장)
+[요구 사양 반영(추가/수정)]
+- 멀티프로세스 = 1개
+- 무한 루프 인터벌 5초
+- DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
+- 백엔드별 상시 연결을 1개로 고정(풀 최소화)  -> 프로세스 전체에서 psycopg2 커넥션 1개만 유지/재사용
+- work_mem 폭증 방지 -> 연결 직후 세션에 SET work_mem 적용(환경변수로 조정 가능)
+- ✅ (추가) 실행 중 서버 끊김/네트워크 단절 발생 시: 감지 즉시 커넥션 폐기 후 무한 재접속 + 재시도
+- ✅ (추가/권장) keepalive 옵션으로 죽은 TCP 세션 감지 가속(환경변수로 조정 가능)
 """
 
+import os
 import re
 import time as time_mod
 from pathlib import Path
@@ -47,12 +36,19 @@ from psycopg2.extras import execute_values
 
 
 # =========================
+# ✅ (중요) psycopg2/libpq 에러 메시지 인코딩 이슈(EXE) 방지
+# =========================
+os.environ.setdefault("PGCLIENTENCODING", "UTF8")
+os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
+
+
+# =========================
 # 0) 설정
 # =========================
 BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\FCT")  # 루트 (YYYY/MM/DD 구조)
 
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -63,25 +59,39 @@ SCHEMA_NAME = "c1_fct_detail"
 TABLE_NAME = "fct_detail"
 
 # ✅ 후보 탐색 폭: "시작시간(파일명)" 기준 최근 N초 내 파일만 후보로 봄
-# 자정 넘김 케이스도 자동 커버(시작시간 기준)
 CANDIDATE_WINDOW_SEC = 3600  # 60분 권장(운영 안정화 후 줄여도 됨)
 
 # ✅ 파일 완료 판정: size가 연속 N회 동일하면 완료(안정화)
 STABLE_REQUIRED = 3
 
-# 무한루프 주기(초)
-LOOP_SLEEP_SEC = 1
+# ✅ 요구사항: 무한루프 주기(초) = 5초
+LOOP_SLEEP_SEC = 5
 
-# 멀티프로세스 고정
-MP_PROCESSES = 2
+# ✅ 요구사항: 멀티프로세스 = 1개
+MP_PROCESSES = 1
 POOL_CHUNKSIZE = 10
 
 # 라인 패턴: [hh:mm:ss.ss] 내용
 LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{1,3})\]\s(.+)$")
 
 # ✅ 파일명: (barcode)_yyyymmdd_(HHMMSS 또는 HHMMSS.xxx).txt
-# barcode에 '_' 가 여러 개 있어도 안전하게 "뒤에서 날짜/시간"만 분리
 FNAME_RE = re.compile(r"^(.*)_(\d{8})_(\d{6}(?:\.\d{1,3})?)\.txt$", re.IGNORECASE)
+
+# ✅ 요구사항: DB 접속 실패 시 무한 재시도(블로킹)
+DB_RETRY_INTERVAL_SEC = 5
+
+# ✅ 요구사항: work_mem 폭증 방지(세션별 cap) - 환경변수로 조정 가능
+#    예) set PG_WORK_MEM=8MB
+WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
+
+# ✅ (추가/권장) 끊긴 TCP 세션을 빠르게 감지(환경변수로 조정 가능)
+PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
+PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
+PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
+PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
+
+# ✅ 요구사항: 백엔드별 상시 연결 1개 고정
+_CONN = None
 
 
 # =========================
@@ -92,14 +102,132 @@ def _conn_str(cfg: dict) -> str:
     return f"postgresql+psycopg2://{cfg['user']}:{pw}@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
 
 
-def _psycopg2_conn(cfg: dict):
-    return psycopg2.connect(
-        host=cfg["host"],
-        port=cfg["port"],
-        dbname=cfg["dbname"],
-        user=cfg["user"],
-        password=cfg["password"],
-    )
+def _safe_close(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _reset_conn(reason: str = ""):
+    """커넥션 강제 폐기 + 다음 ensure에서 무한 재연결 유도"""
+    global _CONN
+    try:
+        if reason:
+            print(f"[DB][RESET] {reason}", flush=True)
+    except Exception:
+        pass
+    try:
+        _safe_close(_CONN)
+    except Exception:
+        pass
+    _CONN = None
+
+
+def _is_connection_error(e: Exception) -> bool:
+    """
+    서버 끊김/네트워크/소켓/세션 종료 등 '재연결'이 필요한 오류인지 판단
+    """
+    if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        return True
+
+    msg = (str(e) or "").lower()
+    keywords = [
+        "server closed the connection",
+        "connection not open",
+        "terminating connection",
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+        "ssl connection has been closed",
+        "broken pipe",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+    ]
+    return any(k in msg for k in keywords)
+
+
+def _apply_session_safety(conn):
+    """
+    ✅ work_mem 폭증 방지: 세션에 cap 적용 + 연결 유효성 ping
+    """
+    with conn.cursor() as cur:
+        cur.execute("SET work_mem TO %s;", (WORK_MEM,))
+        cur.execute("SELECT 1;")
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _psycopg2_conn_blocking(cfg: dict):
+    """
+    ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
+    + keepalive로 죽은 TCP 세션 감지 가속
+    """
+    while True:
+        try:
+            conn = psycopg2.connect(
+                host=cfg["host"],
+                port=cfg["port"],
+                dbname=cfg["dbname"],
+                user=cfg["user"],
+                password=cfg["password"],
+                connect_timeout=5,
+                application_name="c1_fct_detail_loader_factory",
+
+                # keepalive 옵션 (libpq 지원)
+                keepalives=PG_KEEPALIVES,
+                keepalives_idle=PG_KEEPALIVES_IDLE,
+                keepalives_interval=PG_KEEPALIVES_INTERVAL,
+                keepalives_count=PG_KEEPALIVES_COUNT,
+            )
+            conn.autocommit = False
+            _apply_session_safety(conn)
+            print(
+                f"[DB][OK] connected (work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
+                flush=True
+            )
+            return conn
+        except Exception as e:
+            print(f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}", flush=True)
+            try:
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+            except Exception:
+                pass
+
+
+def _ensure_conn():
+    """
+    ✅ 백엔드별 상시 연결 1개 고정(풀 최소화)
+    - 프로세스 전체에서 커넥션 1개만 유지/재사용
+    - 죽었으면 무한 재연결(블로킹)
+    - 실행 중 끊김도 ping에서 감지/복구
+    """
+    global _CONN
+
+    if _CONN is None:
+        _CONN = _psycopg2_conn_blocking(DB_CONFIG)
+        return _CONN
+
+    if getattr(_CONN, "closed", 1) != 0:
+        _reset_conn("conn.closed != 0")
+        _CONN = _psycopg2_conn_blocking(DB_CONFIG)
+        return _CONN
+
+    try:
+        _apply_session_safety(_CONN)
+        return _CONN
+    except Exception as e:
+        if _is_connection_error(e):
+            print(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}", flush=True)
+            _reset_conn("ping failed")
+            _CONN = _psycopg2_conn_blocking(DB_CONFIG)
+            return _CONN
+        raise
 
 
 def _ensure_schema_and_table_and_runid():
@@ -107,6 +235,7 @@ def _ensure_schema_and_table_and_runid():
     - 스키마/테이블 보장
     - run_id 컬럼 추가
     - UNIQUE INDEX (run_id, test_time, contents) 보장
+    ✅ 실행 중 끊김 포함: DB 실패 시 무한 재시도(블로킹)
     """
     ddl = f"""
     CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};
@@ -135,22 +264,37 @@ def _ensure_schema_and_table_and_runid():
     CREATE UNIQUE INDEX IF NOT EXISTS ux_{TABLE_NAME}_runid_dedup
         ON {SCHEMA_NAME}.{TABLE_NAME} (run_id, test_time, contents);
     """
-    with _psycopg2_conn(DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-        conn.commit()
+
+    while True:
+        conn = _ensure_conn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+            conn.autocommit = False
+            return
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] DDL failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("DDL connection error")
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] DDL db error: {type(e).__name__}: {repr(e)}", flush=True)
+            raise
+        except Exception:
+            raise
 
 
 def _load_processed_run_sizes() -> Dict[str, int]:
     """
     ✅ 재시작 후에도 효율을 위해 run_id별 처리 완료(또는 처리한 파일 크기)를 DB에서 복원
     - 같은 run_id가 이미 DB에 있으면, 기본적으로 "한 번은 처리됐다"는 뜻.
-    - 다만, 동일 run_id의 파일이 더 큰(size 증가) 버전으로 나중에 나타날 수 있으므로,
-      우리는 "처리한 파일 size"를 메모리에 저장해 'size가 더 커지면 재처리'를 허용한다.
-
-    여기서는 "run_id가 존재하면 processed"로만 복원하며,
-    size는 메모리에서만 관리(프로세스 재시작 시 0으로 초기화).
-    필요하면 별도 테이블로 run_id->size를 영구화할 수 있으나, 보통 여기까지면 충분.
+    - size는 런타임에서만 관리(재시작 시 0으로 초기화). (기존 로직 유지)
+    ✅ 실행 중 끊김 포함: DB 실패 시 무한 재시도(블로킹)
     """
     sql = f"""
     SELECT DISTINCT run_id
@@ -159,14 +303,31 @@ def _load_processed_run_sizes() -> Dict[str, int]:
       AND run_id <> '';
     """
     out: Dict[str, int] = {}
-    with _psycopg2_conn(DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-    for r in rows:
-        if r and r[0]:
-            out[str(r[0])] = 0  # size는 런타임에서 갱신
-    return out
+
+    while True:
+        conn = _ensure_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            for r in rows:
+                if r and r[0]:
+                    out[str(r[0])] = 0
+            return out
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] load_processed_run_ids failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("load_processed_run_ids connection error")
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] load_processed_run_ids db error: {type(e).__name__}: {repr(e)}", flush=True)
+            raise
+        except Exception:
+            raise
 
 
 def _infer_remark_strict(file_path: Path) -> Optional[str]:
@@ -314,7 +475,6 @@ def _choose_best_path_for_run(run_id: str, paths: List[str]) -> Optional[str]:
         is_stable = 1 if (stable >= STABLE_REQUIRED) else 0
         cand = (is_stable, size)
 
-        # stable이 없는 케이스는 마지막에 None 처리
         if best_tuple is None or cand > best_tuple:
             best_tuple = cand
             best_path = p
@@ -327,7 +487,7 @@ def _choose_best_path_for_run(run_id: str, paths: List[str]) -> Optional[str]:
 
 
 # =========================
-# 4) 파일 파싱 (멀티프로세스 worker)
+# 4) 파일 파싱 (worker)
 # =========================
 def _parse_one_file_worker(args):
     """
@@ -416,25 +576,52 @@ def _parse_one_file_worker(args):
 # =========================
 # 5) DB Insert (ON CONFLICT DO NOTHING)
 # =========================
-def _insert_rows(rows: List[tuple]) -> int:
+def _insert_rows(conn, rows: List[tuple]) -> int:
+    """
+    ✅ 상시 연결 1개(conn)로 insert 수행
+    ✅ 실행 중 서버 끊김 포함: DB 실패 시 무한 재시도(블로킹)
+    """
     if not rows:
         return 0
 
-    # UNIQUE (run_id, test_time, contents) 가 걸려 있으므로 중복은 자동 무시
     sql = f"""
     INSERT INTO {SCHEMA_NAME}.{TABLE_NAME}
     (barcode_information, remark, end_day, end_time, contents, test_ct, test_time, file_path, run_id)
     VALUES %s
     ON CONFLICT (run_id, test_time, contents) DO NOTHING
     """
-    with _psycopg2_conn(DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, sql, rows, page_size=5000)
-        conn.commit()
 
-    # execute_values는 실제 inserted row count를 직접 주지 않으므로, "시도한 row" 반환
-    # (운영에서는 중복 무시가 많아도 문제 없음)
-    return len(rows)
+    while True:
+        conn = _ensure_conn()
+        try:
+            with conn.cursor() as cur:
+                execute_values(cur, sql, rows, page_size=5000)
+            conn.commit()
+            return len(rows)
+
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] insert failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("insert connection error")
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] insert db error: {type(e).__name__}: {repr(e)}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
 # =========================
@@ -443,6 +630,9 @@ def _insert_rows(rows: List[tuple]) -> int:
 def main():
     print(f"[INFO] Connection String: {_conn_str(DB_CONFIG)}")
     print(f"[INFO] BASE_DIR={BASE_DIR}")
+
+    # ✅ 상시 연결 1개 확보(여기서부터 연결 실패 시 무한 블로킹 재시도)
+    _ensure_conn()
 
     _ensure_schema_and_table_and_runid()
     print(f"[INFO] Table ensured: {SCHEMA_NAME}.{TABLE_NAME} (+ run_id + unique index)")
@@ -454,6 +644,8 @@ def main():
     print(f"[INFO] Candidate window(sec)={CANDIDATE_WINDOW_SEC:,} (filename start time based)")
     print(f"[INFO] Stable required(count)={STABLE_REQUIRED} (file size unchanged counts)")
     print(f"[INFO] Loop every {LOOP_SLEEP_SEC}s | MP={MP_PROCESSES}, chunksize={POOL_CHUNKSIZE}")
+    print(f"[INFO] Session work_mem cap={WORK_MEM}")
+    print(f"[INFO] TCP keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}")
     print("[INFO] Dedup policy: run_id based + DB UNIQUE(run_id,test_time,contents)")
 
     total_attempted_rows = 0
@@ -504,13 +696,10 @@ def main():
                 ready_runs += 1
 
             if not ready_tasks:
-                # 필요하면 디버그 출력(10루프마다)
-                # if (loop_count % 10) == 0:
-                #     print(f"[DBG] no_ready | cand_runs={len(cand_map):,} not_stable={skipped_not_stable:,} done={skipped_already_done:,}")
                 time_mod.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            # 3) 멀티프로세스로 파싱
+            # 3) 파싱 (✅ 요구사항: 멀티프로세스 = 1개)
             parsed_rows_all = []
             ok_files = 0
             skip_remark = 0
@@ -518,6 +707,7 @@ def main():
             skip_empty = 0
             error_cnt = 0
 
+            # 기존 구조 유지(멀티프로세스)하되, processes=1로 고정
             with Pool(processes=MP_PROCESSES) as pool:
                 for path_str, run_id, rows, status in pool.imap_unordered(
                     _parse_one_file_worker, ready_tasks, chunksize=POOL_CHUNKSIZE
@@ -543,8 +733,9 @@ def main():
                     else:
                         error_cnt += 1
 
-            # 4) DB 적재
-            attempted = _insert_rows(parsed_rows_all)
+            # 4) DB 적재(✅ 상시 연결 1개, 실행 중 끊김 시 무한 재시도)
+            conn = _ensure_conn()
+            attempted = _insert_rows(conn, parsed_rows_all)
             total_attempted_rows += attempted
 
             print(
@@ -557,8 +748,19 @@ def main():
         except KeyboardInterrupt:
             print("[INFO] KeyboardInterrupt. Stop.")
             break
+
+        except psycopg2.Error as e:
+            # ✅ 루프 바깥에서 터져도(드물지만) 연결 문제면 무한 재연결 유도
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] loop-level connection error: {repr(e)}", flush=True)
+                _reset_conn("loop-level connection error")
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] loop-level db error: {repr(e)}", flush=True)
+            raise
+
         except Exception as e:
-            print(f"[WARN] loop_error: {e}")
+            print(f"[WARN] loop_error: {repr(e)}", flush=True)
 
         time_mod.sleep(LOOP_SLEEP_SEC)
 

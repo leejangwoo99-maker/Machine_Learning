@@ -1,26 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-d4_afa_fail_wasted_time_factory.py  (Warm-start Backfill 포함)
+d4_afa_fail_wasted_time_factory_FIXED_20260130_DAY.py
 
-AFA FAIL wasted time (NG -> ON) 실시간 계산/저장
-- MP=1, 5초 루프
-- DB 접속 실패/끊김 시 무한 재시도(5초마다 [RETRY])
-- 엔진 1개 고정(pool_size=1, max_overflow=0)
-- work_mem 폭증 방지(세션마다 SET)
-- NG는 오로지 contents ILIKE '%제품 감지 NG%' 만 인정
-- WINDOW(KST) 기준 자동 전환:
-  day   : [D] 08:30:00 ~ 20:29:59
-  night : [D] 20:30:00 ~ [D+1] 08:29:59
+✅ 테스트 고정 버전:
+- prod_day = 20260130 (고정)
+- shift    = day (고정)
+- window   = 2026-01-30 08:30:00 ~ 2026-01-30 20:29:59 (KST, 고정)
+
+기능:
+- NG는 오로지 contents ILIKE '%제품 감지 NG%' 만 인정 (Python에서도 '제품 감지 NG' 포함만 NG로 확정)
+- NG -> ON 페어링 + wasted_time 계산
+- save: d1_machine_log.afa_fail_wasted_time (누적 insert, ON CONFLICT DO NOTHING)
 - save PK/UNIQUE: (end_day, station, from_time, to_time)
-- 증분 fetch는 cursor(end_ts) 기반
-- ✅ Warm-start Backfill:
-  - 프로그램 시작 직후, 그리고 shift/window가 바뀔 때마다
-    현재 window(ws ~ now) 구간을 station별로 한번 "전체 스캔"하여 누락분을 채움
-  - 이후 루프에서는 기존처럼 last_pk 기반 증분 처리
+- DB 접속 실패/끊김 시 무한 재시도(5초마다 [RETRY])
+- 엔진 1개 고정(pool_size=1, max_overflow=0), work_mem cap
+- ✅ Warm-start Backfill: 시작 시(또는 강제 재백필 옵션) window 전체를 1회 스캔 후 누락 채움
+- 이후 루프는 last_pk 기반 증분
 
 로그:
-- 실행 즉시 [BOOT]
-- 단계별 INFO: LAST_PK / BACKFILL / FETCH / PAIR / INS
+- [BOOT] 즉시
+- [INFO] LAST_PK / BACKFILL / FETCH / PAIR / INS 단계별
 """
 
 from __future__ import annotations
@@ -31,20 +30,32 @@ import time
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
-
 from zoneinfo import ZoneInfo
 
+
 # =========================
-# 0) 환경/상수
+# 0) 고정 설정 (테스트용)
 # =========================
 KST = ZoneInfo("Asia/Seoul")
 
+FIXED_PROD_DAY = "20260131"
+FIXED_SHIFT = "night"
+FIXED_WS = datetime(2026, 1, 31, 20, 30, 0, tzinfo=KST)
+FIXED_WE = datetime(2026, 2, 1, 8, 29, 59, tzinfo=KST)
+
+# (선택) 매 실행마다 backfill을 강제로 다시 하고 싶으면 1로
+FORCE_BACKFILL_EVERY_BOOT = int(os.getenv("AFA_FORCE_BACKFILL_EVERY_BOOT", "1"))  # 테스트용 default=1
+
+
+# =========================
+# 1) DB / 테이블
+# =========================
 os.environ.setdefault("PGCLIENTENCODING", "UTF8")
 os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
 
@@ -80,7 +91,7 @@ DB_RETRY_INTERVAL_SEC = 5
 # work_mem cap
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
-# Cursor overlap(초) - 증분에서 누락 방지용
+# Cursor overlap(초) - 증분에서 누락 방지
 CURSOR_OVERLAP_SEC = int(os.getenv("AFA_CURSOR_OVERLAP_SEC", "3"))
 
 # keepalive (선택)
@@ -93,7 +104,7 @@ _ENGINE = None
 
 
 # =========================
-# 1) 로깅
+# 2) 로깅
 # =========================
 def log_boot(msg: str) -> None:
     print(f"[BOOT] {msg}", flush=True)
@@ -109,7 +120,7 @@ def log_error(msg: str) -> None:
 
 
 # =========================
-# 2) 텍스트 정규화/매칭
+# 3) 텍스트 정규화/매칭
 # =========================
 _ZWSP_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")  # zero-width chars
 
@@ -137,37 +148,6 @@ def is_auto(c: str) -> bool:
 
 
 # =========================
-# 3) WINDOW 계산(KST 자동 전환)
-# =========================
-def calc_window(now_kst: datetime) -> Tuple[str, str, datetime, datetime]:
-    """
-    window_end는 항상 now(현재 시각).
-    shift 정의:
-      day   : 08:30:00 ~ 20:29:59
-      night : 20:30:00 ~ D+1 08:29:59
-    """
-    t = now_kst.time()
-    day_start = dtime(8, 30, 0)
-    day_end = dtime(20, 29, 59)
-    night_start = dtime(20, 30, 0)
-
-    # day
-    if day_start <= t <= day_end:
-        ws = now_kst.replace(hour=8, minute=30, second=0, microsecond=0)
-        return "day", ws.strftime("%Y%m%d"), ws, now_kst
-
-    # night (20:30~23:59)
-    if t >= night_start:
-        ws = now_kst.replace(hour=20, minute=30, second=0, microsecond=0)
-        return "night", ws.strftime("%Y%m%d"), ws, now_kst
-
-    # night (00:00~08:29:59): 전날 20:30부터
-    yday = (now_kst - timedelta(days=1)).date()
-    ws = datetime(yday.year, yday.month, yday.day, 20, 30, 0, tzinfo=KST)
-    return "night", ws.strftime("%Y%m%d"), ws, now_kst
-
-
-# =========================
 # 4) DB 연결/재접속(엔진 1개 고정)
 # =========================
 def _masked_db() -> str:
@@ -177,9 +157,8 @@ def _masked_db() -> str:
 def _is_connection_error(e: Exception) -> bool:
     if isinstance(e, OperationalError):
         return True
-    if isinstance(e, DBAPIError):
-        if getattr(e, "connection_invalidated", False):
-            return True
+    if isinstance(e, DBAPIError) and getattr(e, "connection_invalidated", False):
+        return True
     msg = (str(e) or "").lower()
     keys = [
         "server closed the connection",
@@ -227,7 +206,7 @@ def _build_engine():
             "keepalives_idle": PG_KEEPALIVES_IDLE,
             "keepalives_interval": PG_KEEPALIVES_INTERVAL,
             "keepalives_count": PG_KEEPALIVES_COUNT,
-            "application_name": "afa_fail_wasted_time_realtime",
+            "application_name": "afa_fail_wasted_time_fixed_20260130_day",
         },
     )
 
@@ -302,16 +281,18 @@ def init_save_table_blocking(engine):
 
 
 # =========================
-# 6) station별 마지막 PK(to_ts) 읽기
+# 6) station별 마지막 PK(to_ts) 읽기 (✅ prod_day 고정 필터)
 # =========================
-def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
+def read_last_pk_per_station(engine, prod_day: str) -> Dict[str, Optional[datetime]]:
     out: Dict[str, Optional[datetime]] = {st: None for _, st in SRC_TABLES}
 
     sql = text(f"""
         SELECT station,
                to_timestamp(end_day || ' ' || split_part(to_time, '.', 1), 'YYYYMMDD HH24:MI:SS') AS to_ts
         FROM {SCHEMA}.{SAVE_TABLE}
-        WHERE end_day IS NOT NULL AND station IS NOT NULL AND to_time IS NOT NULL
+        WHERE end_day = :prod_day
+          AND station IS NOT NULL
+          AND to_time IS NOT NULL
         ORDER BY to_ts DESC
     """)
 
@@ -319,7 +300,7 @@ def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
         try:
             with engine.connect() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
-                rows = conn.execute(sql).fetchall()
+                rows = conn.execute(sql, {"prod_day": prod_day}).fetchall()
 
             seen = set()
             for station, to_ts in rows:
@@ -344,12 +325,16 @@ def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
 
 # =========================
 # 7) 로그 fetch
-#     - 시간 범위(ws~we) + cursor 이후
-#     - 이벤트 후보만 가져옴(ILike)
-#     - source PK(end_day,end_time,contents) dedup
 # =========================
-def fetch_src_logs(engine, table: str, station: str, ws: datetime, we: datetime, cursor_ts: datetime,
-                   overlap_sec: int = CURSOR_OVERLAP_SEC) -> pd.DataFrame:
+def fetch_src_logs(
+    engine,
+    table: str,
+    station: str,
+    ws: datetime,
+    we: datetime,
+    cursor_ts: datetime,
+    overlap_sec: int = CURSOR_OVERLAP_SEC,
+) -> pd.DataFrame:
     cursor_eff = cursor_ts - timedelta(seconds=int(overlap_sec))
 
     params = {
@@ -501,13 +486,12 @@ def insert_rows(engine, df_pairs: pd.DataFrame) -> int:
 
 
 # =========================
-# 10) Warm-start Backfill
+# 10) Warm-start Backfill (고정 window 전체)
 # =========================
 def run_backfill_for_window(engine, ws: datetime, we: datetime, states: Dict[str, StationState]) -> None:
     """
-    현재 window(ws~we) 구간을 station별로 한번 전체 스캔(backfill)
-    - cursor를 ws로 강제
-    - overlap=0(전체스캔은 굳이 overlap 필요 없음)
+    고정 window(ws~we) 구간을 station별로 한번 전체 스캔(backfill)
+    - cursor=ws, overlap=0
     - dedup은 DB PK/UNIQUE로 처리(ON CONFLICT DO NOTHING)
     """
     log_info(f"[BACKFILL] start window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S}")
@@ -538,56 +522,53 @@ def run_backfill_for_window(engine, ws: datetime, we: datetime, states: Dict[str
 
 
 # =========================
-# 11) main
+# 11) main (prod_day/shift 고정)
 # =========================
 def main():
-    log_boot("backend afa_fail_wasted_time realtime starting (MP=1, loop=5s, warm-start backfill=ON)")
+    log_boot(f"backend afa_fail_wasted_time FIXED starting | prod_day={FIXED_PROD_DAY} shift={FIXED_SHIFT} (MP=1, loop=5s, warm-start backfill=ON)")
     log_info(f"DB = {_masked_db()}")
     log_info(f"work_mem cap = {WORK_MEM}")
     log_info(f"SRC = {SCHEMA}.FCT1~4_machine_log | PK(end_day,end_time,contents) assumed")
     log_info(f"SAVE = {SCHEMA}.{SAVE_TABLE} | PK/UNIQUE(end_day,station,from_time,to_time)")
     log_info(f"CURSOR_OVERLAP_SEC = {CURSOR_OVERLAP_SEC}")
+    log_info(f"FIXED window = {FIXED_WS:%Y-%m-%d %H:%M:%S} ~ {FIXED_WE:%Y-%m-%d %H:%M:%S} (KST)")
 
     engine = get_engine_blocking()
     init_save_table_blocking(engine)
 
+    # state는 window 단위로만 의미 있으니, 고정 window 테스트에서는 1회 초기화
     states: Dict[str, StationState] = {st: StationState() for _, st in SRC_TABLES}
 
-    # warm-start 키: shift + ws(윈도우 시작) 단위로 한번만 backfill
-    last_backfill_key: Optional[Tuple[str, datetime]] = None
+    # ✅ 시작 시 backfill 1회 (테스트 default=항상 실행)
+    if FORCE_BACKFILL_EVERY_BOOT:
+        run_backfill_for_window(engine, FIXED_WS, FIXED_WE, states)
 
     while True:
         loop_t0 = time.perf_counter()
-        now_kst = datetime.now(tz=KST)
-        shift, prod_day, ws, we = calc_window(now_kst)
 
         try:
             engine = get_engine_blocking()
 
-            # ✅ (A) Warm-start Backfill: 시작/shift 변경 시 ws~now 범위 전체 스캔
-            backfill_key = (shift, ws)
-            if last_backfill_key != backfill_key:
-                # shift/window 전환 시 state도 "현재 window에 맞게" 리셋(이전 window pending 영향 제거)
-                states = {st: StationState() for _, st in SRC_TABLES}
-                run_backfill_for_window(engine, ws, we, states)
-                last_backfill_key = backfill_key
-
-            # 1) 마지막 PK 읽기
-            last_to_ts = read_last_pk_per_station(engine)
+            # 1) 마지막 PK 읽기 (✅ 20260130만 기준)
+            last_to_ts = read_last_pk_per_station(engine, FIXED_PROD_DAY)
             last_pk_str = ", ".join([f"{k}={(v.strftime('%Y-%m-%d %H:%M:%S') if v else 'None')}" for k, v in last_to_ts.items()])
-            log_info(f"[LAST_PK] shift={shift} prod_day={prod_day} window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S} | {last_pk_str}")
+            log_info(f"[LAST_PK] shift={FIXED_SHIFT} prod_day={FIXED_PROD_DAY} window={FIXED_WS:%Y-%m-%d %H:%M:%S}~{FIXED_WE:%Y-%m-%d %H:%M:%S} | {last_pk_str}")
 
             total_fetched = 0
             total_pairs = 0
             total_attempted = 0
 
-            # 2) station별 신규 fetch/pair/insert (증분)
+            # 2) station별 증분 fetch/pair/insert
             for table, station in SRC_TABLES:
-                cursor_base = last_to_ts.get(station) or ws
-                if cursor_base < ws:
-                    cursor_base = ws
+                cursor_base = last_to_ts.get(station) or FIXED_WS
+                if cursor_base < FIXED_WS:
+                    cursor_base = FIXED_WS
+                if cursor_base > FIXED_WE:
+                    # window 끝을 넘으면 더 볼 게 없음
+                    log_info(f"[FETCH] {station} cursor>{FIXED_WE:%H:%M:%S} -> skip")
+                    continue
 
-                df = fetch_src_logs(engine, table, station, ws, we, cursor_base, overlap_sec=CURSOR_OVERLAP_SEC)
+                df = fetch_src_logs(engine, table, station, FIXED_WS, FIXED_WE, cursor_base, overlap_sec=CURSOR_OVERLAP_SEC)
                 fetched = len(df)
                 total_fetched += fetched
                 log_info(f"[FETCH] {station} cursor={cursor_base:%Y-%m-%d %H:%M:%S} -> rows={fetched}")
@@ -604,7 +585,7 @@ def main():
                 total_attempted += attempted
                 log_info(f"[INS  ] {station} attempted_insert={attempted} (dedup by PK/UNIQUE)")
 
-            log_info(f"[LOOP ] shift={shift} prod_day={prod_day} | fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_attempted}")
+            log_info(f"[LOOP ] FIXED {FIXED_PROD_DAY} {FIXED_SHIFT} | fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_attempted}")
 
         except KeyboardInterrupt:
             log_info("KeyboardInterrupt -> exit")

@@ -6,56 +6,61 @@ FCT RunTime CT 분석 파이프라인 (iqz step 전용) - FACTORY DAEMON (file_p
 - a2_fct_table.fct_table
 
 [Filter]
-- station: FCT1~4 (MP=2 분할)
+- station: FCT1~4 (기존 MP=2 분할 설명은 유지하되, 구현은 MP=1로 동작)
 - barcode_information LIKE 'B%'
 - result <> 'FAIL'
 - remark=PD     -> step_description='1.36 Test iqz(uA)'
 - remark=Non-PD -> step_description='1.32 Test iqz(uA)'
 
 [Daemon]
-- 1초마다 무한 루프
+- ✅ 5초마다 무한 루프
 - 신규 데이터만 캐시에 추가 (중복 방지 PK = file_path 단독)
 - 월 롤오버(YYYYMM 변경) 시 캐시/상태 리셋
 
-[Output 정책(기존 유지)]
+[Output 정책]
 1) LATEST(summary): e1_FCT_ct.fct_run_time_ct
    - UNIQUE (station, remark, month)
-   - INSERT = ON CONFLICT DO UPDATE (최신값으로 갱신)
+   - INSERT = ON CONFLICT DO UPDATE
    - created_at/updated_at 포함
 
 2) HIST(summary): e1_FCT_ct.fct_run_time_ct_hist
-   - UNIQUE (snapshot_day, station, remark, month) 유지
-   - INSERT = ON CONFLICT DO UPDATE => “그날 마지막 값”만 남김(하루 1개 롤링)
+   - UNIQUE (snapshot_day, station, remark, month)
+   - INSERT = ON CONFLICT DO UPDATE (하루 1개 롤링)
    - snapshot_ts 포함
 
 3) OUTLIER(detail): e1_FCT_ct.fct_upper_outlier_ct_list
-   - 기존 UNIQUE(station, remark, barcode_information, end_day, end_time) 유지 (요구사항 그대로)
+   - UNIQUE(station, remark, barcode_information, end_day, end_time)
    - INSERT = ON CONFLICT DO NOTHING (누적 적재 + 중복 방지)
 
 [id NULL 해결]
 - latest/hist/outlier 테이블 모두 id 자동채번 보정
-  * id 컬럼 없으면 생성
-  * 시퀀스 없으면 생성
-  * id default nextval 강제
-  * 기존 NULL id는 nextval로 채움
-  * setval 동기화
 
-[요구사항]
+[요구사항 반영(안정화)]
+- ✅ 멀티프로세스 = 1개 (MP 사용 제거)
+- ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공할 때까지 블로킹)
+- ✅ 백엔드별 상시 연결을 1개로 고정(풀 최소화)
+  - SQLAlchemy: pool_size=1, max_overflow=0
+  - psycopg2: 작업 단위 연결(기존 유지) + 실패시 무한재시도
+- ✅ work_mem 폭증 방지( SQLAlchemy/psycopg2 세션마다 SET work_mem )
+- ✅ (추가) keepalive(connect_args) + connection error 감지 시 engine dispose/rebuild
+
+[기타]
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
 - 콘솔 대기(종료 방지)
 """
 
 import time
+import os
 import urllib.parse
 from datetime import datetime, date
-from multiprocessing import get_context
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import pandas as pd
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError, OperationalError, DBAPIError
 
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -68,7 +73,7 @@ from psycopg2.extras import execute_values
 # 0) 설정
 # =========================
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -88,12 +93,29 @@ TBL_RUN_TIME_HIST   = "fct_run_time_ct_hist"
 TBL_OUTLIER_LIST    = "fct_upper_outlier_ct_list"
 
 # 데몬 루프
-LOOP_INTERVAL_SEC = 1         # 1초마다 무한 루프
-FETCH_LIMIT = 200000          # 1회 조회 최대 row (과다 메모리/트래픽 방지)
+LOOP_INTERVAL_SEC = 5         # ✅ 5초마다 무한 루프
+FETCH_LIMIT = 200000          # 1회 조회 최대 row
 
-# 멀티프로세스 분담
+# (설명은 유지하되, 구현은 MP=1로 통합 운용)
 PROC_1_STATIONS = ["FCT1", "FCT2"]
 PROC_2_STATIONS = ["FCT3", "FCT4"]
+
+
+# =========================
+# ✅ 안정화 파라미터
+# =========================
+DB_RETRY_INTERVAL_SEC = 5
+WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
+CONNECT_TIMEOUT_SEC = 5
+
+# ✅ keepalive (환경변수로 조정)
+PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
+PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
+PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
+PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
+
+# 엔진 싱글톤(상시 연결 1개 고정 목적)
+_ENGINE = None
 
 
 # =========================
@@ -109,23 +131,8 @@ def current_yyyymm(now: datetime | None = None) -> str:
     now = now or datetime.now()
     return now.strftime("%Y%m")
 
-def get_engine(config=DB_CONFIG):
-    user = config["user"]
-    password = urllib.parse.quote_plus(config["password"])
-    host = config["host"]
-    port = config["port"]
-    dbname = config["dbname"]
-    conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
-    return create_engine(conn_str, pool_pre_ping=True)
-
-def get_conn_psycopg2(config=DB_CONFIG):
-    return psycopg2.connect(
-        host=config["host"],
-        port=config["port"],
-        dbname=config["dbname"],
-        user=config["user"],
-        password=config["password"],
-    )
+def _masked_db_info() -> str:
+    return f'postgresql://{DB_CONFIG["user"]}:***@{DB_CONFIG["host"]}:{DB_CONFIG["port"]}/{DB_CONFIG["dbname"]}'
 
 def _round2(x):
     if x is None:
@@ -157,111 +164,245 @@ def _cast_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _is_connection_error(e: Exception) -> bool:
+    if isinstance(e, (OperationalError, DBAPIError)):
+        return True
+
+    msg = (str(e) or "").lower()
+    keys = [
+        "server closed the connection",
+        "terminating connection",
+        "connection not open",
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+        "ssl connection has been closed",
+        "broken pipe",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+    ]
+    return any(k in msg for k in keys)
+
+def _dispose_engine():
+    global _ENGINE
+    try:
+        if _ENGINE is not None:
+            _ENGINE.dispose()
+    except Exception:
+        pass
+    _ENGINE = None
+
+
 # =========================
-# 2) 테이블/인덱스/ID 보정
+# 1-1) DB: 엔진/커넥션 (무한 재시도 + 풀 최소화 + work_mem 제한)
+# =========================
+def _build_engine(config=DB_CONFIG):
+    user = config["user"]
+    password = urllib.parse.quote_plus(config["password"])
+    host = config["host"]
+    port = config["port"]
+    dbname = config["dbname"]
+
+    conn_str = (
+        f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+        f"?connect_timeout={CONNECT_TIMEOUT_SEC}"
+    )
+
+    log(f"[INFO] DB = {_masked_db_info()}")
+
+    # ✅ 상시 연결 1개 고정(풀 최소화) + keepalive
+    return create_engine(
+        conn_str,
+        pool_pre_ping=True,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=30,
+        pool_recycle=300,
+        future=True,
+        connect_args={
+            "connect_timeout": CONNECT_TIMEOUT_SEC,
+            "keepalives": PG_KEEPALIVES,
+            "keepalives_idle": PG_KEEPALIVES_IDLE,
+            "keepalives_interval": PG_KEEPALIVES_INTERVAL,
+            "keepalives_count": PG_KEEPALIVES_COUNT,
+            "application_name": "fct_runtime_ct_daemon",
+        },
+    )
+
+def get_engine_blocking(config=DB_CONFIG):
+    """
+    ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공까지 블로킹)
+    ✅ pool 최소화 (pool_size=1, max_overflow=0)
+    ✅ work_mem 제한 (세션마다 SET)
+    """
+    global _ENGINE
+
+    if _ENGINE is not None:
+        while True:
+            try:
+                with _ENGINE.connect() as conn:
+                    conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                    conn.execute(text("SELECT 1"))
+                return _ENGINE
+            except Exception as e:
+                log(f"[DB][RETRY] engine ping failed -> rebuild: {type(e).__name__}: {repr(e)}")
+                _dispose_engine()
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+
+    while True:
+        try:
+            _ENGINE = _build_engine(config)
+            with _ENGINE.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text("SELECT 1"))
+            log(
+                f"[DB][OK] engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
+            )
+            return _ENGINE
+        except Exception as e:
+            log(f"[DB][RETRY] engine create/connect failed: {type(e).__name__}: {repr(e)}")
+            _dispose_engine()
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+def get_conn_psycopg2_blocking(config=DB_CONFIG):
+    """
+    ✅ psycopg2 연결도 접속 실패/끊김 시 무한 재시도(블로킹)
+    ✅ work_mem 제한을 세션에 적용
+    """
+    while True:
+        conn = None
+        try:
+            conn = psycopg2.connect(
+                host=config["host"],
+                port=config["port"],
+                dbname=config["dbname"],
+                user=config["user"],
+                password=config["password"],
+                connect_timeout=CONNECT_TIMEOUT_SEC,
+                keepalives=PG_KEEPALIVES,
+                keepalives_idle=PG_KEEPALIVES_IDLE,
+                keepalives_interval=PG_KEEPALIVES_INTERVAL,
+                keepalives_count=PG_KEEPALIVES_COUNT,
+                application_name="fct_runtime_ct_daemon",
+            )
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute("SET work_mem TO %s;", (WORK_MEM,))
+            conn.commit()
+            return conn
+        except Exception as e:
+            log(f"[DB][RETRY] psycopg2 connect failed: {type(e).__name__}: {repr(e)}")
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+# =========================
+# 2) 테이블/인덱스/ID 보정 (무한 재시도 적용)
 # =========================
 def ensure_tables_and_indexes():
-    """
-    - 스키마 생성
-    - LATEST/HIST/OUTLIER 테이블 생성(없으면)
-    - UNIQUE 인덱스 보장
-    - id 자동채번/NULL 보정
-    """
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        conn.autocommit = False
-        with conn.cursor() as cur:
-            # schema
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{TARGET_SCHEMA}";')
+    while True:
+        try:
+            conn = get_conn_psycopg2_blocking(DB_CONFIG)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{TARGET_SCHEMA}";')
 
-            # -------------------------
-            # LATEST(summary)
-            # -------------------------
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST} (
-                    id BIGINT,
-                    station                TEXT NOT NULL,
-                    remark                 TEXT NOT NULL,
-                    month                  TEXT NOT NULL,
-                    sample_amount          INTEGER,
-                    run_time_lower_outlier TEXT,
-                    q1                     DOUBLE PRECISION,
-                    median                 DOUBLE PRECISION,
-                    q3                     DOUBLE PRECISION,
-                    run_time_upper_outlier TEXT,
-                    del_out_run_time_av    DOUBLE PRECISION,
-                    plotly_json            JSONB,
-                    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-            """)
-            # 기존 테이블이 이미 존재하면 CREATE TABLE IF NOT EXISTS로는 컬럼 추가가 되지 않으므로,
-            # 과거 버전 테이블(컬럼 누락)을 위해 ALTER로 보정한다.
-            cur.execute(f"""
-                ALTER TABLE "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST}
-                ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
-            """)
-            cur.execute(f"""
-                ALTER TABLE "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST}
-                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-            """)
+                    # LATEST
+                    cur.execute(f"""
+                        CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST} (
+                            id BIGINT,
+                            station                TEXT NOT NULL,
+                            remark                 TEXT NOT NULL,
+                            month                  TEXT NOT NULL,
+                            sample_amount          INTEGER,
+                            run_time_lower_outlier TEXT,
+                            q1                     DOUBLE PRECISION,
+                            median                 DOUBLE PRECISION,
+                            q3                     DOUBLE PRECISION,
+                            run_time_upper_outlier TEXT,
+                            del_out_run_time_av    DOUBLE PRECISION,
+                            plotly_json            JSONB,
+                            created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
+                    cur.execute(f"""
+                        ALTER TABLE "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST}
+                        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+                    """)
+                    cur.execute(f"""
+                        ALTER TABLE "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST}
+                        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+                    """)
+                    cur.execute(f"""
+                        CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_RUN_TIME_LATEST}_key
+                        ON "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST} (station, remark, month);
+                    """)
 
-            cur.execute(f"""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_RUN_TIME_LATEST}_key
-                ON "{TARGET_SCHEMA}".{TBL_RUN_TIME_LATEST} (station, remark, month);
-            """)
+                    # HIST
+                    cur.execute(f"""
+                        CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_RUN_TIME_HIST} (
+                            id BIGINT,
+                            snapshot_day           TEXT NOT NULL,
+                            snapshot_ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            station                TEXT NOT NULL,
+                            remark                 TEXT NOT NULL,
+                            month                  TEXT NOT NULL,
+                            sample_amount          INTEGER,
+                            run_time_lower_outlier TEXT,
+                            q1                     DOUBLE PRECISION,
+                            median                 DOUBLE PRECISION,
+                            q3                     DOUBLE PRECISION,
+                            run_time_upper_outlier TEXT,
+                            del_out_run_time_av    DOUBLE PRECISION,
+                            plotly_json            JSONB
+                        );
+                    """)
+                    cur.execute(f"""
+                        CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_RUN_TIME_HIST}_day_key
+                        ON "{TARGET_SCHEMA}".{TBL_RUN_TIME_HIST} (snapshot_day, station, remark, month);
+                    """)
 
-            # -------------------------
-            # HIST(summary) 하루 1개 롤링
-            # -------------------------
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_RUN_TIME_HIST} (
-                    id BIGINT,
-                    snapshot_day           TEXT NOT NULL,
-                    snapshot_ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    station                TEXT NOT NULL,
-                    remark                 TEXT NOT NULL,
-                    month                  TEXT NOT NULL,
-                    sample_amount          INTEGER,
-                    run_time_lower_outlier TEXT,
-                    q1                     DOUBLE PRECISION,
-                    median                 DOUBLE PRECISION,
-                    q3                     DOUBLE PRECISION,
-                    run_time_upper_outlier TEXT,
-                    del_out_run_time_av    DOUBLE PRECISION,
-                    plotly_json            JSONB
-                );
-            """)
-            cur.execute(f"""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_RUN_TIME_HIST}_day_key
-                ON "{TARGET_SCHEMA}".{TBL_RUN_TIME_HIST} (snapshot_day, station, remark, month);
-            """)
+                    # OUTLIER
+                    cur.execute(f"""
+                        CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_OUTLIER_LIST} (
+                            id BIGINT,
+                            station             TEXT NOT NULL,
+                            remark              TEXT NOT NULL,
+                            barcode_information TEXT NOT NULL,
+                            end_day             TEXT NOT NULL,
+                            end_time            TEXT NOT NULL,
+                            run_time            DOUBLE PRECISION,
+                            month               TEXT,
+                            upper_threshold     DOUBLE PRECISION,
+                            created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
+                    cur.execute(f"""
+                        CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_OUTLIER_LIST}_key
+                        ON "{TARGET_SCHEMA}".{TBL_OUTLIER_LIST} (station, remark, barcode_information, end_day, end_time);
+                    """)
 
-            # -------------------------
-            # OUTLIER(detail) 누적 적재
-            # (요구사항 유지: UNIQUE는 기존 그대로)
-            # -------------------------
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_OUTLIER_LIST} (
-                    id BIGINT,
-                    station             TEXT NOT NULL,
-                    remark              TEXT NOT NULL,
-                    barcode_information TEXT NOT NULL,
-                    end_day             TEXT NOT NULL,
-                    end_time            TEXT NOT NULL,
-                    run_time            DOUBLE PRECISION,
-                    month               TEXT,
-                    upper_threshold     DOUBLE PRECISION,
-                    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-            """)
-            cur.execute(f"""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_{TBL_OUTLIER_LIST}_key
-                ON "{TARGET_SCHEMA}".{TBL_OUTLIER_LIST} (station, remark, barcode_information, end_day, end_time);
-            """)
+                conn.commit()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-        conn.commit()
+            break
 
-    # id 자동채번/NULL 보정 (3개 테이블 모두)
+        except Exception as e:
+            log(f"[DB][RETRY] ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}")
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
     fix_id_sequence(TARGET_SCHEMA, TBL_RUN_TIME_LATEST, "fct_run_time_ct_id_seq")
     fix_id_sequence(TARGET_SCHEMA, TBL_RUN_TIME_HIST,   "fct_run_time_ct_hist_id_seq")
     fix_id_sequence(TARGET_SCHEMA, TBL_OUTLIER_LIST,    "fct_upper_outlier_ct_list_id_seq")
@@ -270,13 +411,6 @@ def ensure_tables_and_indexes():
 
 
 def fix_id_sequence(schema: str, table: str, seq_name: str):
-    """
-    - id 컬럼 없으면 추가
-    - 시퀀스 없으면 생성
-    - id default nextval 강제
-    - id NULL인 기존 행은 nextval로 채움
-    - 시퀀스 setval = max(id)+1 로 동기화
-    """
     do_sql = f"""
     DO $$
     DECLARE
@@ -320,23 +454,30 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
       EXECUTE 'SELECT setval(''' || v_full_seq || ''', ' || (v_max + 1) || ', false)';
     END $$;
     """
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            cur.execute(do_sql)
-        conn.commit()
+
+    while True:
+        conn = None
+        try:
+            conn = get_conn_psycopg2_blocking(DB_CONFIG)
+            with conn.cursor() as cur:
+                cur.execute(do_sql)
+            conn.commit()
+            return
+        except Exception as e:
+            log(f"[DB][RETRY] fix_id_sequence({schema}.{table}) failed: {type(e).__name__}: {repr(e)}")
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
 
 # =========================
-# 3) 로딩 + 전처리 (월 필터, station subset)
-#    (중복 방지 PK = file_path 단독)
+# 3) 로딩 + 전처리 (월 필터, station subset) / PK=file_path
 # =========================
-def load_source_month(engine, stations: List[str], run_month: str) -> pd.DataFrame:
-    """
-    소스 로딩 (해당 월 전체 데이터, station subset)
-
-    - file_path 포함 (PK)
-    - end_day 컬럼 타입(TEXT/DATE 혼재 가능성 대비
-    """
+def fetch_new_rows_by_file_path(engine, stations: List[str], run_month: str, seen_file_paths: set[str]) -> pd.DataFrame:
     query = f"""
     SELECT
         file_path,
@@ -360,19 +501,43 @@ def load_source_month(engine, stations: List[str], run_month: str) -> pd.DataFra
         )
         AND substring(regexp_replace(COALESCE(end_day::text,''), '\\D', '', 'g') from 1 for 6) = :run_month
     ORDER BY end_day ASC, end_time ASC
+    LIMIT :limit
     """
 
-    df = pd.read_sql(text(query), engine, params={"stations": stations, "run_month": run_month})
+    while True:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                df = pd.read_sql(
+                    text(query),
+                    conn,
+                    params={"stations": stations, "run_month": run_month, "limit": FETCH_LIMIT},
+                )
+            break
+        except Exception as e:
+            # ✅ 실행 중 끊김이면 엔진 폐기 후 재생성
+            if _is_connection_error(e):
+                log(f"[DB][RETRY] fetch_new_rows conn error -> rebuild: {type(e).__name__}: {repr(e)}")
+                _dispose_engine()
+            else:
+                log(f"[DB][RETRY] fetch_new_rows failed: {type(e).__name__}: {repr(e)}")
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+            engine = get_engine_blocking(DB_CONFIG)
 
     if df is None or df.empty:
         return df
 
-    # file_path 필수
     df["file_path"] = df["file_path"].astype(str).str.strip()
     df = df[df["file_path"].notna() & (df["file_path"] != "")].copy()
     if df.empty:
         return df
 
+    # 신규만 필터 (PK=file_path)
+    df = df[~df["file_path"].isin(seen_file_paths)].copy()
+    if df.empty:
+        return df
+
+    # 전처리
     df["end_day"] = df["end_day"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
     df["end_time"] = df["end_time"].astype(str).str.strip()
 
@@ -381,7 +546,10 @@ def load_source_month(engine, stations: List[str], run_month: str) -> pd.DataFra
     df = df.dropna(subset=["run_time"]).reset_index(drop=True)
     dropped = before - len(df)
     if dropped:
-        log(f"[INFO] run_time NaN 제거: {dropped} rows drop")
+        log(f"[INFO] run_time NaN 제거: {dropped} rows drop (new rows)")
+
+    if df.empty:
+        return df
 
     df["month"] = df["end_day"].str.slice(0, 6)
     df = df.sort_values(["end_day", "end_time"], ascending=[True, True]).reset_index(drop=True)
@@ -497,7 +665,7 @@ def build_upper_outlier_df(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd
 
 
 # =========================
-# 6) DB 저장 (LATEST UPSERT + HIST 하루롤링 UPSERT + OUTLIER append)
+# 6) DB 저장
 # =========================
 def upsert_latest_run_time_ct(summary_df: pd.DataFrame):
     if summary_df is None or summary_df.empty:
@@ -542,25 +710,34 @@ def upsert_latest_run_time_ct(summary_df: pd.DataFrame):
         plotly_json            = EXCLUDED.plotly_json,
         updated_at             = now();
     """
-
     template = "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb, now(), now())"
 
-    conn = get_conn_psycopg2(DB_CONFIG)
-    try:
-        conn.autocommit = False
-        with conn.cursor() as cur:
-            if rows:
-                execute_values(cur, insert_sql, rows, template=template, page_size=1000)
-        conn.commit()
-    finally:
-        conn.close()
+    while True:
+        conn = None
+        try:
+            conn = get_conn_psycopg2_blocking(DB_CONFIG)
+            with conn.cursor() as cur:
+                if rows:
+                    execute_values(cur, insert_sql, rows, template=template, page_size=1000)
+            conn.commit()
+            return
+        except Exception as e:
+            log(f"[DB][RETRY] upsert_latest_run_time_ct failed: {type(e).__name__}: {repr(e)}")
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
 
 def upsert_hist_run_time_ct_daily(summary_df: pd.DataFrame, snapshot_day: str):
-    """
-    HIST: UNIQUE(snapshot_day, station, remark, month) 유지
-    => ON CONFLICT DO UPDATE (하루 1개 롤링)
-    """
     if summary_df is None or summary_df.empty:
         return
 
@@ -604,26 +781,34 @@ def upsert_hist_run_time_ct_daily(summary_df: pd.DataFrame, snapshot_day: str):
         del_out_run_time_av    = EXCLUDED.del_out_run_time_av,
         plotly_json            = EXCLUDED.plotly_json;
     """
-
     template = "(%s, now(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)"
 
-    conn = get_conn_psycopg2(DB_CONFIG)
-    try:
-        conn.autocommit = False
-        with conn.cursor() as cur:
-            if rows:
-                execute_values(cur, insert_sql, rows, template=template, page_size=1000)
-        conn.commit()
-    finally:
-        conn.close()
+    while True:
+        conn = None
+        try:
+            conn = get_conn_psycopg2_blocking(DB_CONFIG)
+            with conn.cursor() as cur:
+                if rows:
+                    execute_values(cur, insert_sql, rows, template=template, page_size=1000)
+            conn.commit()
+            return
+        except Exception as e:
+            log(f"[DB][RETRY] upsert_hist_run_time_ct_daily failed: {type(e).__name__}: {repr(e)}")
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
 
 def insert_outlier_list(upper_outlier_df: pd.DataFrame):
-    """
-    OUTLIER LIST: 누적 적재 + 중복키 방지
-    UNIQUE(station, remark, barcode_information, end_day, end_time)
-    ON CONFLICT DO NOTHING
-    """
     if upper_outlier_df is None or upper_outlier_df.empty:
         log("[SKIP] upper outlier 저장 생략 (데이터 없음)")
         return
@@ -647,131 +832,38 @@ def insert_outlier_list(upper_outlier_df: pd.DataFrame):
     ON CONFLICT (station, remark, barcode_information, end_day, end_time)
     DO NOTHING;
     """
-
     template = "(" + ",".join(["%s"] * len(cols)) + ")"
 
-    conn = get_conn_psycopg2(DB_CONFIG)
-    try:
-        conn.autocommit = False
-        with conn.cursor() as cur:
-            if rows:
-                execute_values(cur, insert_sql, rows, template=template, page_size=2000)
-        conn.commit()
-        log(f"[OK] upper outlier 누적 저장 완료: insert candidates={len(rows)} (중복키는 PASS)")
-    finally:
-        conn.close()
-
-
-# =========================
-# 7) MP Worker (station subset)
-# =========================
-def worker(stations: List[str], run_month: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    returns: (summary_df, outlier_df)
-    """
-    eng = get_engine(DB_CONFIG)
-    try:
-        df_raw = load_source_month(eng, stations=stations, run_month=run_month)
-    finally:
+    while True:
+        conn = None
         try:
-            eng.dispose()
-        except Exception:
-            pass
-
-    if df_raw is None or df_raw.empty:
-        return (
-            pd.DataFrame(columns=[
-                "station", "remark", "month", "sample_amount",
-                "run_time_lower_outlier", "q1", "median", "q3",
-                "run_time_upper_outlier", "del_out_run_time_av", "plotly_json"
-            ]),
-            pd.DataFrame(columns=[
-                "station", "remark", "barcode_information", "end_day", "end_time",
-                "run_time", "month", "upper_threshold"
-            ])
-        )
-
-    summary_df = build_summary_df(df_raw)
-    outlier_df = build_upper_outlier_df(df_raw, summary_df)
-    return summary_df, outlier_df
+            conn = get_conn_psycopg2_blocking(DB_CONFIG)
+            with conn.cursor() as cur:
+                if rows:
+                    execute_values(cur, insert_sql, rows, template=template, page_size=2000)
+            conn.commit()
+            log(f"[OK] upper outlier 누적 저장 완료: insert candidates={len(rows)} (중복키는 PASS)")
+            return
+        except Exception as e:
+            log(f"[DB][RETRY] insert_outlier_list failed: {type(e).__name__}: {repr(e)}")
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
 
 # =========================
-# 8) 데몬: 신규 행만 캐시에 누적 (PK=file_path)
+# 7) 재계산 + 저장
 # =========================
-def fetch_new_rows_by_file_path(engine, stations: List[str], run_month: str, seen_file_paths: set[str]) -> pd.DataFrame:
-    """
-    - run_month 범위 내에서 조회
-    - file_path 기준으로 '미처리(seen_file_paths에 없는 것)'만 반환
-    - 반환 df는 run_time NaN 제거/정규화 수행
-    """
-    query = f"""
-    SELECT
-        file_path,
-        station,
-        remark,
-        barcode_information,
-        step_description,
-        result,
-        end_day,
-        end_time,
-        run_time
-    FROM {SRC_SCHEMA}.{SRC_TABLE}
-    WHERE
-        station = ANY(:stations)
-        AND barcode_information LIKE 'B%%'
-        AND result <> 'FAIL'
-        AND (
-            (remark = 'PD' AND step_description = '1.36 Test iqz(uA)')
-            OR
-            (remark = 'Non-PD' AND step_description = '1.32 Test iqz(uA)')
-        )
-        AND substring(regexp_replace(COALESCE(end_day::text,''), '\\D', '', 'g') from 1 for 6) = :run_month
-    ORDER BY end_day ASC, end_time ASC
-    LIMIT :limit
-    """
-    df = pd.read_sql(
-        text(query),
-        engine,
-        params={"stations": stations, "run_month": run_month, "limit": FETCH_LIMIT},
-    )
-
-    if df is None or df.empty:
-        return df
-
-    df["file_path"] = df["file_path"].astype(str).str.strip()
-    df = df[df["file_path"].notna() & (df["file_path"] != "")].copy()
-    if df.empty:
-        return df
-
-    # 신규만 필터 (PK=file_path 단독)
-    df = df[~df["file_path"].isin(seen_file_paths)].copy()
-    if df.empty:
-        return df
-
-    # 전처리
-    df["end_day"] = df["end_day"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
-    df["end_time"] = df["end_time"].astype(str).str.strip()
-
-    df["run_time"] = pd.to_numeric(df["run_time"], errors="coerce")
-    before = len(df)
-    df = df.dropna(subset=["run_time"]).reset_index(drop=True)
-    dropped = before - len(df)
-    if dropped:
-        log(f"[INFO] run_time NaN 제거: {dropped} rows drop (new rows)")
-
-    if df.empty:
-        return df
-
-    df["month"] = df["end_day"].str.slice(0, 6)
-    df = df.sort_values(["end_day", "end_time"], ascending=[True, True]).reset_index(drop=True)
-    return df
-
-
 def recompute_and_upsert(cache_df: pd.DataFrame):
-    """
-    캐시 전체로 summary/outlier 재계산 후 UPSERT/INSERT 수행
-    """
     if cache_df is None or cache_df.empty:
         return
 
@@ -785,51 +877,59 @@ def recompute_and_upsert(cache_df: pd.DataFrame):
 
 
 # =========================
-# 9) main: 1초 무한루프 데몬 + 콘솔 대기
+# 8) main: 5초 무한루프 데몬 + 콘솔 대기
 # =========================
 def main():
     start_dt = datetime.now()
     log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S} | DAEMON MODE (PK=file_path)")
     log(f"loop_interval={LOOP_INTERVAL_SEC}s | fetch_limit={FETCH_LIMIT}")
     log(f"src={SRC_SCHEMA}.{SRC_TABLE} -> target schema={TARGET_SCHEMA}")
+    log(f"work_mem={WORK_MEM} | sqlalchemy pool_size=1 max_overflow=0 | db_retry={DB_RETRY_INTERVAL_SEC}s")
 
     ensure_tables_and_indexes()
 
     stations_all = list(set(PROC_1_STATIONS + PROC_2_STATIONS))
     run_month = current_yyyymm()
 
-    # 캐시 및 중복 방지 집합(PK=file_path)
     cache_df: pd.DataFrame | None = None
     seen_file_paths: set[str] = set()
 
-    eng = get_engine(DB_CONFIG)
+    # ✅ 상시 연결 1개 고정(엔진) + 실패 시 무한 재시도
+    eng = get_engine_blocking(DB_CONFIG)
 
     try:
         while True:
+            loop_t0 = time.time()
+
+            # (1) 월 롤오버: 캐시/상태 리셋
             now = datetime.now()
             cur_month = current_yyyymm(now)
-
-            # 월 롤오버: 캐시/상태 리셋
             if cur_month != run_month:
                 log(f"[MONTH ROLLOVER] {run_month} -> {cur_month} (cache reset)")
                 run_month = cur_month
                 cache_df = None
                 seen_file_paths.clear()
 
-            df_new = fetch_new_rows_by_file_path(
-                eng,
-                stations=stations_all,
-                run_month=run_month,
-                seen_file_paths=seen_file_paths,
-            )
+            # (2) 신규 로우 조회 (✅ 끊김이면 엔진 dispose/rebuild 후 무한 재시도)
+            try:
+                df_new = fetch_new_rows_by_file_path(
+                    eng,
+                    stations=stations_all,
+                    run_month=run_month,
+                    seen_file_paths=seen_file_paths,
+                )
+            except Exception as e:
+                log(f"[DB][RETRY] fetch_new_rows failed: {type(e).__name__}: {repr(e)}")
+                if _is_connection_error(e):
+                    _dispose_engine()
+                eng = get_engine_blocking(DB_CONFIG)
+                df_new = pd.DataFrame()
 
+            # (3) 캐시 누적 + 재계산/저장
             if df_new is not None and not df_new.empty:
-                # seen set 업데이트
                 new_paths = df_new["file_path"].astype(str).tolist()
-                for p in new_paths:
-                    seen_file_paths.add(p)
+                seen_file_paths.update(new_paths)
 
-                # 캐시에 누적 (PK=file_path 단독 dedup)
                 if cache_df is None or cache_df.empty:
                     cache_df = df_new.copy()
                 else:
@@ -838,16 +938,19 @@ def main():
 
                 log(f"[NEW] rows={len(df_new)} | cache={len(cache_df)} | seen={len(seen_file_paths)} | month={run_month}")
 
-                # 재계산 + 저장
+                # 저장/업데이트 (각 함수 내부에서 DB 끊김 포함 무한 재시도)
                 recompute_and_upsert(cache_df)
 
-            time.sleep(LOOP_INTERVAL_SEC)
+            # (4) 5초 간격 페이싱
+            elapsed = time.time() - loop_t0
+            time.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
 
     except KeyboardInterrupt:
         log("[STOP] KeyboardInterrupt received. exiting loop...")
     finally:
         try:
-            eng.dispose()
+            if _ENGINE is not None:
+                _ENGINE.dispose()
         except Exception:
             pass
 

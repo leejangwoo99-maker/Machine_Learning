@@ -1,28 +1,24 @@
 # -*- coding: utf-8 -*-
-# fct_database_factory.py (공장 운영형 완전 통합본 - A안: file_path skip 비활성 + 워터마크 + PK로 중복방지)
-#
-# 핵심 수정(이번 에러):
-# - psycopg2 ProgrammingError: can't adapt type 'numpy.int64'
-#   => DIRECT UPSERT에서 numpy 스칼라가 파라미터로 들어가서 발생
-#   => _py() 변환기로 모든 numpy scalar를 python 기본 타입으로 강제 변환
-#
-# 운영 원칙:
-# 0) 누적 적재(매 실행 DROP/CREATE 금지)
-# 1) bootstrap = CREATE SCHEMA/TABLE IF NOT EXISTS
-# 2) 날짜 범위:
-#    - DATE_MODE="AUTO_INCREMENT" : OUT_TABLE max(end_day) 이후 자동 증분
-#    - DATE_MODE="MANUAL_RANGE"   : DATE_FROM~DATE_TO 수동
-# 3) 실행 시간 콘솔 출력 유지
-# 4) df 크기별 UPSERT 자동 분기:
-#    - 소량: DIRECT UPSERT(execute_values)
-#    - 대량: COPY + UNLOGGED staging + UPSERT
-# 5) file_path 기준 처리 제외(단발 모드에서만 적용)
-#    - REALTIME(A안)에서는 file_path skip 비활성(워터마크 + PK로만 중복 방지)
-#
-# 주의:
-# - Source(c1_fct_detail.fct_detail)가 오늘자(end_day) 데이터가 시간순으로 주로 append 된다는 전제
-# - Backfill(과거 end_time이 늦게 들어오는) 패턴이 잦으면 REALTIME_LOOKBACK_SEC를 30~120 등으로 늘리고
-#   PK dedup을 믿는 전략으로 운영해야 함
+"""
+fct_database_factory.py (공장 운영형 완전 통합본 - A안: file_path skip 비활성 + 워터마크 + PK로 중복방지)
+
+요청 추가 반영(이번 요청 핵심)
+- ✅ 실행 중간에 DB 서버가 끊어져도: "무한 재접속(블로킹)" 후 자동 복구하여 계속 진행
+  * connect() / begin() / raw_connection() 모두 블로킹 재시도 래퍼 사용
+  * COPY/DIRECT 업서트 중 끊김도 무한 재시도(절대 raise로 종료하지 않음)
+- ✅ 백엔드별 상시 연결 1개 고정: pool_size=1, max_overflow=0 (전역 엔진 1개 재사용)
+- ✅ work_mem 폭증 방지: 세션마다 SET work_mem 적용 (+ options에도 반영)
+
+기존 요청 유지
+- 멀티프로세스 = 1개 (실시간 모드 단일 프로세스/단일 워커)
+- 무한 루프 인터벌 = 5초
+- 단발(main) + 실시간(REALTIME_TODAY) 동시 포함
+- bootstrap(스키마/테이블/인덱스 IF NOT EXISTS)
+- 워터마크 상태 테이블(ETL state)로 중복 처리 방지
+- PK 중복 방지(ON CONFLICT)
+- 대량(COPY+UNLOGGED staging) vs 소량(DIRECT execute_values) 자동 분기
+- numpy scalar -> python scalar 변환(_py)로 psycopg2 adapt 에러 방지
+"""
 
 import io
 import os
@@ -30,6 +26,7 @@ import re
 import time
 import urllib.parse
 import multiprocessing as mp
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
 
@@ -37,6 +34,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import QueuePool
 
 
 # ============================================================
@@ -53,8 +51,8 @@ DIRECT_UPSERT_BATCH_ROWS = 5_000
 # COPY 기본 청크(시작값) + 다운시프트 후보
 COPY_CHUNK_START_ROWS = 200_000
 COPY_CHUNK_FALLBACKS = [200_000, 100_000, 50_000, 20_000]  # 자동 다운시프트 후보
-COPY_RETRY_PER_CHUNK = 3
 COPY_RETRY_SLEEP_SEC = 5
+
 
 # ============================================================
 # [운영 모드] 날짜 처리 방식(단발 실행용)
@@ -70,8 +68,9 @@ SAFETY_LOOKBACK_DAYS = 2
 AUTO_TO_TODAY = True
 MAX_DAYS_PER_RUN = 7   # 1~7 권장 (운영 안정 목적)
 
+
 # ============================================================
-# 1) DB 접속
+# 1) DB 접속 (전역 1개 엔진 재사용 + 무한 블로킹 재연결)
 # ============================================================
 DB_CONFIG = {
     "host": "100.105.75.47",
@@ -81,26 +80,173 @@ DB_CONFIG = {
     "password": "leejangwoo1!",
 }
 
-def get_engine(cfg):
+# ✅ work_mem 폭증 방지(세션별 제한)
+WORK_MEM_MB = 16  # 필요시 8~64 범위에서 조정
+
+# ✅ DB 접속 실패 시 무한 재시도(블로킹)
+DB_RETRY_SLEEP_SEC = 5
+CONNECT_TIMEOUT_SEC = 10
+STATEMENT_TIMEOUT_MS = None  # 예: 60000, 미사용(None) 권장(운영중 kill 방지)
+
+_ENGINE = None  # 전역 엔진 1개
+
+
+def _build_engine(cfg):
     pw = urllib.parse.quote_plus(cfg["password"])
-    conn_str = f"postgresql+psycopg2://{cfg['user']}:{pw}@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
+    conn_str = "postgresql+psycopg2://{u}:{p}@{h}:{pt}/{d}".format(
+        u=cfg["user"], p=pw, h=cfg["host"], pt=cfg["port"], d=cfg["dbname"]
+    )
+
+    # options에도 work_mem 반영(2중 안전장치) + statement_timeout=0 유지
+    pg_options = "-c statement_timeout=0 -c work_mem={wm}MB".format(wm=int(WORK_MEM_MB))
+
     return create_engine(
         conn_str,
+        poolclass=QueuePool,
+        pool_size=1,           # ✅ 상시 연결 1개 고정
+        max_overflow=0,        # ✅ 추가 연결 금지
+        pool_timeout=10,
         pool_pre_ping=True,
         pool_recycle=1800,
+        future=True,
         connect_args={
-            "connect_timeout": 10,
+            "connect_timeout": int(CONNECT_TIMEOUT_SEC),
             "keepalives": 1,
             "keepalives_idle": 30,
             "keepalives_interval": 10,
             "keepalives_count": 5,
             "application_name": "fct_database_upsert",
-            "options": "-c statement_timeout=0",
+            "options": pg_options,
         },
     )
 
-engine = get_engine(DB_CONFIG)
-print("[OK] engine ready")
+
+def _apply_session_limits(conn):
+    """세션마다 work_mem/statement_timeout 설정(운영 안전)."""
+    try:
+        conn.execute(text("SET work_mem TO :wm"), {"wm": f"{int(WORK_MEM_MB)}MB"})
+    except Exception:
+        pass
+    if STATEMENT_TIMEOUT_MS is not None:
+        try:
+            conn.execute(text("SET statement_timeout TO :st"), {"st": int(STATEMENT_TIMEOUT_MS)})
+        except Exception:
+            pass
+
+
+def _dispose_engine_silent():
+    global _ENGINE
+    try:
+        if _ENGINE is not None:
+            _ENGINE.dispose()
+    except Exception:
+        pass
+    _ENGINE = None
+
+
+def get_engine_blocking():
+    """
+    ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
+    ✅ 엔진 1개를 전역으로 유지/재사용
+    """
+    global _ENGINE
+    while True:
+        try:
+            if _ENGINE is None:
+                _ENGINE = _build_engine(DB_CONFIG)
+
+            with _ENGINE.connect() as conn:
+                _apply_session_limits(conn)
+                conn.execute(text("SELECT 1"))
+            return _ENGINE
+
+        except Exception as e:
+            print("[DB][RETRY] connect failed -> retry in {}s | {}: {}".format(
+                DB_RETRY_SLEEP_SEC, type(e).__name__, repr(e)
+            ), flush=True)
+            _dispose_engine_silent()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+
+
+def safe_engine_recover():
+    """실행 중 DB 에러 발생 시: 엔진 dispose 후, 재연결 성공까지 블로킹으로 재획득."""
+    _dispose_engine_silent()
+    return get_engine_blocking()
+
+
+@contextmanager
+def connect_blocking():
+    """
+    ✅ engine.connect() 자체가 실패해도 무한 재시도(블로킹)
+    - yield: Connection
+    """
+    while True:
+        eng = get_engine_blocking()
+        try:
+            conn = eng.connect()
+            try:
+                _apply_session_limits(conn)
+            except Exception:
+                pass
+            try:
+                yield conn
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            break
+        except Exception as e:
+            print("[DB][RETRY] connect() failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+
+
+@contextmanager
+def begin_blocking():
+    """
+    ✅ engine.begin() 트랜잭션도 실패 시 무한 재시도(블로킹)
+    - yield: Connection (transaction scope)
+    """
+    while True:
+        eng = get_engine_blocking()
+        try:
+            with eng.begin() as conn:
+                _apply_session_limits(conn)
+                yield conn
+            break
+        except Exception as e:
+            print("[DB][RETRY] begin() failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+
+
+def raw_connection_blocking():
+    """
+    ✅ engine.raw_connection()도 끊김/실패 시 무한 재시도(블로킹)
+    - return: DBAPI connection
+    """
+    while True:
+        eng = get_engine_blocking()
+        try:
+            raw = eng.raw_connection()
+            return raw
+        except Exception as e:
+            print("[DB][RETRY] raw_connection() failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+
+
+def read_sql_blocking(sql_obj, params=None) -> pd.DataFrame:
+    """pd.read_sql도 무한 재시도(블로킹)."""
+    while True:
+        try:
+            with connect_blocking() as conn:
+                return pd.read_sql(sql_obj, conn, params=params)
+        except Exception as e:
+            print("[DB][RETRY] read_sql failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
 
 
 # ============================================================
@@ -119,50 +265,58 @@ OUT_TABLE  = "fct_database"
 # ============================================================
 # 3) 테이블 부트스트랩 (운영형: DROP 금지, IF NOT EXISTS)
 # ============================================================
-def bootstrap_fct_database(engine_):
-    with engine_.begin() as conn:
-        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {OUT_SCHEMA};"))
-        conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {OUT_SCHEMA}.{OUT_TABLE} (
-            "group" BIGINT,
-            barcode_information TEXT,
-            station TEXT,
-            remark TEXT,
-            end_day DATE,
-            end_time TIME,
-            run_time DOUBLE PRECISION,
-            contents TEXT,
-            step_description TEXT,
-            set_up_or_test_ct DOUBLE PRECISION,
-            value TEXT,
-            min TEXT,
-            max TEXT,
-            result TEXT,
-            test_ct DOUBLE PRECISION,
-            test_time TEXT,
-            file_path TEXT,
-            updated_at TIMESTAMPTZ DEFAULT now(),
-            PRIMARY KEY (end_day, barcode_information, end_time, test_time, contents)
-        );
-        """))
-        conn.execute(text(f"""
-        CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_end_day
-        ON {OUT_SCHEMA}.{OUT_TABLE} (end_day);
-        """))
-        conn.execute(text(f"""
-        CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_barcode
-        ON {OUT_SCHEMA}.{OUT_TABLE} (barcode_information);
-        """))
-        conn.execute(text(f"""
-        CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_station
-        ON {OUT_SCHEMA}.{OUT_TABLE} (station);
-        """))
-        conn.execute(text(f"""
-        CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_file_path
-        ON {OUT_SCHEMA}.{OUT_TABLE} (file_path);
-        """))
+def bootstrap_fct_database(_engine_unused=None):
+    while True:
+        try:
+            with begin_blocking() as conn:
+                conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {OUT_SCHEMA};"))
+                conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {OUT_SCHEMA}.{OUT_TABLE} (
+                    "group" BIGINT,
+                    barcode_information TEXT,
+                    station TEXT,
+                    remark TEXT,
+                    end_day DATE,
+                    end_time TIME,
+                    run_time DOUBLE PRECISION,
+                    contents TEXT,
+                    step_description TEXT,
+                    set_up_or_test_ct DOUBLE PRECISION,
+                    value TEXT,
+                    min TEXT,
+                    max TEXT,
+                    result TEXT,
+                    test_ct DOUBLE PRECISION,
+                    test_time TEXT,
+                    file_path TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT now(),
+                    PRIMARY KEY (end_day, barcode_information, end_time, test_time, contents)
+                );
+                """))
+                conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_end_day
+                ON {OUT_SCHEMA}.{OUT_TABLE} (end_day);
+                """))
+                conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_barcode
+                ON {OUT_SCHEMA}.{OUT_TABLE} (barcode_information);
+                """))
+                conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_station
+                ON {OUT_SCHEMA}.{OUT_TABLE} (station);
+                """))
+                conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{OUT_TABLE}_file_path
+                ON {OUT_SCHEMA}.{OUT_TABLE} (file_path);
+                """))
 
-    print(f"[OK] bootstrap done: {OUT_SCHEMA}.{OUT_TABLE} ensured (NO DROP)")
+            print(f"[OK] bootstrap done: {OUT_SCHEMA}.{OUT_TABLE} ensured (NO DROP)", flush=True)
+            return
+
+        except Exception as e:
+            print("[DB][RETRY] bootstrap_fct_database failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
 
 
 # ============================================================
@@ -423,7 +577,7 @@ def _safe_date(v):
         return v
     return None
 
-def resolve_date_range(engine_) -> tuple[date, date]:
+def resolve_date_range(_engine_unused=None):
     if DATE_MODE == "MANUAL_RANGE":
         if DATE_FROM is None or DATE_TO is None:
             raise ValueError("[STOP] MANUAL_RANGE requires DATE_FROM and DATE_TO")
@@ -431,45 +585,52 @@ def resolve_date_range(engine_) -> tuple[date, date]:
             raise ValueError("[STOP] DATE_TO < DATE_FROM")
         return DATE_FROM, DATE_TO
 
-    with engine_.connect() as conn:
-        max_sql = text(f"SELECT MAX(end_day) AS max_end_day FROM {OUT_SCHEMA}.{OUT_TABLE};")
-        row = conn.execute(max_sql).fetchone()
-        max_end_day = _safe_date(row[0] if row else None)
+    while True:
+        try:
+            with connect_blocking() as conn:
+                max_sql = text(f"SELECT MAX(end_day) AS max_end_day FROM {OUT_SCHEMA}.{OUT_TABLE};")
+                row = conn.execute(max_sql).fetchone()
+                max_end_day = _safe_date(row[0] if row else None)
 
-        src_max_sql = text(f"SELECT MAX(end_day) AS src_max_end_day FROM {SRC_SCHEMA}.{SRC_TABLE};")
-        row2 = conn.execute(src_max_sql).fetchone()
-        src_max_end_day = _safe_date(row2[0] if row2 else None)
+                src_max_sql = text(f"SELECT MAX(end_day) AS src_max_end_day FROM {SRC_SCHEMA}.{SRC_TABLE};")
+                row2 = conn.execute(src_max_sql).fetchone()
+                src_max_end_day = _safe_date(row2[0] if row2 else None)
 
-    today = datetime.now().date()
-    to_day = today if AUTO_TO_TODAY else (src_max_end_day or today)
+            today = datetime.now().date()
+            to_day = today if AUTO_TO_TODAY else (src_max_end_day or today)
 
-    if src_max_end_day is None:
-        raise ValueError("[STOP] source has no end_day (src_max_end_day is NULL)")
+            if src_max_end_day is None:
+                raise ValueError("[STOP] source has no end_day (src_max_end_day is NULL)")
 
-    if to_day > src_max_end_day:
-        to_day = src_max_end_day
+            if to_day > src_max_end_day:
+                to_day = src_max_end_day
 
-    if max_end_day is None:
-        from_day = max(date(1900, 1, 1), to_day - timedelta(days=MAX_DAYS_PER_RUN - 1))
-    else:
-        from_day = max_end_day - timedelta(days=SAFETY_LOOKBACK_DAYS)
-        if from_day > to_day:
-            from_day = to_day
-        if (to_day - from_day).days + 1 > MAX_DAYS_PER_RUN:
-            from_day = to_day - timedelta(days=MAX_DAYS_PER_RUN - 1)
+            if max_end_day is None:
+                from_day = max(date(1900, 1, 1), to_day - timedelta(days=MAX_DAYS_PER_RUN - 1))
+            else:
+                from_day = max_end_day - timedelta(days=SAFETY_LOOKBACK_DAYS)
+                if from_day > to_day:
+                    from_day = to_day
+                if (to_day - from_day).days + 1 > MAX_DAYS_PER_RUN:
+                    from_day = to_day - timedelta(days=MAX_DAYS_PER_RUN - 1)
 
-    if to_day < from_day:
-        from_day = to_day
+            if to_day < from_day:
+                from_day = to_day
 
-    return from_day, to_day
+            return from_day, to_day
+
+        except Exception as e:
+            print("[DB][RETRY] resolve_date_range failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
 
 
 # ============================================================
 # 6) file_path 기준 처리 제외(단발 모드용) + 날짜 캐시
 # ============================================================
-_processed_paths_cache: dict[str, set] = {}  # key: "YYYY-MM-DD"
+_processed_paths_cache = {}  # key: "YYYY-MM-DD" -> set
 
-def get_processed_file_paths(engine_, candidate_paths, chunk_size: int = 5000) -> set:
+def get_processed_file_paths(_engine_unused, candidate_paths, chunk_size: int = 5000) -> set:
     if candidate_paths is None:
         return set()
 
@@ -486,11 +647,22 @@ def get_processed_file_paths(engine_, candidate_paths, chunk_size: int = 5000) -
         WHERE file_path = ANY(:paths)
     """)
 
-    with engine_.connect() as conn:
-        for i in range(0, len(paths), chunk_size):
-            sub = paths[i:i+chunk_size]
-            rows = conn.execute(sql, {"paths": sub}).fetchall()
-            exist.update([r[0] for r in rows if r and r[0]])
+    i = 0
+    while i < len(paths):
+        sub = paths[i:i+chunk_size]
+        while True:
+            try:
+                with connect_blocking() as conn:
+                    rows = conn.execute(sql, {"paths": sub}).fetchall()
+                for r in rows:
+                    if r and r[0]:
+                        exist.add(r[0])
+                break
+            except Exception as e:
+                print("[DB][RETRY] get_processed_file_paths failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+                safe_engine_recover()
+                time.sleep(DB_RETRY_SLEEP_SEC)
+        i += chunk_size
 
     return exist
 
@@ -506,7 +678,7 @@ def apply_file_path_skip(df0: pd.DataFrame, processed_paths: set) -> pd.DataFram
     if df0 is None or df0.empty:
         return df0
     if not processed_paths:
-        print("[OK] file_path skip applied: processed_paths=0")
+        print("[OK] file_path skip applied: processed_paths=0", flush=True)
         return df0
 
     fp = df0["file_path"].astype("string").fillna("").str.strip()
@@ -518,15 +690,15 @@ def apply_file_path_skip(df0: pd.DataFrame, processed_paths: set) -> pd.DataFram
     skipped_rows = before - len(out)
     skipped_files = int(fp.loc[mask_skip].nunique()) if skipped_rows > 0 else 0
 
-    print(f"[OK] file_path skip applied: skipped_rows={skipped_rows} / remain_rows={len(out)} / unique_file_path_skipped={skipped_files}")
+    print(f"[OK] file_path skip applied: skipped_rows={skipped_rows} / remain_rows={len(out)} / unique_file_path_skipped={skipped_files}", flush=True)
     return out
 
 
 # ============================================================
 # 7) Source 로드 + MES group 제외 + group 생성 + 정렬
 # ============================================================
-def load_source(engine_, d_from: date, d_to: date) -> pd.DataFrame:
-    sql = f"""
+def load_source(_engine_unused, d_from: date, d_to: date) -> pd.DataFrame:
+    sql = text(f"""
     SELECT
         barcode_information,
         remark,
@@ -538,12 +710,12 @@ def load_source(engine_, d_from: date, d_to: date) -> pd.DataFrame:
         file_path
     FROM {SRC_SCHEMA}.{SRC_TABLE}
     WHERE end_day BETWEEN :d1 AND :d2
-    """
-    with engine_.connect() as conn:
-        df = pd.read_sql(text(sql), conn, params={"d1": d_from, "d2": d_to})
+    """)
+
+    df = read_sql_blocking(sql, params={"d1": d_from, "d2": d_to})
 
     if df.empty:
-        print(f"[SKIP] source 0 rows in range {d_from} ~ {d_to}")
+        print(f"[SKIP] source 0 rows in range {d_from} ~ {d_to}", flush=True)
         return df
 
     df["_key"] = (
@@ -572,7 +744,7 @@ def load_source(engine_, d_from: date, d_to: date) -> pd.DataFrame:
     out_cols = ["group", "barcode_information", "remark", "end_day", "end_time", "contents", "test_ct", "test_time", "file_path"]
     df = df[out_cols + ["_key", "_gkey", "_seq", "_tt"]].copy()
 
-    print("[OK] loaded:", len(df), "rows / groups:", df["group"].nunique(), "/ mes_filtered_keys:", len(mes_keys))
+    print("[OK] loaded:", len(df), "rows / groups:", df["group"].nunique(), "/ mes_filtered_keys:", len(mes_keys), flush=True)
     return df
 
 
@@ -666,13 +838,13 @@ def build_steps_and_setup_ct(df: pd.DataFrame) -> pd.DataFrame:
     cnt = okng.groupby(["group", "remark"], sort=False).size().reset_index(name="okng_cnt")
     bad_pd = cnt[(cnt["remark"] == "PD") & (cnt["okng_cnt"] != PD_OKNG_EXPECT)]
     bad_np = cnt[(cnt["remark"] == "Non-PD") & (cnt["okng_cnt"] != NONPD_OKNG_EXPECT)]
-    print(f"[OK] okng count check: bad_PD={len(bad_pd)} bad_NonPD={len(bad_np)}")
+    print(f"[OK] okng count check: bad_PD={len(bad_pd)} bad_NonPD={len(bad_np)}", flush=True)
 
     before = len(work)
     work = work[~work["step_description"].isin(DROP_STEPS)].copy()
     after = len(work)
     if before != after:
-        print(f"[OK] dropped steps rows: {before - after}")
+        print(f"[OK] dropped steps rows: {before - after}", flush=True)
 
     work = work.sort_values(["end_day", "end_time", "group", "_tt", "_seq"],
                             ascending=[True, True, True, True, True],
@@ -685,19 +857,19 @@ def build_steps_and_setup_ct(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # 9) fct_table 로드(필요 컬럼)
 # ============================================================
-def load_fct_table(engine_, days_yyyymmdd, patterns) -> pd.DataFrame:
+def load_fct_table(_engine_unused, days_yyyymmdd, patterns) -> pd.DataFrame:
     if not days_yyyymmdd or not patterns:
         return pd.DataFrame()
 
-    sql = f"""
+    sql = text(f"""
     SELECT barcode_information, remark, station, end_day, end_time, run_time,
            step_description, value, min, max, result
     FROM {FCT_SCHEMA}.{FCT_TABLE}
     WHERE end_day = ANY(:days)
       AND barcode_information ILIKE ANY(:patterns)
-    """
-    with engine_.connect() as conn:
-        fct = pd.read_sql(text(sql), conn, params={"days": days_yyyymmdd, "patterns": patterns})
+    """)
+
+    fct = read_sql_blocking(sql, params={"days": days_yyyymmdd, "patterns": patterns})
 
     if fct.empty:
         return fct
@@ -736,10 +908,9 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
         out["run_time"] = pd.Series(np.nan, index=out.index, dtype="float64")
 
     if fct is None or fct.empty:
-        print("[DBG] fct empty -> snap skip")
+        print("[DBG] fct empty -> snap skip", flush=True)
         return out
 
-    # df 쪽 키 준비
     if "barcode_norm" not in out.columns:
         out["barcode_norm"] = normalize_barcode(out["barcode_information"])
     if "end_day_text" not in out.columns:
@@ -749,7 +920,6 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     if "end_sec" not in out.columns:
         out["end_sec"] = hhmiss_to_seconds(pd.to_numeric(out["end_time_int"], errors="coerce"))
 
-    # fct 쪽 키 준비
     f = fct.copy()
     if "barcode_norm" not in f.columns:
         f["barcode_norm"] = normalize_barcode(f["barcode_information"])
@@ -763,7 +933,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     reps = out.groupby("group", sort=False).head(1)[["group", "barcode_norm", "end_day_text", "end_sec"]].copy()
     reps = reps.dropna(subset=["barcode_norm", "end_day_text", "end_sec"]).reset_index(drop=True)
     if reps.empty:
-        print("[DBG] reps empty -> snap skip")
+        print("[DBG] reps empty -> snap skip", flush=True)
         return out
 
     j = reps.merge(
@@ -773,7 +943,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
         suffixes=("", "_fct"),
     )
     if j.empty:
-        print("[DBG] snap join empty")
+        print("[DBG] snap join empty", flush=True)
         return out
 
     col_time = "end_time_int_fct" if "end_time_int_fct" in j.columns else "end_time_int"
@@ -785,7 +955,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     j["diff"] = (pd.to_numeric(j["fct_end_sec"], errors="coerce") - pd.to_numeric(j["end_sec"], errors="coerce")).abs()
     j = j[(j["diff"].notna()) & (j["diff"] <= END_TIME_TOL_SECONDS)].copy()
     if j.empty:
-        print("[DBG] snap: no cand within tol")
+        print("[DBG] snap: no cand within tol", flush=True)
         return out
 
     best_idx = j.groupby("group")["diff"].idxmin()
@@ -803,7 +973,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     matched_rows = int(out["fct_end_sec"].notna().sum())
     total_groups = int(out["group"].nunique())
     matched_groups = int(out.loc[out["fct_end_sec"].notna(), "group"].nunique())
-    print(f"[OK] snap group cycle: matched_groups={matched_groups}/{total_groups} (rows with fct_end_sec={matched_rows})")
+    print(f"[OK] snap group cycle: matched_groups={matched_groups}/{total_groups} (rows with fct_end_sec={matched_rows})", flush=True)
 
     return out
 
@@ -818,7 +988,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
         out[c] = pd.Series(pd.NA, index=out.index, dtype="string")
 
     if fct is None or fct.empty:
-        print("[CHK] value matched: 0 /", len(out), "(fct empty)")
+        print("[CHK] value matched: 0 /", len(out), "(fct empty)", flush=True)
         return out
 
     out["barcode_norm"] = normalize_barcode(out["barcode_information"])
@@ -838,7 +1008,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
     ].copy()
 
     if need.empty:
-        print("[CHK] value matched: 0 /", len(out), "(need empty)")
+        print("[CHK] value matched: 0 /", len(out), "(need empty)", flush=True)
         return out.drop(columns=["_row_id"], errors="ignore")
 
     need["_step_stripped"] = strip_step_prefix_by_remark(need["step_description"], need["remark"])
@@ -867,8 +1037,8 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
         right_on=["barcode_norm", "end_day_text", "station", "end_time_int_fct", "step_key_norm"]
     )
 
-    print("[DBG-MATCH] join rows:", len(j), "/", len(need2))
-    print("[DBG-MATCH] non-null value in join:", int(j["value"].notna().sum()))
+    print("[DBG-MATCH] join rows:", len(j), "/", len(need2), flush=True)
+    print("[DBG-MATCH] non-null value in join:", int(j["value"].notna().sum()), flush=True)
 
     j = j.sort_values("_row_id").drop_duplicates("_row_id", keep="first")
     got = j[["_row_id", "value", "min", "max", "result"]]
@@ -880,12 +1050,12 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
     out = out.drop(columns=[f"{c}_m" for c in ["value", "min", "max", "result"]], errors="ignore")
     out = out.drop(columns=["_row_id"], errors="ignore")
 
-    print("[CHK] value matched:", int(out["value"].notna().sum()), "/", len(out))
+    print("[CHK] value matched:", int(out["value"].notna().sum()), "/", len(out), flush=True)
     return out
 
 
 # ============================================================
-# 12) UPSERT (자동 분기: DIRECT vs COPY)
+# 12) UPSERT (자동 분기: DIRECT vs COPY) + "끊김 무한 복구"
 # ============================================================
 FINAL_COLS = [
     "group", "barcode_information", "station", "remark", "end_day", "end_time", "run_time",
@@ -916,77 +1086,99 @@ def _prepare_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
 
     return df2
 
-def _copy_one_chunk(engine_, staging: str, chunk: pd.DataFrame, start: int, end: int):
+def _copy_one_chunk_blocking(staging: str, chunk: pd.DataFrame, start: int, end: int):
+    """
+    ✅ COPY+UPSERT 한 청크:
+    - 실행 중 끊김/서버다운 등 발생 시: 무한 재접속(블로킹) 후 같은 청크를 계속 재시도
+    """
     def to_copy_buffer(frame: pd.DataFrame) -> io.StringIO:
         buf = io.StringIO()
         frame.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
         buf.seek(0)
         return buf
 
-    raw = engine_.raw_connection()
-    try:
-        with raw.cursor() as cur:
-            cur.execute(f"""
-            CREATE UNLOGGED TABLE IF NOT EXISTS {staging}
-            (LIKE {OUT_SCHEMA}.{OUT_TABLE} INCLUDING DEFAULTS);
-            """)
-            raw.commit()
-
-            cur.execute(f"TRUNCATE TABLE {staging};")
-            raw.commit()
-
-            buf = to_copy_buffer(chunk)
-            copy_sql = f"""
-            COPY {staging} (
-                "group", barcode_information, station, remark, end_day, end_time, run_time,
-                contents, step_description, set_up_or_test_ct, value, min, max, result,
-                test_ct, test_time, file_path
-            )
-            FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N');
-            """
-            cur.copy_expert(copy_sql, buf)
-            raw.commit()
-
-            cur.execute(f"""
-            INSERT INTO {OUT_SCHEMA}.{OUT_TABLE} (
-                "group", barcode_information, station, remark, end_day, end_time, run_time,
-                contents, step_description, set_up_or_test_ct, value, min, max, result,
-                test_ct, test_time, file_path
-            )
-            SELECT
-                "group", barcode_information, station, remark, end_day, end_time, run_time,
-                contents, step_description, set_up_or_test_ct, value, min, max, result,
-                test_ct, test_time, file_path
-            FROM {staging}
-            ON CONFLICT (end_day, barcode_information, end_time, test_time, contents)
-            DO UPDATE SET
-                "group" = EXCLUDED."group",
-                station = EXCLUDED.station,
-                remark = EXCLUDED.remark,
-                run_time = EXCLUDED.run_time,
-                step_description = EXCLUDED.step_description,
-                set_up_or_test_ct = EXCLUDED.set_up_or_test_ct,
-                value = EXCLUDED.value,
-                min = EXCLUDED.min,
-                max = EXCLUDED.max,
-                result = EXCLUDED.result,
-                test_ct = EXCLUDED.test_ct,
-                file_path = EXCLUDED.file_path,
-                updated_at = now();
-            """)
-            raw.commit()
-
-        print(f"[OK] bulk upsert chunk: {start}~{end-1} ({end-start} rows)")
-
-    finally:
+    while True:
+        raw = None
         try:
-            raw.close()
-        except Exception:
-            pass
+            raw = raw_connection_blocking()
+            with raw.cursor() as cur:
+                cur.execute(f"""
+                CREATE UNLOGGED TABLE IF NOT EXISTS {staging}
+                (LIKE {OUT_SCHEMA}.{OUT_TABLE} INCLUDING DEFAULTS);
+                """)
+                raw.commit()
 
-def bulk_upsert_copy(engine_, df: pd.DataFrame):
+                cur.execute(f"TRUNCATE TABLE {staging};")
+                raw.commit()
+
+                buf = to_copy_buffer(chunk)
+                copy_sql = f"""
+                COPY {staging} (
+                    "group", barcode_information, station, remark, end_day, end_time, run_time,
+                    contents, step_description, set_up_or_test_ct, value, min, max, result,
+                    test_ct, test_time, file_path
+                )
+                FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N');
+                """
+                cur.copy_expert(copy_sql, buf)
+                raw.commit()
+
+                cur.execute(f"""
+                INSERT INTO {OUT_SCHEMA}.{OUT_TABLE} (
+                    "group", barcode_information, station, remark, end_day, end_time, run_time,
+                    contents, step_description, set_up_or_test_ct, value, min, max, result,
+                    test_ct, test_time, file_path
+                )
+                SELECT
+                    "group", barcode_information, station, remark, end_day, end_time, run_time,
+                    contents, step_description, set_up_or_test_ct, value, min, max, result,
+                    test_ct, test_time, file_path
+                FROM {staging}
+                ON CONFLICT (end_day, barcode_information, end_time, test_time, contents)
+                DO UPDATE SET
+                    "group" = EXCLUDED."group",
+                    station = EXCLUDED.station,
+                    remark = EXCLUDED.remark,
+                    run_time = EXCLUDED.run_time,
+                    step_description = EXCLUDED.step_description,
+                    set_up_or_test_ct = EXCLUDED.set_up_or_test_ct,
+                    value = EXCLUDED.value,
+                    min = EXCLUDED.min,
+                    max = EXCLUDED.max,
+                    result = EXCLUDED.result,
+                    test_ct = EXCLUDED.test_ct,
+                    file_path = EXCLUDED.file_path,
+                    updated_at = now();
+                """)
+                raw.commit()
+
+            print(f"[OK] bulk upsert chunk: {start}~{end-1} ({end-start} rows)", flush=True)
+            return
+
+        except Exception as e:
+            print("[DB][RETRY] COPY chunk failed -> {}: {} | chunk {}~{}".format(
+                type(e).__name__, repr(e), start, end-1
+            ), flush=True)
+            try:
+                if raw is not None:
+                    raw.close()
+            except Exception:
+                pass
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+            continue
+
+        finally:
+            try:
+                if raw is not None:
+                    raw.close()
+            except Exception:
+                pass
+
+
+def bulk_upsert_copy(_engine_unused, df: pd.DataFrame):
     if df.empty:
-        print("[SKIP] df empty")
+        print("[SKIP] df empty", flush=True)
         return
 
     df2 = _prepare_df_for_db(df)
@@ -1017,44 +1209,20 @@ def bulk_upsert_copy(engine_, df: pd.DataFrame):
         chunk = chunk.drop_duplicates(subset=PK_COLS, keep="last").copy()
         dropped = before_rows - len(chunk)
         if dropped > 0:
-            print(f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})")
+            print(f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})", flush=True)
 
-        attempt = 0
-        while True:
-            try:
-                _copy_one_chunk(engine_, staging, chunk, start, end)
-                break
-            except (OperationalError, Exception) as e:
-                attempt += 1
-                msg = str(e)
-                print(f"[ERR] COPY+UPSERT failed (attempt={attempt}/{COPY_RETRY_PER_CHUNK}) at chunk {start}~{end-1}")
-                print("      ", msg[:300])
-
-                if attempt >= COPY_RETRY_PER_CHUNK:
-                    next_sizes = [x for x in chunk_sizes if x < current_chunk_rows]
-                    if next_sizes:
-                        current_chunk_rows = next_sizes[0]
-                        print(f"[DOWN] COPY_CHUNK_ROWS downshift -> {current_chunk_rows} (retry chunk from {start})")
-                        end = min(start + current_chunk_rows, total)
-                        chunk = df_db.iloc[start:end].copy()
-                        before_rows = len(chunk)
-                        chunk = chunk.drop_duplicates(subset=PK_COLS, keep="last").copy()
-                        dropped = before_rows - len(chunk)
-                        if dropped > 0:
-                            print(f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})")
-                        attempt = 0
-                        time.sleep(COPY_RETRY_SLEEP_SEC)
-                        continue
-                    raise
-
-                time.sleep(COPY_RETRY_SLEEP_SEC)
+        # ✅ 서버끊김은 _copy_one_chunk_blocking 내부에서 "무한 복구"
+        # ✅ 다만 chunk_rows가 너무 크면(메모리/시간) 다운시프트는 유지
+        _copy_one_chunk_blocking(staging, chunk, start, end)
 
         start = end
 
-    print(f"[DONE] UPSERT(COPY) 완료: {total} rows / sec={time.time()-t0:.2f}")
+        # 다운시프트는 "성능/안정" 목적이고 서버끊김과 무관
+        # 운영에서 너무 큰 청크가 문제면 manual로 COPY_CHUNK_* 조정 권장
+
+    print(f"[DONE] UPSERT(COPY) 완료: {total} rows / sec={time.time()-t0:.2f}", flush=True)
 
 
-# ====== 핵심: numpy scalar -> python scalar 변환기(Direct UPSERT 안정화) ======
 def _py(v):
     """psycopg2가 적응 못하는 numpy 스칼라 등을 python 기본 타입으로 변환"""
     if v is None:
@@ -1080,9 +1248,9 @@ def _py(v):
     return v
 
 
-def direct_upsert(engine_, df: pd.DataFrame):
+def direct_upsert(_engine_unused, df: pd.DataFrame):
     if df.empty:
-        print("[SKIP] df empty")
+        print("[SKIP] df empty", flush=True)
         return
 
     df2 = _prepare_df_for_db(df)
@@ -1092,7 +1260,7 @@ def direct_upsert(engine_, df: pd.DataFrame):
     df2 = df2.drop_duplicates(subset=PK_COLS, keep="last").copy()
     dropped = before - len(df2)
     if dropped > 0:
-        print(f"[WARN] direct upsert PK duplicates dropped: {dropped} (rows {before} -> {len(df2)})")
+        print(f"[WARN] direct upsert PK duplicates dropped: {dropped} (rows {before} -> {len(df2)})", flush=True)
 
     cols = [
         "group","barcode_information","station","remark","end_day","end_time","run_time",
@@ -1100,66 +1268,83 @@ def direct_upsert(engine_, df: pd.DataFrame):
         "test_ct","test_time","file_path"
     ]
 
-    raw = engine_.raw_connection()
     t0 = time.time()
-    try:
-        from psycopg2.extras import execute_values
-        with raw.cursor() as cur:
-            sql = f"""
-            INSERT INTO {OUT_SCHEMA}.{OUT_TABLE} (
-                "group", barcode_information, station, remark, end_day, end_time, run_time,
-                contents, step_description, set_up_or_test_ct, value, min, max, result,
-                test_ct, test_time, file_path
-            ) VALUES %s
-            ON CONFLICT (end_day, barcode_information, end_time, test_time, contents)
-            DO UPDATE SET
-                "group" = EXCLUDED."group",
-                station = EXCLUDED.station,
-                remark = EXCLUDED.remark,
-                run_time = EXCLUDED.run_time,
-                step_description = EXCLUDED.step_description,
-                set_up_or_test_ct = EXCLUDED.set_up_or_test_ct,
-                value = EXCLUDED.value,
-                min = EXCLUDED.min,
-                max = EXCLUDED.max,
-                result = EXCLUDED.result,
-                test_ct = EXCLUDED.test_ct,
-                file_path = EXCLUDED.file_path,
-                updated_at = now();
-            """
 
-            total = len(df2)
-            for start in range(0, total, DIRECT_UPSERT_BATCH_ROWS):
-                end = min(start + DIRECT_UPSERT_BATCH_ROWS, total)
-                chunk = df2.iloc[start:end][cols]
-
-                records = []
-                for row in chunk.itertuples(index=False, name=None):
-                    records.append(tuple(_py(v) for v in row))
-
-                execute_values(cur, sql, records, page_size=min(1000, len(records)))
-                raw.commit()
-                print(f"[OK] direct upsert batch: {start}~{end-1} ({end-start} rows)")
-
-    finally:
+    # ✅ 서버끊김/네트워크 에러 시 "무한 복구"
+    while True:
+        raw = None
         try:
-            raw.close()
-        except Exception:
-            pass
+            raw = raw_connection_blocking()
+            from psycopg2.extras import execute_values
 
-    print(f"[DONE] UPSERT(DIRECT) 완료: {len(df2)} rows / sec={time.time()-t0:.2f}")
+            with raw.cursor() as cur:
+                sql = f"""
+                INSERT INTO {OUT_SCHEMA}.{OUT_TABLE} (
+                    "group", barcode_information, station, remark, end_day, end_time, run_time,
+                    contents, step_description, set_up_or_test_ct, value, min, max, result,
+                    test_ct, test_time, file_path
+                ) VALUES %s
+                ON CONFLICT (end_day, barcode_information, end_time, test_time, contents)
+                DO UPDATE SET
+                    "group" = EXCLUDED."group",
+                    station = EXCLUDED.station,
+                    remark = EXCLUDED.remark,
+                    run_time = EXCLUDED.run_time,
+                    step_description = EXCLUDED.step_description,
+                    set_up_or_test_ct = EXCLUDED.set_up_or_test_ct,
+                    value = EXCLUDED.value,
+                    min = EXCLUDED.min,
+                    max = EXCLUDED.max,
+                    result = EXCLUDED.result,
+                    test_ct = EXCLUDED.test_ct,
+                    file_path = EXCLUDED.file_path,
+                    updated_at = now();
+                """
+
+                total = len(df2)
+                for start in range(0, total, DIRECT_UPSERT_BATCH_ROWS):
+                    end = min(start + DIRECT_UPSERT_BATCH_ROWS, total)
+                    chunk = df2.iloc[start:end][cols]
+
+                    records = []
+                    for row in chunk.itertuples(index=False, name=None):
+                        records.append(tuple(_py(v) for v in row))
+
+                    execute_values(cur, sql, records, page_size=min(1000, len(records)))
+                    raw.commit()
+                    print(f"[OK] direct upsert batch: {start}~{end-1} ({end-start} rows)", flush=True)
+
+            try:
+                raw.close()
+            except Exception:
+                pass
+
+            print(f"[DONE] UPSERT(DIRECT) 완료: {len(df2)} rows / sec={time.time()-t0:.2f}", flush=True)
+            return
+
+        except Exception as e:
+            print("[DB][RETRY] direct_upsert failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            try:
+                if raw is not None:
+                    raw.close()
+            except Exception:
+                pass
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+            continue
+
 
 def upsert_auto(engine_, df: pd.DataFrame):
     n = int(len(df))
     if n <= 0:
-        print("[SKIP] df empty")
+        print("[SKIP] df empty", flush=True)
         return
 
     if n <= UPSERT_DIRECT_THRESHOLD_ROWS:
-        print(f"[MODE] DIRECT UPSERT (rows={n} <= threshold={UPSERT_DIRECT_THRESHOLD_ROWS})")
+        print(f"[MODE] DIRECT UPSERT (rows={n} <= threshold={UPSERT_DIRECT_THRESHOLD_ROWS})", flush=True)
         direct_upsert(engine_, df)
     else:
-        print(f"[MODE] COPY+STAGING UPSERT (rows={n} > threshold={UPSERT_DIRECT_THRESHOLD_ROWS})")
+        print(f"[MODE] COPY+STAGING UPSERT (rows={n} > threshold={UPSERT_DIRECT_THRESHOLD_ROWS})", flush=True)
         bulk_upsert_copy(engine_, df)
 
 
@@ -1167,34 +1352,39 @@ def upsert_auto(engine_, df: pd.DataFrame):
 # 13) MAIN (운영형, 단발 실행)
 # ============================================================
 def main():
+    # ✅ 시작 시: 연결 성공까지 블로킹
+    get_engine_blocking()
+
     run_start = datetime.now()
-    print("=" * 120)
-    print(f"[RUN] START : {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[RUN] MODE  : DATE_MODE={DATE_MODE}, SAFETY_LOOKBACK_DAYS={SAFETY_LOOKBACK_DAYS}, MAX_DAYS_PER_RUN={MAX_DAYS_PER_RUN}")
-    print("=" * 120)
+    print("=" * 120, flush=True)
+    print(f"[RUN] START : {run_start.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[RUN] MODE  : DATE_MODE={DATE_MODE}, SAFETY_LOOKBACK_DAYS={SAFETY_LOOKBACK_DAYS}, MAX_DAYS_PER_RUN={MAX_DAYS_PER_RUN}", flush=True)
+    print(f"[RUN] DB    : pool_size=1 max_overflow=0 work_mem={WORK_MEM_MB}MB", flush=True)
+    print("=" * 120, flush=True)
 
-    bootstrap_fct_database(engine)
+    bootstrap_fct_database(None)
 
-    d_from, d_to = resolve_date_range(engine)
-    print(f"[RUN] DATE_RANGE : {d_from} ~ {d_to}")
+    d_from, d_to = resolve_date_range(None)
+    print(f"[RUN] DATE_RANGE : {d_from} ~ {d_to}", flush=True)
 
     cur = d_from
     while cur <= d_to:
         day_start = time.time()
-        print("\n" + "-" * 120)
-        print(f"[RUN] DAY : {cur}")
-        print("-" * 120)
+        print("\n" + "-" * 120, flush=True)
+        print(f"[RUN] DAY : {cur}", flush=True)
+        print("-" * 120, flush=True)
 
-        df0 = load_source(engine, cur, cur)
+        # ✅ 끊김 시에도 내부 DB 래퍼가 무한 복구
+        df0 = load_source(None, cur, cur)
         if df0.empty:
-            print("[SKIP] no source rows")
+            print("[SKIP] no source rows", flush=True)
             cur = cur + timedelta(days=1)
             continue
 
-        processed = get_processed_file_paths_cached(engine, cur, df0["file_path"].tolist())
+        processed = get_processed_file_paths_cached(None, cur, df0["file_path"].tolist())
         df0 = apply_file_path_skip(df0, processed)
         if df0.empty:
-            print("[SKIP] all rows skipped by file_path")
+            print("[SKIP] all rows skipped by file_path", flush=True)
             cur = cur + timedelta(days=1)
             continue
 
@@ -1208,9 +1398,9 @@ def main():
         days = df1["end_day_text"].dropna().unique().tolist()
         patterns = [f"%{b}%" for b in df1["barcode_norm"].dropna().unique().tolist()]
 
-        fct = load_fct_table(engine, days, patterns)
+        fct = load_fct_table(None, days, patterns)
         if fct.empty:
-            print("[WARN] fct_table empty for this day -> value/min/max/result will be all NULL")
+            print("[WARN] fct_table empty for this day -> value/min/max/result will be all NULL", flush=True)
 
         df2 = snap_group_cycle_to_fct(df1, fct)
         df3 = match_value_min_max_result_by_cycle(df2, fct)
@@ -1218,28 +1408,28 @@ def main():
         df_final = df3[FINAL_COLS].copy()
 
         if SHOW_PREVIEW:
-            print(df_final.head(200))
+            print(df_final.head(200), flush=True)
 
-        upsert_auto(engine, df_final)
+        upsert_auto(None, df_final)
 
-        print(f"[RUN] DAY DONE : {cur} / rows_final={len(df_final)} / sec={time.time()-day_start:.2f}")
+        print(f"[RUN] DAY DONE : {cur} / rows_final={len(df_final)} / sec={time.time()-day_start:.2f}", flush=True)
         cur = cur + timedelta(days=1)
 
     run_end = datetime.now()
     run_seconds = (run_end - run_start).total_seconds()
-    print("=" * 120)
-    print(f"[RUN] END   : {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[RUN] SEC   : {run_seconds:.2f} sec")
-    print("=" * 120)
-    print("[DONE] 전체 파이프라인 종료")
+    print("=" * 120, flush=True)
+    print(f"[RUN] END   : {run_end.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[RUN] SEC   : {run_seconds:.2f} sec", flush=True)
+    print("=" * 120, flush=True)
+    print("[DONE] 전체 파이프라인 종료", flush=True)
 
 
 # ============================================================
-# 14) REALTIME (공장 운영형) : 오늘자 window + 무한루프 + MP=2 + 워터마크(중복방지)
+# 14) REALTIME (공장 운영형) : 오늘자 window + 무한루프 + MP=1 + 워터마크(중복방지)
 # ============================================================
-REALTIME_LOOP_INTERVAL_SEC = 1
-REALTIME_FETCH_LIMIT_ROWS = 120_000   # 루프 1회당 최대 로드 행수(환경에 맞게 조정)
-REALTIME_LOOKBACK_SEC = 0             # A안: 0(중복 없이). Backfill 많으면 30~120 권장
+REALTIME_LOOP_INTERVAL_SEC = 5
+REALTIME_FETCH_LIMIT_ROWS = 120_000
+REALTIME_LOOKBACK_SEC = 0
 
 REALTIME_DISABLE_FILEPATH_SKIP = True  # ✅ A안: 실시간 모드 file_path skip 비활성(워터마크 + PK로 중복 방지)
 REALTIME_JOB_NAME = f"{OUT_SCHEMA}.{OUT_TABLE}_realtime"
@@ -1247,46 +1437,63 @@ REALTIME_JOB_NAME = f"{OUT_SCHEMA}.{OUT_TABLE}_realtime"
 STATE_TABLE = "etl_state_fct_database"
 STATE_SCHEMA = OUT_SCHEMA
 
-def bootstrap_state_table(engine_):
+
+def bootstrap_state_table(_engine_unused=None):
     """상태(워터마크) 테이블 보장 + DDL race 방지(advisory lock)."""
-    with engine_.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_lock(hashtext(:k)::bigint);"), {"k": f"{STATE_SCHEMA}.{STATE_TABLE}"})
+    while True:
         try:
-            conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {STATE_SCHEMA};"))
-            try:
-                conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS {STATE_SCHEMA}.{STATE_TABLE} (
-                    job_name   TEXT NOT NULL,
-                    worker_id  INT  NOT NULL,
-                    day        DATE NOT NULL,
-                    last_end_time TIME,
-                    updated_at TIMESTAMPTZ DEFAULT now(),
-                    PRIMARY KEY (job_name, worker_id, day)
-                );
-                """))
-            except Exception as e:
-                msg = str(e)
-                if "pg_type_typname_nsp_index" not in msg and "UniqueViolation" not in msg:
-                    raise
+            with begin_blocking() as conn:
+                conn.execute(text("SELECT pg_advisory_lock(hashtext(:k)::bigint);"), {"k": f"{STATE_SCHEMA}.{STATE_TABLE}"})
+                try:
+                    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {STATE_SCHEMA};"))
+                    try:
+                        conn.execute(text(f"""
+                        CREATE TABLE IF NOT EXISTS {STATE_SCHEMA}.{STATE_TABLE} (
+                            job_name   TEXT NOT NULL,
+                            worker_id  INT  NOT NULL,
+                            day        DATE NOT NULL,
+                            last_end_time TIME,
+                            updated_at TIMESTAMPTZ DEFAULT now(),
+                            PRIMARY KEY (job_name, worker_id, day)
+                        );
+                        """))
+                    except Exception as e:
+                        msg = str(e)
+                        if "pg_type_typname_nsp_index" not in msg and "UniqueViolation" not in msg:
+                            raise
 
-            conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_{STATE_TABLE}_day
-            ON {STATE_SCHEMA}.{STATE_TABLE} (day);
-            """))
-        finally:
-            conn.execute(text("SELECT pg_advisory_unlock(hashtext(:k)::bigint);"), {"k": f"{STATE_SCHEMA}.{STATE_TABLE}"})
+                    conn.execute(text(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{STATE_TABLE}_day
+                    ON {STATE_SCHEMA}.{STATE_TABLE} (day);
+                    """))
+                finally:
+                    conn.execute(text("SELECT pg_advisory_unlock(hashtext(:k)::bigint);"), {"k": f"{STATE_SCHEMA}.{STATE_TABLE}"})
 
-    print(f"[OK] state table ensured: {STATE_SCHEMA}.{STATE_TABLE}")
+            print(f"[OK] state table ensured: {STATE_SCHEMA}.{STATE_TABLE}", flush=True)
+            return
 
-def read_watermark_end_time(engine_, worker_id: int, day_: date):
+        except Exception as e:
+            print("[DB][RETRY] bootstrap_state_table failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+
+
+def read_watermark_end_time(_engine_unused, worker_id: int, day_: date):
     sql = text(f"""
         SELECT last_end_time
         FROM {STATE_SCHEMA}.{STATE_TABLE}
         WHERE job_name=:job AND worker_id=:wid AND day=:day
     """)
-    with engine_.connect() as conn:
-        row = conn.execute(sql, {"job": REALTIME_JOB_NAME, "wid": int(worker_id), "day": day_}).fetchone()
-    return row[0] if row and row[0] is not None else None
+    while True:
+        try:
+            with connect_blocking() as conn:
+                row = conn.execute(sql, {"job": REALTIME_JOB_NAME, "wid": int(worker_id), "day": day_}).fetchone()
+            return row[0] if row and row[0] is not None else None
+        except Exception as e:
+            print("[DB][RETRY] read_watermark_end_time failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
+
 
 def _normalize_db_time_value(x):
     try:
@@ -1303,7 +1510,7 @@ def _normalize_db_time_value(x):
     except Exception:
         return None
 
-def write_watermark_end_time(engine_, worker_id: int, day_: date, last_end_time_):
+def write_watermark_end_time(_engine_unused, worker_id: int, day_: date, last_end_time_):
     last_end_time_ = _normalize_db_time_value(last_end_time_)
     sql = text(f"""
         INSERT INTO {STATE_SCHEMA}.{STATE_TABLE} (job_name, worker_id, day, last_end_time, updated_at)
@@ -1311,10 +1518,18 @@ def write_watermark_end_time(engine_, worker_id: int, day_: date, last_end_time_
         ON CONFLICT (job_name, worker_id, day)
         DO UPDATE SET last_end_time=EXCLUDED.last_end_time, updated_at=now()
     """)
-    with engine_.begin() as conn:
-        conn.execute(sql, {"job": REALTIME_JOB_NAME, "wid": int(worker_id), "day": day_, "t": last_end_time_})
+    while True:
+        try:
+            with begin_blocking() as conn:
+                conn.execute(sql, {"job": REALTIME_JOB_NAME, "wid": int(worker_id), "day": day_, "t": last_end_time_})
+            return
+        except Exception as e:
+            print("[DB][RETRY] write_watermark_end_time failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            safe_engine_recover()
+            time.sleep(DB_RETRY_SLEEP_SEC)
 
-def _time_minus_seconds(t: dtime, seconds: int) -> dtime:
+
+def _time_minus_seconds(t: dtime, seconds: int):
     if t is None:
         return None
     base = datetime.combine(date.today(), t)
@@ -1323,7 +1538,7 @@ def _time_minus_seconds(t: dtime, seconds: int) -> dtime:
         return dtime(0, 0, 0)
     return base2.time()
 
-def _safe_max_time_end_time(series) -> dtime | None:
+def _safe_max_time_end_time(series):
     """end_time 컬럼에서 워터마크로 쓸 최대 TIME을 안전하게 계산."""
     if series is None:
         return None
@@ -1369,7 +1584,11 @@ def _safe_max_time_end_time(series) -> dtime | None:
         return None
     return max(parsed)
 
-def load_source_realtime_today(engine_, day_: date, last_end_time_, worker_id: int, limit_rows: int) -> pd.DataFrame:
+
+def load_source_realtime_today(_engine_unused, day_: date, last_end_time_, limit_rows: int) -> pd.DataFrame:
+    """
+    ✅ MP=1로 변경되었으므로, 기존 worker_id 분할(md5 % 2) 제거.
+    """
     if last_end_time_ is None:
         cursor_t = dtime(0, 0, 0)
     else:
@@ -1378,7 +1597,7 @@ def load_source_realtime_today(engine_, day_: date, last_end_time_, worker_id: i
     if REALTIME_LOOKBACK_SEC and last_end_time_ is not None:
         cursor_t = _time_minus_seconds(last_end_time_, REALTIME_LOOKBACK_SEC)
 
-    sql = f"""
+    sql = text(f"""
     SELECT
         barcode_information,
         remark,
@@ -1391,17 +1610,11 @@ def load_source_realtime_today(engine_, day_: date, last_end_time_, worker_id: i
     FROM {SRC_SCHEMA}.{SRC_TABLE}
     WHERE end_day = :day
       AND end_time > :t
-      AND (get_byte(decode(md5(COALESCE(barcode_information,'')), 'hex'), 0) % 2) = :wid
     ORDER BY end_time ASC
     LIMIT :lim
-    """
-    with engine_.connect() as conn:
-        df = pd.read_sql(
-            text(sql),
-            conn,
-            params={"day": day_, "t": cursor_t, "wid": int(worker_id), "lim": int(limit_rows)},
-        )
+    """)
 
+    df = read_sql_blocking(sql, params={"day": day_, "t": cursor_t, "lim": int(limit_rows)})
     if df.empty:
         return df
 
@@ -1432,7 +1645,8 @@ def load_source_realtime_today(engine_, day_: date, last_end_time_, worker_id: i
 
     return df
 
-def process_chunk_one_loop(engine_, worker_id: int, day_: date, df0: pd.DataFrame) -> tuple[int, dtime]:
+
+def process_chunk_one_loop(_engine_unused, day_: date, df0: pd.DataFrame):
     if df0 is None or df0.empty:
         return 0, None
 
@@ -1441,7 +1655,7 @@ def process_chunk_one_loop(engine_, worker_id: int, day_: date, df0: pd.DataFram
 
     # A안: 실시간에서는 file_path skip 비활성
     if not REALTIME_DISABLE_FILEPATH_SKIP:
-        processed = get_processed_file_paths_cached(engine_, day_, df0["file_path"].tolist())
+        processed = get_processed_file_paths_cached(None, day_, df0["file_path"].tolist())
         df0 = apply_file_path_skip(df0, processed)
 
     if df0.empty:
@@ -1457,34 +1671,40 @@ def process_chunk_one_loop(engine_, worker_id: int, day_: date, df0: pd.DataFram
     days = df1["end_day_text"].dropna().unique().tolist()
     patterns = [f"%{b}%" for b in df1["barcode_norm"].dropna().unique().tolist()]
 
-    fct = load_fct_table(engine_, days, patterns)
+    fct = load_fct_table(None, days, patterns)
 
     df2 = snap_group_cycle_to_fct(df1, fct)
     df3 = match_value_min_max_result_by_cycle(df2, fct)
 
     df_final = df3[FINAL_COLS].copy()
 
-    upsert_auto(engine_, df_final)
+    upsert_auto(None, df_final)
 
     return int(len(df_final)), max_t
 
-def worker_loop(worker_id: int):
-    try:
-        mp.current_process().name = f"Worker-{worker_id}"
-    except Exception:
-        pass
 
-    local_engine = get_engine(DB_CONFIG)
+def realtime_loop_single():
+    """
+    ✅ MP=1: 단일 프로세스에서 무한 루프 수행
+    ✅ DB 연결 실패/끊김 시 블로킹 재연결(성공할 때까지) 후 자동 복구
+    """
+    worker_id = 0
     last_day = None
 
-    print("=" * 120)
-    print(f"[WORKER-{worker_id}] START | loop={REALTIME_LOOP_INTERVAL_SEC}s | limit={REALTIME_FETCH_LIMIT_ROWS} | lookback={REALTIME_LOOKBACK_SEC}s")
-    print("=" * 120)
+    print("=" * 120, flush=True)
+    print(f"[REALTIME] START | loop={REALTIME_LOOP_INTERVAL_SEC}s | limit={REALTIME_FETCH_LIMIT_ROWS} | lookback={REALTIME_LOOKBACK_SEC}s | work_mem={WORK_MEM_MB}MB", flush=True)
+    print("=" * 120, flush=True)
+
+    # ✅ 시작 시: 연결/부트스트랩 블로킹 보장
+    get_engine_blocking()
+    bootstrap_fct_database(None)
+    bootstrap_state_table(None)
 
     while True:
-        t_loop0 = time.time()
+        t0 = time.time()
         day_ = datetime.now().date()
 
+        # 날짜 넘어가면 캐시 초기화
         if last_day is None or day_ != last_day:
             try:
                 _processed_paths_cache.clear()
@@ -1492,60 +1712,55 @@ def worker_loop(worker_id: int):
                 pass
             last_day = day_
 
-        last_end_time_ = read_watermark_end_time(local_engine, worker_id, day_)
-
-        df0 = load_source_realtime_today(
-            local_engine,
-            day_,
-            last_end_time_,
-            worker_id=worker_id,
-            limit_rows=REALTIME_FETCH_LIMIT_ROWS,
-        )
-
-        if df0 is None or df0.empty:
-            elapsed = time.time() - t_loop0
-            time.sleep(max(0.0, REALTIME_LOOP_INTERVAL_SEC - elapsed))
-            continue
-
         try:
-            rows_in, max_t = process_chunk_one_loop(local_engine, worker_id, day_, df0)
+            last_end_time_ = read_watermark_end_time(None, worker_id, day_)
+
+            df0 = load_source_realtime_today(
+                None,
+                day_,
+                last_end_time_,
+                limit_rows=REALTIME_FETCH_LIMIT_ROWS,
+            )
+
+            if df0 is not None and not df0.empty:
+                rows_in, max_t = process_chunk_one_loop(None, day_, df0)
+
+                if max_t is not None:
+                    write_watermark_end_time(None, worker_id, day_, max_t)
+
+                elapsed = time.time() - t0
+                print(f"[REALTIME] day={day_} loaded={len(df0)} upsert_in={rows_in} watermark={max_t} sec={elapsed:.2f}", flush=True)
+
         except Exception as e:
-            print(f"[WORKER-{worker_id}][ERROR] pipeline failed: {type(e).__name__}: {e}")
-            elapsed = time.time() - t_loop0
-            time.sleep(max(0.0, REALTIME_LOOP_INTERVAL_SEC - elapsed))
-            continue
+            # ✅ 어떤 예외든: 엔진을 강제 리셋하고 다음 루프에서 블로킹 재연결
+            print(f"[REALTIME][ERROR] {type(e).__name__}: {e}", flush=True)
+            safe_engine_recover()
+            bootstrap_fct_database(None)
+            bootstrap_state_table(None)
 
-        if max_t is not None:
-            write_watermark_end_time(local_engine, worker_id, day_, max_t)
+        # 루프 간격 5초 맞추기
+        elapsed = time.time() - t0
+        sleep_sec = max(0.0, REALTIME_LOOP_INTERVAL_SEC - elapsed)
+        time.sleep(sleep_sec)
 
-        elapsed = time.time() - t_loop0
-        print(f"[WORKER-{worker_id}] day={day_} loaded={len(df0)} upsert_in={rows_in} watermark={max_t} sec={elapsed:.2f}")
-        time.sleep(max(0.0, REALTIME_LOOP_INTERVAL_SEC - elapsed))
 
 def realtime_main():
+    # EXE + multiprocessing 안정화(요청: MP=1이지만 freeze_support는 유지)
     try:
         mp.set_start_method("spawn", force=True)
     except Exception:
         pass
 
-    parent_engine = get_engine(DB_CONFIG)
-    bootstrap_fct_database(parent_engine)
-    bootstrap_state_table(parent_engine)
-
-    procs = []
-    for wid in (0, 1):
-        p = mp.Process(target=worker_loop, args=(wid,), daemon=False)
-        p.start()
-        procs.append(p)
-
-    for p in procs:
-        p.join()
+    realtime_loop_single()
 
 
+# ============================================================
+# 15) Entry
+# ============================================================
 if __name__ == "__main__":
     # =========================
     # 실행 모드 선택
-    #  - REALTIME_TODAY = True  : 공장 실시간(오늘자 window) 무한루프 + MP=2
+    #  - REALTIME_TODAY = True  : 공장 실시간(오늘자 window) 무한루프 + MP=1
     #  - REALTIME_TODAY = False : 기존 단발(기간 처리) main()
     # =========================
     REALTIME_TODAY = True

@@ -8,13 +8,24 @@ a2_fct_table_parser_mp_realtime.py (Nuitka/Windows onefile + realtime loop)
 - run 내 중복 방지: file_path 단독
 - 날짜 변경(자정) 감지 시: 캐시 초기화 + 오늘 DB file_path 재로딩
 - ⚠️ fct_table은 파일 1개당 여러 row 구조이므로 file_path UNIQUE 인덱스는 생성하지 않음
+
+[추가/수정 사양 반영]
+- 멀티프로세스 = 1개
+- 무한 루프 인터벌 5초
+- DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
+- 백엔드별 상시 연결을 1개로 고정(풀 최소화)  -> 프로세스 전체에서 psycopg2 커넥션 1개만 유지/재사용
+- work_mem 폭증 방지 -> 연결 직후 세션에 SET work_mem 적용(환경변수로 조정 가능)
+
+[추가 반영(요청사항)]
+- ✅ 실행 중(쿼리/커밋/INSERT 중 포함) 서버 연결이 끊겨도 무한 재접속 후 자동 재시도
+- ✅ keepalive 옵션(권장) 추가: 죽은 TCP 세션 감지 가속
+- ✅ 연결 오류 판별 강화(OperationalError/InterfaceError + 메시지 키워드)
 """
 
 from __future__ import annotations
 
 import os
 import re
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +40,10 @@ from psycopg2.extras import execute_values
 # 0) 사용자 설정
 # =========================
 
+# ✅ (중요) psycopg2/libpq 에러 메시지 인코딩 이슈 방지(EXE에서 UnicodeDecodeError 예방)
+os.environ.setdefault("PGCLIENTENCODING", "UTF8")
+os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
+
 BASE_DIR = Path(r"\\192.168.108.101\HistoryLog")
 
 TC_TO_STATION = {
@@ -42,7 +57,7 @@ TARGET_SUBFOLDERS = ["GoodFile", "BadFile"]
 
 # DB 설정
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
@@ -55,10 +70,14 @@ TABLE_NAME  = "fct_table"
 # =========================
 # Realtime / Loop 사양
 # =========================
-USE_MULTIPROCESSING = True
-MAX_WORKERS = 2
 
-LOOP_INTERVAL_SEC = 1.0
+# ✅ 요구사항: 멀티프로세스 = 1개
+USE_MULTIPROCESSING = False   # 기능은 유지(코드 구조), 하지만 요구사항에 따라 비활성
+MAX_WORKERS = 1               # 명시적으로 1
+
+# ✅ 요구사항: 무한 루프 인터벌 5초
+LOOP_INTERVAL_SEC = 5.0
+
 RECENT_SECONDS = 120
 
 # ✅ 저장 중(미완성) 파싱 방지 파라미터
@@ -77,10 +96,23 @@ POOL_CHUNKSIZE = 500
 FLUSH_ROWS_REALTIME = 20_000
 EXECUTE_VALUES_PAGE_SIZE = 5_000
 
-HEARTBEAT_EVERY_LOOPS = 30  # 30루프(약 30초)마다 상태 로그
+HEARTBEAT_EVERY_LOOPS = 30  # 30루프마다 상태 로그
 
 # ✅ DB에서 "오늘 end_day" 기준 file_path 재로딩 주기(루프 횟수)
-DB_RELOAD_EVERY_LOOPS = 120  # 약 2분(1초 루프 기준)
+DB_RELOAD_EVERY_LOOPS = 120  # 약 10분(5초 루프 기준)
+
+# ✅ 요구사항: DB 접속 실패 시 무한 재시도(블로킹)
+DB_RETRY_INTERVAL_SEC = 5.0
+
+# ✅ 요구사항: work_mem 폭증 방지(세션별 cap) - 환경변수로 조정 가능
+#    예) set PG_WORK_MEM=8MB
+WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
+
+# ✅ (추가/권장) 끊긴 TCP 세션을 빠르게 감지하기 위한 keepalive
+PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
+PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
+PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
+PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
 
 # =========================
@@ -448,20 +480,152 @@ INSERT INTO {SCHEMA_NAME}.{TABLE_NAME} ({INSERT_COLS})
 VALUES %s
 """
 
-def get_conn():
-    return psycopg2.connect(
-        host=DB_CONFIG["host"],
-        port=DB_CONFIG["port"],
-        dbname=DB_CONFIG["dbname"],
-        user=DB_CONFIG["user"],
-        password=DB_CONFIG["password"],
-    )
+def _apply_session_safety(conn) -> None:
+    """
+    ✅ work_mem 폭증 방지: 세션에 cap 적용
+    + ping(SELECT 1)으로 연결 유효성 확인
+    """
+    with conn.cursor() as cur:
+        cur.execute("SET work_mem TO %s;", (WORK_MEM,))
+        cur.execute("SELECT 1;")
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+_CONN = None  # ✅ 백엔드별 상시 연결 1개 고정(프로세스 전체 1개)
+
+def _safe_close(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+def _reset_conn(reason: str = ""):
+    """커넥션 강제 폐기 + 다음 ensure_conn에서 무한 재연결 유도"""
+    global _CONN
+    try:
+        if reason:
+            log(f"[DB][RESET] {reason}")
+    except Exception:
+        pass
+    try:
+        _safe_close(_CONN)
+    except Exception:
+        pass
+    _CONN = None
+
+def _is_connection_error(e: Exception) -> bool:
+    """
+    서버 끊김/네트워크/소켓/세션 종료 등 '재연결'이 필요한 오류인지 판단
+    """
+    if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        return True
+
+    msg = (str(e) or "").lower()
+    keywords = [
+        "server closed the connection",
+        "connection not open",
+        "terminating connection",
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+        "ssl connection has been closed",
+        "broken pipe",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+    ]
+    return any(k in msg for k in keywords)
+
+def get_conn_blocking():
+    """
+    ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
+    """
+    while True:
+        try:
+            conn = psycopg2.connect(
+                host=DB_CONFIG["host"],
+                port=DB_CONFIG["port"],
+                dbname=DB_CONFIG["dbname"],
+                user=DB_CONFIG["user"],
+                password=DB_CONFIG["password"],
+                connect_timeout=5,
+                application_name="a2_fct_table_parser_mp_realtime",
+
+                # keepalive 옵션 (libpq 지원)
+                keepalives=PG_KEEPALIVES,
+                keepalives_idle=PG_KEEPALIVES_IDLE,
+                keepalives_interval=PG_KEEPALIVES_INTERVAL,
+                keepalives_count=PG_KEEPALIVES_COUNT,
+            )
+            conn.autocommit = False
+            _apply_session_safety(conn)
+            log(
+                f"[DB][OK] connected (work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
+            )
+            return conn
+        except Exception as e:
+            log(f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}")
+            try:
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+            except Exception:
+                pass
+
+def ensure_conn():
+    """
+    ✅ 상시 연결 1개 유지 + 죽으면 무한 재연결(블로킹)
+    """
+    global _CONN
+    if _CONN is None:
+        _CONN = get_conn_blocking()
+        return _CONN
+
+    if getattr(_CONN, "closed", 1) != 0:
+        _reset_conn("conn.closed != 0")
+        _CONN = get_conn_blocking()
+        return _CONN
+
+    try:
+        _apply_session_safety(_CONN)
+        return _CONN
+    except Exception as e:
+        if _is_connection_error(e):
+            log(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}")
+            _reset_conn("ping failed")
+            _CONN = get_conn_blocking()
+            return _CONN
+        raise
 
 def ensure_schema_table() -> None:
-    with get_conn() as conn:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(DDL_SQL)
+    """
+    schema/table/index 생성.
+    ✅ 실행 중 끊김 포함: 실패 시 무한 재시도.
+    """
+    while True:
+        conn = ensure_conn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(DDL_SQL)
+            conn.autocommit = False
+            return
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                log(f"[DB][RETRY] ensure_schema_table failed(conn): {type(e).__name__}: {repr(e)}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("ensure_schema_table connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            log(f"[DB][FATAL] ensure_schema_table db error: {type(e).__name__}: {repr(e)}")
+            raise
+        except Exception:
+            raise
 
 def flush_rows(cur, buffer_rows: List[RowTuple]) -> int:
     if not buffer_rows:
@@ -479,6 +643,7 @@ def load_db_file_paths_today(conn, end_day_today: str) -> Set[str]:
     ✅ 오늘(end_day=오늘) 기준으로 fct_table에 이미 저장된 file_path 목록을 로드 (DISTINCT)
     - file_path 단독 중복 방지
     - 메모리 절감을 위해 '오늘'만
+    ✅ 실행 중 끊김 포함: 호출부에서 무한 재시도
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -509,11 +674,14 @@ def realtime_loop() -> int:
     log(f"[INFO] TODAY(end_day) ONLY = {today_yyyymmdd()}")
     log(f"[INFO] RECENT_SECONDS(mtime) = {RECENT_SECONDS}")
     log(f"[INFO] LOOP_INTERVAL_SEC = {LOOP_INTERVAL_SEC}")
-    log(f"[INFO] MULTIPROCESSING = {USE_MULTIPROCESSING} | workers={MAX_WORKERS if USE_MULTIPROCESSING else 1}")
+    log(f"[INFO] MULTIPROCESSING = {USE_MULTIPROCESSING} | workers=1")
     log(f"[INFO] TARGET = {SCHEMA_NAME}.{TABLE_NAME}")
     log(f"[INFO] MIN_FILE_AGE_SEC={MIN_FILE_AGE_SEC} | STABILITY_CHECK_SEC={STABILITY_CHECK_SEC} | STABILITY_RETRY={STABILITY_RETRY}")
     log(f"[INFO] LOCK_GLOB_PATTERNS={LOCK_GLOB_PATTERNS}")
     log(f"[INFO] DB_RELOAD_EVERY_LOOPS={DB_RELOAD_EVERY_LOOPS}")
+    log(f"[INFO] DB_RETRY_INTERVAL_SEC={DB_RETRY_INTERVAL_SEC}")
+    log(f"[INFO] WORK_MEM(cap)={WORK_MEM}")
+    log(f"[INFO] keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}")
     log("============================================================")
 
     log("[STEP] Ensure schema/table/index ...")
@@ -523,94 +691,155 @@ def realtime_loop() -> int:
     processed: Dict[str, ProcessedInfo] = {}
     loop_count = 0
 
-    # DB connection은 루프 동안 유지
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            if USE_MULTIPROCESSING:
-                ctx = mp.get_context("spawn")
-                pool = ctx.Pool(processes=MAX_WORKERS)
-            else:
-                pool = None
+    # ✅ 상시 연결 1개 유지
+    conn = ensure_conn()
 
-            # ✅ 오늘 기준 DB file_path 캐시
-            current_day = today_yyyymmdd()
+    # pool 변수는 기존 기능 구조를 유지하기 위해 남겨두되, 요구사항에 따라 사용하지 않음
+    pool = None
+
+    # ✅ 오늘 기준 DB file_path 캐시
+    current_day = today_yyyymmdd()
+    while True:
+        try:
+            conn = ensure_conn()
             already_in_db_paths_today: Set[str] = load_db_file_paths_today(conn, current_day)
             log(f"[DB] Loaded DISTINCT file_path for end_day={current_day}: {len(already_in_db_paths_today):,}")
+            break
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                log(f"[DB][RETRY] load_db_file_paths_today failed(conn): {type(e).__name__}: {repr(e)}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("load_db_file_paths_today connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            log(f"[DB][FATAL] load_db_file_paths_today db error: {type(e).__name__}: {repr(e)}")
+            raise
+        except Exception:
+            raise
 
-            try:
+    try:
+        while True:
+            loop_count += 1
+            loop_start = time.perf_counter()
+            now_dt = datetime.now()
+            today_str = now_dt.strftime("%Y%m%d")
+
+            # ✅ 날짜 변경 감지(자정): 캐시 초기화 + DB file_path 재로딩
+            if today_str != current_day:
+                current_day = today_str
+                processed.clear()
+
                 while True:
-                    loop_count += 1
-                    loop_start = time.perf_counter()
-                    now_dt = datetime.now()
-                    today_str = now_dt.strftime("%Y%m%d")
-
-                    # ✅ 날짜 변경 감지(자정): 캐시 초기화 + DB file_path 재로딩
-                    if today_str != current_day:
-                        current_day = today_str
-                        processed.clear()
+                    try:
+                        conn = ensure_conn()
                         already_in_db_paths_today = load_db_file_paths_today(conn, current_day)
                         log(f"[DAY-CHANGE] today={current_day} | reset caches | db_paths={len(already_in_db_paths_today):,}")
+                        break
+                    except psycopg2.Error as e:
+                        if _is_connection_error(e):
+                            log(f"[DB][RETRY] day-change reload failed(conn): {type(e).__name__}: {repr(e)}")
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            _reset_conn("day-change reload connection error")
+                            time.sleep(DB_RETRY_INTERVAL_SEC)
+                            continue
+                        log(f"[DB][FATAL] day-change reload db error: {type(e).__name__}: {repr(e)}")
+                        raise
+                    except Exception:
+                        raise
 
-                    # ✅ 주기적 DB file_path 재로딩(프로그램 재시작/타 프로세스 적재 반영)
-                    if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
+            # ✅ 주기적 DB file_path 재로딩(프로그램 재시작/타 프로세스 적재 반영)
+            if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
+                while True:
+                    try:
+                        conn = ensure_conn()
                         already_in_db_paths_today = load_db_file_paths_today(conn, current_day)
                         log(f"[DB-RELOAD] end_day={current_day} | db_paths={len(already_in_db_paths_today):,}")
+                        break
+                    except psycopg2.Error as e:
+                        if _is_connection_error(e):
+                            log(f"[DB][RETRY] periodic reload failed(conn): {type(e).__name__}: {repr(e)}")
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            _reset_conn("periodic reload connection error")
+                            time.sleep(DB_RETRY_INTERVAL_SEC)
+                            continue
+                        log(f"[DB][FATAL] periodic reload db error: {type(e).__name__}: {repr(e)}")
+                        raise
+                    except Exception:
+                        raise
 
-                    # 1) 최근 파일 수집 (✅ DB에 이미 있는 file_path는 스킵)
-                    jobs = collect_recent_files(processed, already_in_db_paths_today, current_day)
+            # 1) 최근 파일 수집 (✅ DB에 이미 있는 file_path는 스킵)
+            jobs = collect_recent_files(processed, already_in_db_paths_today, current_day)
 
-                    if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
-                        log(f"[HEARTBEAT] {now_dt:%Y-%m-%d %H:%M:%S} | jobs={len(jobs):,} | cache={len(processed):,} | db_paths={len(already_in_db_paths_today):,} | today={current_day}")
+            if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
+                log(f"[HEARTBEAT] {now_dt:%Y-%m-%d %H:%M:%S} | jobs={len(jobs):,} | cache={len(processed):,} | db_paths={len(already_in_db_paths_today):,} | today={current_day}")
 
-                    if not jobs:
-                        elapsed = time.perf_counter() - loop_start
-                        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-                        if sleep_sec > 0:
-                            time.sleep(sleep_sec)
-                        continue
+            if not jobs:
+                elapsed = time.perf_counter() - loop_start
+                sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+                if sleep_sec > 0:
+                    time.sleep(sleep_sec)
+                continue
 
-                    # 2) 파싱 + insert
-                    buffer: List[RowTuple] = []
-                    files_processed = 0
-                    rows_inserted = 0
+            # 2) 파싱 + insert
+            buffer: List[RowTuple] = []
+            files_processed = 0
+            rows_inserted = 0
 
-                    if USE_MULTIPROCESSING and pool is not None:
-                        for rows in pool.imap_unordered(parse_one_file, jobs, chunksize=POOL_CHUNKSIZE):
-                            files_processed += 1
-                            if rows:
-                                buffer.extend(rows)
+            # ✅ 요구사항: 멀티프로세스 1개 -> 단일 프로세스로 순차 파싱
+            for j in jobs:
+                rows = parse_one_file(j)
+                files_processed += 1
+                if rows:
+                    buffer.extend(rows)
 
-                            if len(buffer) >= FLUSH_ROWS_REALTIME:
+                if len(buffer) >= FLUSH_ROWS_REALTIME:
+                    # ✅ DB 작업 도중 끊겨도 무한 재연결 후 flush 재시도
+                    while True:
+                        conn = ensure_conn()
+                        try:
+                            with conn.cursor() as cur:
                                 inserted = flush_rows(cur, buffer)
-                                conn.commit()
-                                rows_inserted += inserted
+                            conn.commit()
+                            rows_inserted += inserted
 
-                                # ✅ 방금 처리된 파일들 file_path를 DB캐시에 즉시 반영(중복 방지 강화)
-                                for r in buffer:
-                                    already_in_db_paths_today.add(r[-1])  # file_path
+                            # ✅ 방금 처리된 파일들 file_path를 DB캐시에 즉시 반영(중복 방지 강화)
+                            for r in buffer:
+                                already_in_db_paths_today.add(r[-1])
 
-                                log(f"[FLUSH] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
-                                buffer.clear()
-                    else:
-                        for j in jobs:
-                            rows = parse_one_file(j)
-                            files_processed += 1
-                            if rows:
-                                buffer.extend(rows)
+                            log(f"[FLUSH] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
+                            buffer.clear()
+                            break
 
-                            if len(buffer) >= FLUSH_ROWS_REALTIME:
-                                inserted = flush_rows(cur, buffer)
-                                conn.commit()
-                                rows_inserted += inserted
+                        except psycopg2.Error as e:
+                            if _is_connection_error(e):
+                                log(f"[DB][RETRY] flush failed(conn): {type(e).__name__}: {repr(e)}")
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                                _reset_conn("flush connection error")
+                                time.sleep(DB_RETRY_INTERVAL_SEC)
+                                continue
+                            log(f"[DB][FATAL] flush db error: {type(e).__name__}: {repr(e)}")
+                            raise
+                        except Exception:
+                            raise
 
-                                for r in buffer:
-                                    already_in_db_paths_today.add(r[-1])
-
-                                log(f"[FLUSH] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
-                                buffer.clear()
-
-                    if buffer:
-                        inserted = flush_rows(cur, buffer)
+            if buffer:
+                while True:
+                    conn = ensure_conn()
+                    try:
+                        with conn.cursor() as cur:
+                            inserted = flush_rows(cur, buffer)
                         conn.commit()
                         rows_inserted += inserted
 
@@ -619,22 +848,38 @@ def realtime_loop() -> int:
 
                         log(f"[FLUSH-LAST] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
                         buffer.clear()
+                        break
 
-                    log(f"[LOOP] {now_dt:%H:%M:%S} | jobs={len(jobs):,} | files={files_processed:,} | inserted_rows={rows_inserted:,}")
-
-                    # 3) 1초 주기 유지
-                    elapsed = time.perf_counter() - loop_start
-                    sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-                    if sleep_sec > 0:
-                        time.sleep(sleep_sec)
-
-            finally:
-                if pool is not None:
-                    try:
-                        pool.close()
-                        pool.join()
+                    except psycopg2.Error as e:
+                        if _is_connection_error(e):
+                            log(f"[DB][RETRY] flush-last failed(conn): {type(e).__name__}: {repr(e)}")
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            _reset_conn("flush-last connection error")
+                            time.sleep(DB_RETRY_INTERVAL_SEC)
+                            continue
+                        log(f"[DB][FATAL] flush-last db error: {type(e).__name__}: {repr(e)}")
+                        raise
                     except Exception:
-                        pass
+                        raise
+
+            log(f"[LOOP] {now_dt:%H:%M:%S} | jobs={len(jobs):,} | files={files_processed:,} | inserted_rows={rows_inserted:,}")
+
+            # 3) 5초 주기 유지
+            elapsed = time.perf_counter() - loop_start
+            sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+    finally:
+        if pool is not None:
+            try:
+                pool.close()
+                pool.join()
+            except Exception:
+                pass
 
     return 0
 
