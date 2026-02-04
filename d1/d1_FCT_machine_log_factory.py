@@ -19,6 +19,11 @@
 # - Engine 1개 재사용(풀 최소: pool_size=1, max_overflow=0, pool_pre_ping)
 # - work_mem 세션에 SET (환경변수 PG_WORK_MEM)
 # - keepalive 옵션(connect_args)
+#
+# ✅ 추가 반영(이번 요청)
+# - 콘솔 + 파일 로그 저장(날짜별 롤링)
+# - 로그 경로: C:\AptivAgent\logs\d1_FC_machine_log_factory\
+# - get_engine_blocking() None.connect 무한루프 구조 제거(vision에서 발생했던 동일 문제 예방)
 # ============================================
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import os
 import re
 import time as time_mod
 import atexit
+import traceback
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,11 +41,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
 import urllib.parse
 
-# (권장) psycopg2 extras for fast bulk insert
+# psycopg2 extras for fast bulk insert
 try:
-    import psycopg2.extras
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
 except Exception:
-    psycopg2 = None
+    psycopg2 = None  # type: ignore
 
 
 # ============================================
@@ -47,6 +54,39 @@ except Exception:
 # ============================================
 os.environ.setdefault("PGCLIENTENCODING", "UTF8")
 os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
+
+
+# ============================================
+# ✅ 로그(콘솔 + 파일) / 날짜별 롤링
+# ============================================
+LOG_DIR = Path(os.getenv("D1_FCT_LOG_DIR", r"C:\AptivAgent\logs\d1_FC_machine_log_factory"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_FILE_LOG_DISABLED = False
+
+def _log_file_path():
+    day = datetime.now().strftime("%Y%m%d")
+    return LOG_DIR / f"fct_machine_log_parser_realtime_optimized_{day}.log"
+
+def log(msg: str):
+    global _FILE_LOG_DISABLED
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    if _FILE_LOG_DISABLED:
+        return
+    try:
+        fp = _log_file_path()
+        with fp.open("a", encoding="utf-8", errors="ignore") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        _FILE_LOG_DISABLED = True
+        print(f"[{ts}] [WARN] file logging disabled due to error: {type(e).__name__}: {e}", flush=True)
+
+def log_exc(prefix: str, e: Exception):
+    log(f"{prefix}: {type(e).__name__}: {repr(e)}")
+    tb = traceback.format_exc()
+    for line in tb.rstrip().splitlines():
+        log(f"{prefix} TRACE: {line}")
 
 
 # ============================================
@@ -88,11 +128,11 @@ SLEEP_SEC = int(os.getenv("SLEEP_SEC", "5"))
 PARSE_WORKERS = int(os.getenv("PARSE_WORKERS", "4"))
 
 # ============================================
-# 4) offset 기반 tail-follow 캐시 (진짜 byte offset)
+# offset 기반 tail-follow 캐시 (진짜 byte offset)
 # ============================================
 PROCESSED_OFFSET: dict[str, int] = {}  # path(str) -> int(byte_offset)
 
-CURSOR_SAVE_INTERVAL_SEC = int(os.getenv("CURSOR_SAVE_INTERVAL_SEC", "30"))  # ✅ 5 -> 30 (기본)
+CURSOR_SAVE_INTERVAL_SEC = int(os.getenv("CURSOR_SAVE_INTERVAL_SEC", "30"))  # 기본 30초
 _last_cursor_save_ts = 0.0
 _cursor_dirty_paths: set[str] = set()
 
@@ -178,40 +218,48 @@ def _build_engine(cfg=DB_CONFIG):
             "application_name": "fct_machine_log_parser_realtime_optimized",
         },
     )
-    print(f"[INFO] DB = {_masked_db_info(cfg)}", flush=True)
+    log(f"[INFO] DB = {_masked_db_info(cfg)}")
     return eng
 
 
 def get_engine_blocking():
-    """Engine 1개 재사용 + 접속 실패/끊김 시 무한 재시도(블로킹) + 세션 work_mem 적용"""
+    """
+    Engine 1개 재사용 + 접속 실패/끊김 시 무한 재시도(블로킹) + 세션 work_mem 적용
+
+    ✅ (중요) None.connect 무한루프 방지:
+    - ping 실패 시 _dispose_engine()로 _ENGINE=None이 되면,
+      그 즉시 ping 루프를 빠져나와 "새 엔진 생성 루프"로 내려가게 함.
+    """
     global _ENGINE
 
-    if _ENGINE is not None:
-        while True:
-            try:
-                with _ENGINE.connect() as conn:
-                    conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
-                    conn.execute(text("SELECT 1"))
-                return _ENGINE
-            except Exception as e:
-                print(f"[DB][RETRY] engine ping failed -> rebuild: {type(e).__name__}: {repr(e)}", flush=True)
-                _dispose_engine()
-                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+    # 1) 기존 엔진 ping
+    while _ENGINE is not None:
+        try:
+            with _ENGINE.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text("SELECT 1"))
+            return _ENGINE
+        except Exception as e:
+            log(f"[DB][RETRY] engine ping failed -> rebuild")
+            log_exc("[DB][RETRY] ping error", e)
+            _dispose_engine()
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
+    # 2) 새 엔진 생성
     while True:
         try:
             _ENGINE = _build_engine(DB_CONFIG)
             with _ENGINE.connect() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
-            print(
+            log(
                 f"[DB][OK] engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
-                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
-                flush=True,
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
             )
             return _ENGINE
         except Exception as e:
-            print(f"[DB][RETRY] engine create/connect failed: {type(e).__name__}: {repr(e)}", flush=True)
+            log(f"[DB][RETRY] engine create/connect failed")
+            log_exc("[DB][RETRY] connect error", e)
             _dispose_engine()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -231,11 +279,11 @@ CREATE TABLE IF NOT EXISTS {schema}.{table} (
 
 CREATE_CURSOR_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {SCHEMA}.{CURSOR_TABLE} (
-    path         TEXT PRIMARY KEY,     -- 파일 전체 경로(UNC 포함)
-    file_day     VARCHAR(8) NOT NULL,  -- YYYYMMDD (파일명 기준)
-    station      VARCHAR(10),          -- FCT1~4
-    byte_offset  BIGINT NOT NULL,      -- 마지막으로 읽은 파일 byte 위치 (✅ 진짜 byte)
-    file_size    BIGINT,               -- 참고용
+    path         TEXT PRIMARY KEY,
+    file_day     VARCHAR(8) NOT NULL,
+    station      VARCHAR(10),
+    byte_offset  BIGINT NOT NULL,
+    file_size    BIGINT,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
@@ -256,7 +304,7 @@ def ensure_schema_and_tables(engine):
                 for station, table_quoted in TABLE_BY_STATION.items():
                     ddl = CREATE_TABLE_TEMPLATE.format(schema=SCHEMA, table=table_quoted)
                     conn.execute(text(ddl))
-                    print(f"[INFO] Table ensured: {SCHEMA}.{table_quoted}", flush=True)
+                    log(f"[INFO] Table ensured: {SCHEMA}.{table_quoted}")
 
                     idx_name = f"ux_{SCHEMA}_{_index_safe_name(table_quoted)}_dedup"
                     conn.execute(
@@ -267,27 +315,29 @@ def ensure_schema_and_tables(engine):
                             """
                         )
                     )
-                    print(f"[INFO] Unique index ensured: {idx_name}", flush=True)
+                    log(f"[INFO] Unique index ensured: {idx_name}")
 
                 conn.execute(text(CREATE_CURSOR_TABLE_SQL))
                 conn.execute(text(CREATE_CURSOR_DAY_INDEX_SQL))
-                print(f"[INFO] Cursor table ensured: {SCHEMA}.{CURSOR_TABLE}", flush=True)
+                log(f"[INFO] Cursor table ensured: {SCHEMA}.{CURSOR_TABLE}")
 
             return
         except Exception as e:
             if _is_connection_error(e):
-                print(f"[DB][RETRY] ensure_schema_and_tables conn error: {type(e).__name__}: {repr(e)}", flush=True)
+                log(f"[DB][RETRY] ensure_schema_and_tables conn error -> rebuild")
+                log_exc("[DB][RETRY] ensure_schema_and_tables", e)
                 _dispose_engine()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
                 engine = get_engine_blocking()
                 continue
-            print(f"[DB][RETRY] ensure_schema_and_tables failed: {type(e).__name__}: {repr(e)}", flush=True)
+            log(f"[DB][RETRY] ensure_schema_and_tables failed")
+            log_exc("[DB][RETRY] ensure_schema_and_tables", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = get_engine_blocking()
 
 
 # ============================================
-# 5-1) 파일명에서 (file_day, station) 추출
+# 파일명에서 (file_day, station) 추출
 # ============================================
 def extract_day_station_from_path(path_str: str):
     p = Path(path_str)
@@ -301,7 +351,7 @@ def extract_day_station_from_path(path_str: str):
 
 
 # ============================================
-# 5-2) DB에서 오늘자 커서 로드
+# DB에서 오늘자 커서 로드
 # ============================================
 def load_today_offsets_from_db(engine, today_ymd: str) -> dict[str, int]:
     while True:
@@ -324,24 +374,26 @@ def load_today_offsets_from_db(engine, today_ymd: str) -> dict[str, int]:
                     loaded[str(r[0])] = int(r[1])
 
             if loaded:
-                print(f"[INFO] Loaded cursor offsets from DB: {len(loaded)} file(s) for {today_ymd}", flush=True)
+                log(f"[INFO] Loaded cursor offsets from DB: {len(loaded)} file(s) for {today_ymd}")
             else:
-                print(f"[INFO] No cursor offsets in DB for {today_ymd} (fresh start)", flush=True)
+                log(f"[INFO] No cursor offsets in DB for {today_ymd} (fresh start)")
             return loaded
         except Exception as e:
             if _is_connection_error(e):
-                print(f"[DB][RETRY] load_today_offsets conn error: {type(e).__name__}: {repr(e)}", flush=True)
+                log(f"[DB][RETRY] load_today_offsets conn error -> rebuild")
+                log_exc("[DB][RETRY] load_today_offsets", e)
                 _dispose_engine()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
                 engine = get_engine_blocking()
                 continue
-            print(f"[DB][RETRY] load_today_offsets failed: {type(e).__name__}: {repr(e)}", flush=True)
+            log(f"[DB][RETRY] load_today_offsets failed")
+            log_exc("[DB][RETRY] load_today_offsets", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = get_engine_blocking()
 
 
 # ============================================
-# 5-3) DB에 커서 UPSERT 저장
+# DB에 커서 UPSERT 저장
 # ============================================
 def upsert_cursor_offsets_to_db(engine, path_to_offset: dict[str, int]):
     if not path_to_offset:
@@ -390,22 +442,24 @@ def upsert_cursor_offsets_to_db(engine, path_to_offset: dict[str, int]):
             with engine.begin() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(sql, records)
-            print(f"[INFO] Cursor saved to DB: {len(records)} file(s)", flush=True)
+            log(f"[INFO] Cursor saved to DB: {len(records)} file(s)")
             return
         except Exception as e:
             if _is_connection_error(e):
-                print(f"[DB][RETRY] cursor upsert conn error: {type(e).__name__}: {repr(e)}", flush=True)
+                log(f"[DB][RETRY] cursor upsert conn error -> rebuild")
+                log_exc("[DB][RETRY] cursor upsert", e)
                 _dispose_engine()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
                 engine = get_engine_blocking()
                 continue
-            print(f"[DB][RETRY] cursor upsert failed: {type(e).__name__}: {repr(e)}", flush=True)
+            log(f"[DB][RETRY] cursor upsert failed")
+            log_exc("[DB][RETRY] cursor upsert", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = get_engine_blocking()
 
 
 # ============================================
-# 6. contents 정리
+# contents 정리
 # ============================================
 def clean_contents(raw: str, max_len: int = 75) -> str:
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
@@ -414,9 +468,7 @@ def clean_contents(raw: str, max_len: int = 75) -> str:
 
 
 # ============================================
-# 7. 단일 로그 파일 파싱 (binary tail-follow)
-#    ✅ 진짜 byte offset 기반
-#    ✅ 마지막 줄이 개행 없이 끝나면 "미완성 라인"으로 보고 다음 루프에서 처리
+# 단일 로그 파일 파싱 (binary tail-follow)
 # ============================================
 def parse_machine_log_file_tail_binary(path_str: str, offset: int, today_ymd: str):
     path = Path(path_str)
@@ -433,8 +485,8 @@ def parse_machine_log_file_tail_binary(path_str: str, offset: int, today_ymd: st
 
     try:
         size = path.stat().st_size
-    except Exception:
-        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": "ERROR_STAT"}
+    except Exception as e:
+        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": f"ERROR_STAT:{type(e).__name__}"}
 
     if offset > size:
         offset = 0
@@ -454,12 +506,11 @@ def parse_machine_log_file_tail_binary(path_str: str, offset: int, today_ymd: st
                 if not bline:
                     break
 
-                # 미완성 라인(개행 없음) → offset 되돌리고 다음 루프에서 재시도
+                # 미완성 라인(개행 없음) → offset 되돌리고 다음 루프에서 처리
                 if not bline.endswith(b"\n"):
                     f.seek(pos, os.SEEK_SET)
                     break
 
-                # 디코드
                 line = bline.decode("cp949", errors="ignore").rstrip("\r\n")
                 mm = LINE_PATTERN.match(line)
                 if not mm:
@@ -469,13 +520,9 @@ def parse_machine_log_file_tail_binary(path_str: str, offset: int, today_ymd: st
                 frac = mm.group(2) or ""
                 contents_raw = mm.group(3)
 
-                # 2자리 소수 초 고정(.ss)
                 frac2 = (frac.ljust(2, "0")[:2] if frac else "00")
                 end_time_str = f"{hms}.{frac2}"
 
-                # 시간 형식 검증(가벼운 검증)
-                # (파서 성능 위해 datetime.strptime 대신 간단 검증)
-                # HH:MM:SS.ss where ss 00-99
                 if len(end_time_str) != 11 or end_time_str[2] != ":" or end_time_str[5] != ":" or end_time_str[8] != ".":
                     continue
 
@@ -493,20 +540,19 @@ def parse_machine_log_file_tail_binary(path_str: str, offset: int, today_ymd: st
             new_offset = f.tell()
 
     except Exception as e:
-        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": f"ERROR:{e}"}
+        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": f"ERROR_READ:{type(e).__name__}:{e}"}
 
     return {"path": path_str, "station": station, "new_offset": new_offset, "rows": rows, "status": "OK"}
 
 
 # ============================================
-# 8. 오늘 파일 목록 수집
-#    ✅ 오늘 YYYY/MM 폴더만 스캔 (전체 year/month 순회 제거)
+# 오늘 파일 목록 수집 (오늘 YYYY/MM 폴더만)
 # ============================================
 def list_target_files_today_only(today_ymd: str) -> list[str]:
     files: list[str] = []
 
     if not BASE_DIR.exists():
-        print("[WARN] BASE_DIR not found:", BASE_DIR, flush=True)
+        log(f"[WARN] BASE_DIR not found: {BASE_DIR}")
         return files
 
     year = today_ymd[:4]
@@ -514,7 +560,6 @@ def list_target_files_today_only(today_ymd: str) -> list[str]:
 
     month_dir = BASE_DIR / year / month
     if not month_dir.exists():
-        # UNC에서는 폴더가 아직 없을 수 있음
         return files
 
     try:
@@ -529,13 +574,14 @@ def list_target_files_today_only(today_ymd: str) -> list[str]:
                 continue
             files.append(str(file_path))
     except Exception as e:
-        print(f"[WARN] list_target_files_today_only failed: {type(e).__name__}: {repr(e)}", flush=True)
+        log(f"[WARN] list_target_files_today_only failed")
+        log_exc("[WARN] list_target_files_today_only", e)
 
     return files
 
 
 # ============================================
-# 9. ThreadPool로 tail-follow 파싱 (재사용)
+# ThreadPool로 tail-follow 파싱 (재사용)
 # ============================================
 def collect_all_rows_threadpool(executor: ThreadPoolExecutor, file_list: list[str], today_ymd: str):
     data_by_station: dict[str, list[dict]] = {st: [] for st in TABLE_BY_STATION.keys()}
@@ -563,22 +609,14 @@ def collect_all_rows_threadpool(executor: ThreadPoolExecutor, file_list: list[st
 
 
 # ============================================
-# 10. DB INSERT (중복 회피)
-#    ✅ pandas 제거
-#    ✅ psycopg2.execute_values로 bulk insert (가능하면)
+# DB INSERT (중복 회피)
 # ============================================
 def _bulk_insert_execute_values(conn, full_table: str, rows: list[dict]):
-    """
-    conn: SQLAlchemy Connection (트랜잭션 begin 컨텍스트 내부)
-    """
     if not rows:
         return 0
 
-    # SQLAlchemy Connection -> DBAPI connection 획득
-    # conn.connection 은 ConnectionFairy, 그 안의 connection이 DBAPI(conn)
     dbapi_conn = getattr(conn.connection, "connection", None)
-    if dbapi_conn is None:
-        # fallback
+    if dbapi_conn is None or psycopg2 is None:
         return _bulk_insert_executemany(conn, full_table, rows)
 
     cur = dbapi_conn.cursor()
@@ -588,12 +626,9 @@ def _bulk_insert_execute_values(conn, full_table: str, rows: list[dict]):
         ON CONFLICT (end_day, station, end_time, contents) DO NOTHING
     """
     values = [(r["end_day"], r["station"], r["end_time"], r["contents"]) for r in rows]
-
-    # page_size 조정 가능(기본 1000)
     page_size = int(os.getenv("INSERT_PAGE_SIZE", "2000"))
 
-    psycopg2.extras.execute_values(cur, sql, values, page_size=page_size)
-    # commit은 상위 engine.begin()이 수행
+    psycopg2.extras.execute_values(cur, sql, values, page_size=page_size)  # type: ignore
     return len(values)
 
 
@@ -624,9 +659,6 @@ def insert_to_db(engine, data_by_station: dict[str, list[dict]]):
 
                     full_table = f"{SCHEMA}.{TABLE_BY_STATION[station]}"
 
-                    # (옵션) 동일 루프 안 중복 제거(메모리에서 한 번 더)
-                    # - 파일 한 줄이 같은 내용으로 반복되는 케이스에서 DB round-trip 감소
-                    # - 필요 없으면 끄려면 env로
                     if os.getenv("LOCAL_DEDUP", "1") == "1":
                         seen = set()
                         deduped = []
@@ -638,36 +670,31 @@ def insert_to_db(engine, data_by_station: dict[str, list[dict]]):
                             deduped.append(r)
                         rows = deduped
 
-                    if psycopg2 is not None:
-                        attempted = _bulk_insert_execute_values(conn, full_table, rows)
-                    else:
-                        attempted = _bulk_insert_executemany(conn, full_table, rows)
-
+                    attempted = _bulk_insert_execute_values(conn, full_table, rows)
                     total_attempt += attempted
-                    print(
-                        f"[INFO] Insert attempted {attempted} rows → {full_table} (duplicates ignored)",
-                        flush=True,
-                    )
+                    log(f"[INFO] Insert attempted {attempted} rows → {full_table} (duplicates ignored)")
 
             if total_attempt:
-                print(f"[INFO] Insert batch done. attempted_total={total_attempt}", flush=True)
+                log(f"[INFO] Insert batch done. attempted_total={total_attempt}")
             return
 
         except Exception as e:
             if _is_connection_error(e):
-                print(f"[DB][RETRY] insert_to_db conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", flush=True)
+                log(f"[DB][RETRY] insert_to_db conn error -> rebuild engine")
+                log_exc("[DB][RETRY] insert_to_db", e)
                 _dispose_engine()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
                 engine = get_engine_blocking()
                 continue
 
-            print(f"[DB][RETRY] insert_to_db failed: {type(e).__name__}: {repr(e)}", flush=True)
+            log(f"[DB][RETRY] insert_to_db failed")
+            log_exc("[DB][RETRY] insert_to_db", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = get_engine_blocking()
 
 
 # ============================================
-# 11. 커서 저장 스케줄러
+# 커서 저장 스케줄러
 # ============================================
 def maybe_save_cursor(engine, force: bool = False):
     global _last_cursor_save_ts, _cursor_dirty_paths
@@ -690,10 +717,11 @@ def maybe_save_cursor(engine, force: bool = False):
 
 
 # ============================================
-# 12. main (5초 무한루프)
+# main (5초 무한루프)
 # ============================================
 def main():
-    print("[BOOT] fct_machine_log_parser_realtime_optimized starting", flush=True)
+    log("[BOOT] fct_machine_log_parser_realtime_optimized starting")
+    log(f"[INFO] LOG_DIR={LOG_DIR}")
 
     engine = get_engine_blocking()
     ensure_schema_and_tables(engine)
@@ -707,27 +735,23 @@ def main():
         try:
             maybe_save_cursor(engine, force=True)
         except Exception as e:
-            print(f"[WARN] Exit cursor save failed: {e}", flush=True)
+            log("[WARN] Exit cursor save failed")
+            log_exc("[WARN] Exit cursor save failed", e)
 
     atexit.register(_on_exit)
 
-    print("[INFO] Realtime mode: binary tail-follow (byte offset), loop every %ss" % SLEEP_SEC, flush=True)
-    print("[INFO] Only today's files are tailed. Cursor is persisted to DB periodically.", flush=True)
-    print(f"[INFO] BASE_DIR = {BASE_DIR}", flush=True)
-    print(f"[INFO] Cursor save interval = {CURSOR_SAVE_INTERVAL_SEC}s", flush=True)
-    print(f"[INFO] Parse workers = {PARSE_WORKERS} (ThreadPoolExecutor)", flush=True)
-    print(f"[INFO] Engine pool minimized: pool_size=1, max_overflow=0 | session work_mem={WORK_MEM}", flush=True)
-    print(
-        f"[INFO] keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}",
-        flush=True,
-    )
+    log(f"[INFO] Realtime mode: binary tail-follow (byte offset), loop every {SLEEP_SEC}s")
+    log("[INFO] Only today's files are tailed. Cursor is persisted to DB periodically.")
+    log(f"[INFO] BASE_DIR = {BASE_DIR}")
+    log(f"[INFO] Cursor save interval = {CURSOR_SAVE_INTERVAL_SEC}s")
+    log(f"[INFO] Parse workers = {PARSE_WORKERS} (ThreadPoolExecutor)")
+    log(f"[INFO] Engine pool minimized: pool_size=1, max_overflow=0 | session work_mem={WORK_MEM}")
+    log(f"[INFO] keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}")
 
-    # ✅ ThreadPoolExecutor는 루프 밖에서 1회 생성/재사용
     with ThreadPoolExecutor(max_workers=max(1, PARSE_WORKERS)) as executor:
         while True:
             loop_t0 = time_mod.perf_counter()
             try:
-                # 날짜 바뀌면(자정) 커서 리셋 + 오늘 커서 로드
                 now_today = datetime.now().strftime("%Y%m%d")
                 if now_today != today_ymd:
                     today_ymd = now_today
@@ -737,9 +761,8 @@ def main():
                     engine = get_engine_blocking()
                     loaded2 = load_today_offsets_from_db(engine, today_ymd)
                     PROCESSED_OFFSET.update(loaded2)
-                    print(f"[DAY-CHANGE] Reloaded cursor for {today_ymd}: {len(loaded2)} file(s)", flush=True)
+                    log(f"[DAY-CHANGE] Reloaded cursor for {today_ymd}: {len(loaded2)} file(s)")
 
-                # ✅ 오늘 폴더만 스캔
                 t_scan0 = time_mod.perf_counter()
                 file_list = list_target_files_today_only(today_ymd)
                 t_scan1 = time_mod.perf_counter()
@@ -749,12 +772,10 @@ def main():
                     time_mod.sleep(SLEEP_SEC)
                     continue
 
-                # ✅ ThreadPool로 바이너리 tail 파싱
                 t_parse0 = time_mod.perf_counter()
                 data_by_station, offset_updates = collect_all_rows_threadpool(executor, file_list, today_ymd)
                 t_parse1 = time_mod.perf_counter()
 
-                # offset 업데이트 + dirty mark
                 changed = 0
                 for fp, new_off in offset_updates.items():
                     new_off_int = int(new_off)
@@ -764,22 +785,19 @@ def main():
                         _cursor_dirty_paths.add(fp)
                         changed += 1
 
-                # ✅ DB insert (bulk) + retry
                 t_ins0 = time_mod.perf_counter()
                 insert_to_db(engine, data_by_station)
                 t_ins1 = time_mod.perf_counter()
 
-                # ✅ 커서 저장(주기)
                 t_cur0 = time_mod.perf_counter()
                 maybe_save_cursor(engine, force=False)
                 t_cur1 = time_mod.perf_counter()
 
                 loop_t1 = time_mod.perf_counter()
 
-                # (선택) 성능 로그
                 if os.getenv("PERF_LOG", "1") == "1":
                     total_rows = sum(len(v) for v in data_by_station.values())
-                    print(
+                    log(
                         "[PERF] scan=%.3fs parse=%.3fs insert=%.3fs cursor=%.3fs loop=%.3fs files=%d changed=%d rows=%d"
                         % (
                             (t_scan1 - t_scan0),
@@ -790,29 +808,39 @@ def main():
                             len(file_list),
                             changed,
                             total_rows,
-                        ),
-                        flush=True,
+                        )
                     )
 
             except KeyboardInterrupt:
-                print("\n[STOP] Interrupted by user.", flush=True)
+                log("[STOP] Interrupted by user.")
                 try:
                     maybe_save_cursor(engine, force=True)
                 except Exception as e:
-                    print(f"[WARN] Final cursor save failed: {e}", flush=True)
+                    log("[WARN] Final cursor save failed")
+                    log_exc("[WARN] Final cursor save failed", e)
                 break
 
             except Exception as e:
                 if _is_connection_error(e):
-                    print(f"[DB][RETRY] loop-level conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", flush=True)
+                    log("[DB][RETRY] loop-level conn error -> rebuild engine")
+                    log_exc("[DB][RETRY] loop-level", e)
                     _dispose_engine()
                     time_mod.sleep(DB_RETRY_INTERVAL_SEC)
                     engine = get_engine_blocking()
                 else:
-                    print(f"[ERROR] Loop error: {type(e).__name__}: {repr(e)}", flush=True)
+                    log("[ERROR] Loop error (continue)")
+                    log_exc("[ERROR] Loop error", e)
 
-            time_mod.sleep(SLEEP_SEC)
+            elapsed = time_mod.perf_counter() - loop_t0
+            time_mod.sleep(max(0.0, SLEEP_SEC - elapsed))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("[STOP] user interrupted (Ctrl+C)")
+    except Exception as e:
+        log("[UNHANDLED] fatal error")
+        log_exc("[UNHANDLED]", e)
+        raise
