@@ -26,10 +26,10 @@ class NonOpUpsertIn(BaseModel):
             "example": {
                 "end_day": "20260205",
                 "station": "FCT1",
-                "from_time": "13:34:24.69",
-                "to_time": "13:34:35.81",
+                "from_time": "13:32:17.95",
+                "to_time": "13:32:35.81",
                 "reason": "휴식",
-                "sparepart": "usb_a",
+                "sparepart": "usb_a"
             }
         }
     )
@@ -44,3 +44,11 @@ class NonOpUpsertIn(BaseModel):
 
 class NonOpUpsertOut(BaseModel):
     ok: bool = True
+    event_name: str = "non_operation_time_event"
+
+
+class NonOpKeyPayload(BaseModel):
+    end_day: str
+    station: str
+    from_time: str
+    to_time: str

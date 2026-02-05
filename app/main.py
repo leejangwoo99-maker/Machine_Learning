@@ -4,11 +4,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load .env from PROJECT ROOT (one level above /app)
-# e.g. C:\Users\user\PycharmProjects\PythonProject\.env
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from fastapi import FastAPI
 
+from app.routers.events import router as events_router
 from app.routers.worker_info import router as worker_info_router
 from app.routers.email_list import router as email_list_router
 from app.routers.remark_info import router as remark_info_router
@@ -31,6 +31,7 @@ def health() -> dict[str, bool]:
 
 
 # Router registration
+app.include_router(events_router)         # ✅ 추가
 app.include_router(worker_info_router)
 app.include_router(email_list_router)
 app.include_router(remark_info_router)
