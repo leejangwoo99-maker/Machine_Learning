@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dotenv import load_dotenv
 from pathlib import Path
+from dotenv import load_dotenv
 
 # Load .env from PROJECT ROOT (one level above /app)
 # e.g. C:\Users\user\PycharmProjects\PythonProject\.env
@@ -18,8 +18,19 @@ from app.routers.alarm_record import router as alarm_record_router
 from app.routers.predictive import router as predictive_router
 from app.routers.reports import router as reports_router
 
-app = FastAPI(title="Aptiv Film API", version="2.1", debug=True)
+app = FastAPI(
+    title="Aptiv Film API",
+    version="2.1",
+    debug=True,
+)
 
+
+@app.get("/health")
+def health() -> dict[str, bool]:
+    return {"ok": True}
+
+
+# Router registration
 app.include_router(worker_info_router)
 app.include_router(email_list_router)
 app.include_router(remark_info_router)

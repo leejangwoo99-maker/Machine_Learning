@@ -1,44 +1,174 @@
 # -*- coding: utf-8 -*-
 """
-oee_daemon.py
-- OEE calc daemon based on Jupyter Cells 1~16 (final)
-- 5-thread parallel fetch
-- window auto switch (KST)
-- incremental remark_change (PK: prod_day, station, at_time) + seen_pk cache (last 5)
-- planned_stop full rescan each loop (can be updated)
-- non_time / quality full rescan each loop (prod_day row keeps updating)
-- final_amount full rescan each loop (base remark fallback)
-- No dataframe print (logs only)
-- CREATE IF NOT EXISTS + ENSURE UNIQUE INDEX + UPSERT to:
-  - i_daily_report.k_total_oee_{day|night}_daily   (UNIQUE: prod_day)
-  - i_daily_report.k_line_oee_{day|night}_daily    (UNIQUE: prod_day, line)   line in {left,right}
-  - i_daily_report.k_station_oee_{day|night}_daily (UNIQUE: prod_day, station)
+11_OEE_calculation.py (oee_daemon.py)
+
+- Keep ALL existing OEE daemon behaviors
+  - 5-thread parallel fetch
+  - window auto switch (KST)
+  - incremental remark_change (PK: prod_day, station, at_time) + seen_pk cache
+  - planned_stop full rescan each loop
+  - non_time / quality full rescan each loop
+  - final_amount full rescan each loop
+  - CREATE IF NOT EXISTS + ENSURE UNIQUE INDEX + UPSERT to:
+    - i_daily_report.k_total_oee_{day|night}_daily   (UNIQUE: prod_day)
+    - i_daily_report.k_line_oee_{day|night}_daily    (UNIQUE: prod_day, line)
+    - i_daily_report.k_station_oee_{day|night}_daily (UNIQUE: prod_day, station)
+
+- Added for Nuitka EXE diagnostics:
+  - Logs to BOTH console and rotating file
+  - EXE environment diagnostics log on startup
+  - ZoneInfo("Asia/Seoul") fallback to fixed KST offset if tzdata missing
+  - Import failures are logged with stacktrace (critical for EXE packaging issues)
+
+Log path priority:
+  1) <exe_or_script_dir>/_logs/11_oee_calculation.log
+  2) <user_home>/oee_logs/11_oee_calculation.log
+  3) <cwd>/oee_logs/11_oee_calculation.log
 """
 
 from __future__ import annotations
 
+# =========================
+# 0) Stdlib first (so import errors from 3rd-party libs can be logged)
+# =========================
 import os
 import re
+import sys
 import math
 import time as time_mod
+import traceback
+import logging
+from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
-from datetime import datetime, date, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, date, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
-
-import pandas as pd
-import numpy as np
-from sqlalchemy import create_engine, text, event
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import OperationalError, DBAPIError
 from concurrent.futures import ThreadPoolExecutor
+
+# ---------- KST timezone (ZoneInfo fallback-safe for Windows EXE) ----------
+try:
+    from zoneinfo import ZoneInfo  # py>=3.9
+    try:
+        KST = ZoneInfo("Asia/Seoul")
+    except Exception:
+        KST = timezone(timedelta(hours=9))  # fallback if tzdata missing
+except Exception:
+    KST = timezone(timedelta(hours=9))
+
+
+# =========================
+# 1) Logging (console + rotating file)
+# =========================
+def _app_base_dir() -> str:
+    try:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+    except Exception:
+        pass
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _ensure_log_dir() -> str:
+    candidates = [
+        os.path.join(_app_base_dir(), "_logs"),
+        os.path.join(os.path.expanduser("~"), "oee_logs"),
+        os.path.join(os.getcwd(), "oee_logs"),
+    ]
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            test_path = os.path.join(d, ".__write_test")
+            with open(test_path, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_path)
+            return d
+        except Exception:
+            continue
+    return os.getcwd()
+
+def _init_logger() -> logging.Logger:
+    log_dir = _ensure_log_dir()
+    log_path = os.path.join(log_dir, "11_oee_calculation.log")
+
+    logger = logging.getLogger("oee_daemon")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if logger.handlers:
+        return logger
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    fh = RotatingFileHandler(
+        log_path,
+        maxBytes=10_000_000,  # 10MB
+        backupCount=10,
+        encoding="utf-8",
+        delay=True,
+    )
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler(stream=sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    logger.info(f"[BOOT] logger initialized | dir={log_dir} | file={log_path}")
+    return logger
+
+LOGGER = _init_logger()
+
+def log_boot(msg: str) -> None:
+    LOGGER.info(f"[BOOT] {msg}")
+
+def log_info(msg: str) -> None:
+    LOGGER.info(f"[INFO] {msg}")
+
+def log_warn(msg: str) -> None:
+    LOGGER.warning(f"[WARN] {msg}")
+
+def log_retry(msg: str) -> None:
+    LOGGER.error(f"[RETRY] {msg}")
+
+def log_exc(prefix: str, e: BaseException) -> None:
+    tb = traceback.format_exc()
+    LOGGER.error(f"[RETRY] {prefix}: {type(e).__name__}: {e}\n{tb}")
+
+def log_diag_startup() -> None:
+    try:
+        LOGGER.info("[BOOT] ===== EXE DIAGNOSTICS =====")
+        LOGGER.info(f"[BOOT] frozen={getattr(sys, 'frozen', False)}")
+        LOGGER.info(f"[BOOT] executable={sys.executable}")
+        LOGGER.info(f"[BOOT] argv={' '.join(sys.argv)}")
+        LOGGER.info(f"[BOOT] cwd={os.getcwd()}")
+        LOGGER.info(f"[BOOT] base_dir={_app_base_dir()}")
+        LOGGER.info(f"[BOOT] python={sys.version.replace(os.linesep,' ')}")
+        LOGGER.info(f"[BOOT] platform={sys.platform}")
+        LOGGER.info(f"[BOOT] pid={os.getpid()}")
+        LOGGER.info(f"[BOOT] KST_tzinfo={KST}")
+        LOGGER.info("[BOOT] ===========================")
+    except Exception as e:
+        log_exc("diag log failed", e)
+
+log_diag_startup()
+
+
+# =========================
+# 2) Third-party imports (log if missing in EXE packaging)
+# =========================
+try:
+    import pandas as pd
+    import numpy as np
+    from sqlalchemy import create_engine, text, event
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import OperationalError, DBAPIError
+except Exception as e:
+    log_exc("IMPORT ERROR (likely Nuitka packaging missing dependency)", e)
+    raise
+
 
 # -----------------------------
 # Config
 # -----------------------------
-KST = ZoneInfo("Asia/Seoul")
-
 WINDOW_SECONDS = 43200
 STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4", "Vision1", "Vision2"]
 REMARKS  = ["PD", "Non-PD"]
@@ -90,24 +220,6 @@ DB_CONFIG = {
 }
 
 # -----------------------------
-# Logging
-# -----------------------------
-def _ts() -> str:
-    return f"{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}"
-
-def log_boot(msg: str) -> None:
-    print(f"[{_ts()}] [BOOT] {msg}")
-
-def log_info(msg: str) -> None:
-    print(f"[{_ts()}] [INFO] {msg}")
-
-def log_warn(msg: str) -> None:
-    print(f"[{_ts()}] [WARN] {msg}")
-
-def log_retry(msg: str) -> None:
-    print(f"[{_ts()}] [RETRY] {msg}")
-
-# -----------------------------
 # Engine
 # -----------------------------
 def make_engine() -> Engine:
@@ -117,12 +229,11 @@ def make_engine() -> Engine:
     )
     eng = create_engine(
         url,
-        pool_size=5,         # ✅ 5 threads => 5 conns
+        pool_size=5,         # 5 threads => up to 5 conns
         max_overflow=0,
         pool_pre_ping=True,
         pool_recycle=1800,
         connect_args={
-            # keepalive (psycopg2)
             "keepalives": 1,
             "keepalives_idle": 30,
             "keepalives_interval": 10,
@@ -132,7 +243,6 @@ def make_engine() -> Engine:
 
     @event.listens_for(eng, "connect")
     def _on_connect(dbapi_conn, _conn_record):
-        # set work_mem once per DBAPI connection
         try:
             cur = dbapi_conn.cursor()
             cur.execute(f"SET work_mem = '{DEFAULT_WORK_MEM}';")
@@ -144,6 +254,8 @@ def make_engine() -> Engine:
     return eng
 
 def connect_blocking() -> Engine:
+    log_boot("DB connect blocking loop start")
+    log_info(f"DB target={DB_CONFIG['host']}:{DB_CONFIG['port']} db={DB_CONFIG['dbname']} user={DB_CONFIG['user']} work_mem={DEFAULT_WORK_MEM}")
     while True:
         try:
             eng = make_engine()
@@ -152,7 +264,7 @@ def connect_blocking() -> Engine:
             log_info(f"DB engine OK (pool_size=5, work_mem={DEFAULT_WORK_MEM})")
             return eng
         except Exception as e:
-            log_retry(f"DB connect failed: {repr(e)}")
+            log_exc("DB connect failed", e)
             time_mod.sleep(SLEEP_SEC)
 
 # -----------------------------
@@ -273,7 +385,6 @@ def to_pct_str(x):
         return None
     return f"{x*100:.2f}%"
 
-# time parser (HH:MM:SS string guaranteed)
 def parse_hms(v: Any) -> time:
     s = str(v).strip()
     if "." in s:
@@ -664,7 +775,7 @@ def get_total_planned_time_if_available(df_stop: pd.DataFrame) -> Optional[int]:
         return None
 
 # -----------------------------
-# OEE calc (Cell 15 logic)
+# OEE calc
 # -----------------------------
 def ideal_ct_for(df_ideal: pd.DataFrame, station: str, remark: str) -> Optional[float]:
     s = df_ideal[(df_ideal["station"] == station) & (df_ideal["remark"] == remark)]
@@ -859,10 +970,6 @@ def calc_oee(
 
 # -----------------------------
 # Save to DB (CREATE + ENSURE UNIQUE INDEX + UPSERT)
-# UNIQUE:
-#  - total   : (prod_day)
-#  - line    : (prod_day, line)
-#  - station : (prod_day, station)
 # -----------------------------
 def ensure_output_tables(engine: Engine, shift_type: str) -> Tuple[str, str, str]:
     t_total   = T_TOTAL_DAY   if shift_type == "day" else T_TOTAL_NIGHT
@@ -875,7 +982,6 @@ def ensure_output_tables(engine: Engine, shift_type: str) -> Tuple[str, str, str
 
     ddl_schema = text(f'CREATE SCHEMA IF NOT EXISTS "{SAVE_SCHEMA}";')
 
-    # ✅ 테이블은 "컬럼만" 보장 (기존 테이블에 PK 없던 케이스를 커버)
     ddl_total = text(f"""
     CREATE TABLE IF NOT EXISTS {f_total} (
         prod_day   text NOT NULL,
@@ -905,7 +1011,6 @@ def ensure_output_tables(engine: Engine, shift_type: str) -> Tuple[str, str, str
     );
     """)
 
-    # ✅ ON CONFLICT 가 동작하려면 UNIQUE/PK가 반드시 필요
     ux_total = text(f"""
     CREATE UNIQUE INDEX IF NOT EXISTS ux_{t_total}_prod_day
     ON {f_total} (prod_day);
@@ -926,8 +1031,6 @@ def ensure_output_tables(engine: Engine, shift_type: str) -> Tuple[str, str, str
         conn.execute(ddl_total)
         conn.execute(ddl_line)
         conn.execute(ddl_station)
-
-        # unique index ensure (중복 데이터가 있으면 여기서 실패할 수 있음)
         conn.execute(ux_total)
         conn.execute(ux_line)
         conn.execute(ux_station)
@@ -987,16 +1090,17 @@ def upsert_outputs(
 # -----------------------------
 def run_daemon():
     log_boot("OEE daemon starting (5-thread fetch, 5s loop)")
+
+    # IMPORTANT: log DB target at startup (no password)
+    log_info(f"DB target={DB_CONFIG['host']}:{DB_CONFIG['port']} db={DB_CONFIG['dbname']} user={DB_CONFIG['user']}")
     engine = connect_blocking()
 
     last_window_key = None  # (prod_day, shift_type)
     df_ideal: Optional[pd.DataFrame] = None
 
-    # remark incremental state
     last_at_time_by_station: Dict[str, str] = {}
     seen_remark_pk = SeenPK(maxlen=5)
 
-    # in-memory full remark events (accumulate incremental)
     df_remark_all = pd.DataFrame(columns=["prod_day","shift_type","station","at_time","from_remark","to_remark"])
 
     while True:
@@ -1011,13 +1115,12 @@ def run_daemon():
             q_table      = T_QUALITY_DAY       if shift_type == "day" else T_QUALITY_NIGHT
             final_table  = T_FINAL_AMT_DAY     if shift_type == "day" else T_FINAL_AMT_NIGHT
 
-            remark_fqn = fqn(SAVE_SCHEMA, remark_table)
-            stop_fqn   = fqn(SAVE_SCHEMA, stop_table)
-            non_fqn    = fqn(SAVE_SCHEMA, non_table)
-            q_fqn      = fqn(SAVE_SCHEMA, q_table)
-            final_fqn  = fqn(SAVE_SCHEMA, final_table)
+            remark_f = fqn(SAVE_SCHEMA, remark_table)
+            stop_f   = fqn(SAVE_SCHEMA, stop_table)
+            non_f    = fqn(SAVE_SCHEMA, non_table)
+            q_f      = fqn(SAVE_SCHEMA, q_table)
+            final_f  = fqn(SAVE_SCHEMA, final_table)
 
-            # window changed => bootstrap
             if window_key != last_window_key:
                 log_info(
                     f"WINDOW switch => prod_day={prod_day}, shift={shift_type}, "
@@ -1029,7 +1132,7 @@ def run_daemon():
                 seen_remark_pk = SeenPK(maxlen=5)
 
                 log_info("bootstrap: load full remark_change + ideal_ct")
-                df_remark_all = load_remark_changes_full(engine, remark_fqn, prod_day, shift_type)
+                df_remark_all = load_remark_changes_full(engine, remark_f, prod_day, shift_type)
 
                 for st in STATIONS:
                     s = df_remark_all[df_remark_all["station"] == st]
@@ -1037,18 +1140,19 @@ def run_daemon():
                         last_at_time_by_station[st] = str(s.sort_values("at_time").iloc[-1]["at_time"])
 
                 df_ideal = load_ideal_ct(engine)
+                log_info(f"ideal_ct loaded rows={0 if df_ideal is None else len(df_ideal)}")
 
-            # ---------- parallel fetch (5 tables) ----------
+            # parallel fetch (5 tables)
             with ThreadPoolExecutor(max_workers=5) as ex:
                 fut_remark = ex.submit(
                     load_remark_changes_incremental,
-                    engine, remark_fqn, prod_day, shift_type, STATIONS,
+                    engine, remark_f, prod_day, shift_type, STATIONS,
                     last_at_time_by_station, seen_remark_pk
                 )
-                fut_stop   = ex.submit(load_planned_stops_full, engine, stop_fqn, prod_day, shift_type)
-                fut_non    = ex.submit(load_non_time_row, engine, non_fqn, prod_day, shift_type)
-                fut_q      = ex.submit(load_quality_row, engine, q_fqn, prod_day, shift_type)
-                fut_final  = ex.submit(load_final_amount_full, engine, final_fqn, prod_day, shift_type)
+                fut_stop   = ex.submit(load_planned_stops_full, engine, stop_f, prod_day, shift_type)
+                fut_non    = ex.submit(load_non_time_row, engine, non_f, prod_day, shift_type)
+                fut_q      = ex.submit(load_quality_row, engine, q_f, prod_day, shift_type)
+                fut_final  = ex.submit(load_final_amount_full, engine, final_f, prod_day, shift_type)
 
                 df_remark_inc = fut_remark.result()
                 df_stop       = fut_stop.result()
@@ -1073,7 +1177,6 @@ def run_daemon():
             else:
                 log_info("remark_change fetch: 0 new")
 
-            # ---------- compute ----------
             if df_ideal is None or df_ideal.empty:
                 raise ValueError("ideal_ct not loaded")
 
@@ -1090,11 +1193,9 @@ def run_daemon():
                 df_ideal=df_ideal,
             )
 
-            # ---------- save ----------
             try:
                 f_total, f_line, f_station = ensure_output_tables(engine, shift_type)
             except Exception as e:
-                # UNIQUE INDEX 생성 실패(대부분 기존 중복 데이터)면 삭제 없이 해결 불가 -> 저장만 스킵
                 log_warn(
                     "ensure_output_tables failed (likely duplicates prevent UNIQUE index). "
                     f"Need manual cleanup. err={repr(e)}"
@@ -1108,12 +1209,12 @@ def run_daemon():
             time_mod.sleep(SLEEP_SEC)
 
         except (OperationalError, DBAPIError) as e:
-            log_retry(f"DB error: {repr(e)}")
+            log_exc("DB error", e)
             time_mod.sleep(SLEEP_SEC)
             engine = connect_blocking()
 
         except Exception as e:
-            log_warn(f"loop error: {repr(e)}")
+            log_exc("loop error", e)
             time_mod.sleep(SLEEP_SEC)
 
 if __name__ == "__main__":
