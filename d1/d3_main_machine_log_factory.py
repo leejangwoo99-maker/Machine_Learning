@@ -22,6 +22,12 @@
 # - ✅ work_mem 폭증 방지: 세션에 SET work_mem 적용 (환경변수 PG_WORK_MEM로 조정)
 # - ✅ (추가) 실행 중 서버/네트워크 끊김 발생 시: engine dispose 후 무한 재접속/재시도
 # - ✅ (추가/권장) TCP keepalive 옵션(가능 범위) + pool_pre_ping 유지
+#
+# [로그 DB 저장 추가]
+# - ✅ 스키마: k_demon_heath_check (없으면 생성)
+# - ✅ 테이블: d3_log (없으면 생성)
+# - ✅ 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+# - ✅ end_day, end_time, info, contents 순서로 dataframe화 후 저장
 # ============================================
 
 import re
@@ -33,7 +39,7 @@ from datetime import datetime
 
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError, OperationalError, DBAPIError
+from sqlalchemy.exc import OperationalError, DBAPIError
 import urllib.parse
 
 
@@ -60,6 +66,10 @@ DB_CONFIG = {
 SCHEMA_NAME = "d1_machine_log"
 TABLE_NAME = "Main_machine_log"
 
+# 로그 저장 대상
+LOG_SCHEMA_NAME = "k_demon_heath_check"
+LOG_TABLE_NAME = "d3_log"
+
 LINE_PATTERN = re.compile(r'^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$')
 FILE_PATTERN = re.compile(r"(\d{8})_Main_Machine_Log\.txt$", re.IGNORECASE)
 
@@ -67,11 +77,11 @@ FILE_PATTERN = re.compile(r"(\d{8})_Main_Machine_Log\.txt$", re.IGNORECASE)
 # =========================
 # ✅ 요청 반영 고정값
 # =========================
-SLEEP_SEC = 5  # ✅ 루프 5초
+SLEEP_SEC = 5
 DB_RETRY_INTERVAL_SEC = 5
-WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")  # ✅ work_mem 폭증 방지
+WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
-# ✅ 처리 캐시 (path -> 마지막 읽은 파일 byte offset)
+# 처리 캐시 (path -> 마지막 읽은 파일 byte offset)
 PROCESSED_OFFSET = {}
 
 # =========================
@@ -85,7 +95,7 @@ _cursor_dirty_paths = set()
 # Engine singleton
 _ENGINE = None
 
-# ✅ (추가/권장) keepalive 옵션(환경변수로 조정 가능)
+# keepalive 옵션
 PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
 PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
@@ -140,8 +150,6 @@ def _build_engine(config=DB_CONFIG):
     )
     print(f"[INFO] DB = {_masked_db_info(config)}", flush=True)
 
-    # ✅ 백엔드별 상시 연결 1개 고정(풀 최소화)
-    # ✅ keepalive로 죽은 TCP 세션 감지 가속(가능한 범위)
     return create_engine(
         conn_str,
         pool_pre_ping=True,
@@ -163,13 +171,11 @@ def _build_engine(config=DB_CONFIG):
 
 def get_engine_blocking():
     """
-    ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공할 때까지 블로킹)
-    ✅ Engine 1개만 생성/재사용(풀 최소화)
-    ✅ work_mem 폭증 방지: 매 연결에서 SET work_mem 적용
+    DB 접속 실패/실행 중 끊김 시 무한 재시도
+    Engine 1개 재사용
     """
     global _ENGINE
 
-    # 이미 엔진이 있으면 ping 후 재사용(불량이면 dispose -> 재생성)
     if _ENGINE is not None:
         while True:
             try:
@@ -182,7 +188,6 @@ def get_engine_blocking():
                 _dispose_engine()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
-    # 새 엔진 생성 루프
     while True:
         try:
             _ENGINE = _build_engine(DB_CONFIG)
@@ -202,7 +207,7 @@ def get_engine_blocking():
 
 
 # =========================
-# 3. 스키마 / 테이블 / UNIQUE INDEX + 커서 테이블
+# 3. 스키마 / 테이블 / INDEX + 커서 / 로그테이블
 # =========================
 CREATE_CURSOR_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS "{SCHEMA_NAME}".{CURSOR_TABLE} (
@@ -220,18 +225,76 @@ CREATE INDEX IF NOT EXISTS ix_{SCHEMA_NAME}_{CURSOR_TABLE}_day
 ON "{SCHEMA_NAME}".{CURSOR_TABLE} (file_day);
 """
 
+CREATE_LOG_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS "{LOG_SCHEMA_NAME}"."{LOG_TABLE_NAME}" (
+    id BIGSERIAL PRIMARY KEY,
+    end_day  VARCHAR(8)  NOT NULL,
+    end_time VARCHAR(8)  NOT NULL,
+    info     VARCHAR(20) NOT NULL,
+    contents TEXT
+);
+"""
+
+CREATE_LOG_INDEX_SQL = f"""
+CREATE INDEX IF NOT EXISTS ix_{LOG_TABLE_NAME}_day_time
+ON "{LOG_SCHEMA_NAME}"."{LOG_TABLE_NAME}" (end_day, end_time);
+"""
+
+
+def _now_log_day_time():
+    now = datetime.now()
+    return now.strftime("%Y%m%d"), now.strftime("%H:%M:%S")
+
+
+def _make_log_df(info: str, contents: str) -> pd.DataFrame:
+    end_day, end_time = _now_log_day_time()
+    safe_info = (info or "info").strip().lower()[:20]
+    safe_contents = (contents or "").replace("\x00", " ").strip()
+    return pd.DataFrame([{
+        "end_day": end_day,
+        "end_time": end_time,
+        "info": safe_info,
+        "contents": safe_contents
+    }], columns=["end_day", "end_time", "info", "contents"])
+
+
+def log_to_db(engine, info: str, contents: str):
+    """
+    로그를 DB에 저장.
+    실패 시 프로그램 진행을 막지 않기 위해 콘솔 출력만 수행.
+    """
+    try:
+        df = _make_log_df(info, contents)
+        records = df.to_dict(orient="records")
+        sql = text(f"""
+            INSERT INTO "{LOG_SCHEMA_NAME}"."{LOG_TABLE_NAME}"
+            (end_day, end_time, info, contents)
+            VALUES (:end_day, :end_time, :info, :contents)
+        """)
+        with engine.begin() as conn:
+            conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+            conn.execute(sql, records)
+    except Exception as e:
+        print(f"[LOG][WARN] DB log write failed: {type(e).__name__}: {repr(e)}", flush=True)
+
+
+def emit_log(engine, info: str, contents: str, print_prefix: str = "[INFO]"):
+    msg = f"{contents}"
+    print(f"{print_prefix} {msg}", flush=True)
+    log_to_db(engine, info, contents)
+
 
 def ensure_schema_table(engine):
     """
-    ✅ INIT/DDL 중 DB 끊김 포함: 무한 재시도(블로킹)
+    INIT/DDL 무한 재시도
     """
     while True:
         try:
             with engine.begin() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
 
+                # main
                 conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA_NAME}"'))
-
                 conn.execute(text(f"""
                     CREATE TABLE IF NOT EXISTS "{SCHEMA_NAME}"."{TABLE_NAME}" (
                         id BIGSERIAL PRIMARY KEY,
@@ -241,17 +304,26 @@ def ensure_schema_table(engine):
                         contents    VARCHAR(75)
                     )
                 """))
-
                 conn.execute(text(f"""
                     CREATE UNIQUE INDEX IF NOT EXISTS ux_{TABLE_NAME.lower()}_dedup
                     ON "{SCHEMA_NAME}"."{TABLE_NAME}"
                     (end_day, station, end_time, contents)
                 """))
 
+                # cursor
                 conn.execute(text(CREATE_CURSOR_TABLE_SQL))
                 conn.execute(text(CREATE_CURSOR_DAY_INDEX_SQL))
 
-            print("[INFO] Schema / table / unique index ready (incl. cursor table)", flush=True)
+                # health log
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LOG_SCHEMA_NAME}"'))
+                conn.execute(text(CREATE_LOG_TABLE_SQL))
+                conn.execute(text(CREATE_LOG_INDEX_SQL))
+
+            print("[INFO] Schema/table/index ready (main + cursor + health log)", flush=True)
+            try:
+                log_to_db(engine, "info", "schema/table/index ready (main + cursor + health log)")
+            except Exception:
+                pass
             return
 
         except Exception as e:
@@ -298,9 +370,9 @@ def load_today_offsets_from_db(engine, today_ymd: str):
                     loaded[str(r[0])] = int(r[1])
 
             if loaded:
-                print(f"[INFO] Loaded cursor offsets from DB: {len(loaded)} file(s) for {today_ymd}", flush=True)
+                emit_log(engine, "info", f"loaded cursor offsets from db: {len(loaded)} file(s) for {today_ymd}")
             else:
-                print(f"[INFO] No cursor offsets in DB for {today_ymd} (fresh start)", flush=True)
+                emit_log(engine, "info", f"no cursor offsets in db for {today_ymd} (fresh start)")
             return loaded
 
         except Exception as e:
@@ -358,7 +430,8 @@ def upsert_cursor_offsets_to_db(engine, path_to_offset: dict):
             with engine.begin() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(sql, records)
-            print(f"[INFO] Cursor saved to DB: {len(records)} file(s)", flush=True)
+
+            emit_log(engine, "info", f"cursor saved to db: {len(records)} file(s)")
             return
 
         except Exception as e:
@@ -393,7 +466,7 @@ def maybe_save_cursor(engine, force=False):
 
 
 # =========================
-# 5. 파일 파싱 - TAIL FOLLOW (단일 프로세스)
+# 5. 파일 파싱 - TAIL FOLLOW
 # =========================
 def parse_main_log_file(path_str: str, start_offset: int):
     """
@@ -460,17 +533,15 @@ def parse_main_log_file(path_str: str, start_offset: int):
 
 
 # =========================
-# 6. 실시간 대상 파일 수집 (mtime 필터 제거)
+# 6. 실시간 대상 파일 수집
 # =========================
 def list_target_files_realtime(base_dir: Path):
     targets = []
     if not base_dir.exists():
-        print("[WARN] BASE_DIR not found:", base_dir, flush=True)
         return targets
 
     today_ymd = datetime.now().strftime("%Y%m%d")
 
-    # 기존 구조 유지(연/월 디렉토리 순회)
     for year_dir in base_dir.iterdir():
         if not (year_dir.is_dir() and year_dir.name.isdigit()):
             continue
@@ -489,14 +560,11 @@ def list_target_files_realtime(base_dir: Path):
 
                 targets.append(str(fp))
 
-    if targets:
-        print(f"[INFO] Today target files: {len(targets)}", flush=True)
-
     return targets
 
 
 # =========================
-# 7. DB INSERT (무한 재시도 + work_mem cap) + ✅ 실행 중 끊김 복구
+# 7. DB INSERT (main)
 # =========================
 def insert_to_db(engine, df: pd.DataFrame):
     if df is None or df.empty:
@@ -520,41 +588,52 @@ def insert_to_db(engine, df: pd.DataFrame):
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(insert_sql, records)
 
-            print(f"[DB] Insert attempted {len(df)} rows (duplicates ignored)", flush=True)
+            emit_log(engine, "info", f"insert attempted {len(df)} rows (duplicates ignored)")
             return len(df)
 
         except Exception as e:
-            # ✅ 실행 중 서버/네트워크 끊김 포함: engine dispose 후 무한 재접속
             if _is_connection_error(e):
                 print(f"[DB][RETRY] insert conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    log_to_db(engine, "down", f"insert conn error -> rebuild engine: {type(e).__name__}: {repr(e)}")
+                except Exception:
+                    pass
                 _dispose_engine()
             else:
                 print(f"[DB][RETRY] insert failed (blocked until success): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    log_to_db(engine, "error", f"insert failed: {type(e).__name__}: {repr(e)}")
+                except Exception:
+                    pass
 
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = get_engine_blocking()
 
 
 # =========================
-# 8. main (5초 무한루프) + ✅ loop-level 끊김 복구
+# 8. main
 # =========================
 def main():
     engine = get_engine_blocking()
     ensure_schema_table(engine)
+    emit_log(engine, "info", "boot main_machine_log_parser_realtime started")
 
     today_ymd = datetime.now().strftime("%Y%m%d")
 
-    # ✅ 시작 시: DB에서 오늘 커서(offset) 로드
     loaded = load_today_offsets_from_db(engine, today_ymd)
     if loaded:
         PROCESSED_OFFSET.update(loaded)
 
-    # ✅ 정상 종료 시 마지막 커서 강제 저장(강제전원off는 미보장 -> 주기 저장이 핵심)
     def _on_exit():
         try:
             maybe_save_cursor(engine, force=True)
+            emit_log(engine, "info", "graceful exit cursor save done")
         except Exception as e:
             print(f"[WARN] Exit cursor save failed: {e}", flush=True)
+            try:
+                log_to_db(engine, "error", f"exit cursor save failed: {type(e).__name__}: {repr(e)}")
+            except Exception:
+                pass
 
     atexit.register(_on_exit)
 
@@ -564,14 +643,13 @@ def main():
         try:
             now_day = datetime.now().strftime("%Y%m%d")
             if now_day != today_ymd:
-                print(f"[INFO] Day changed {today_ymd} -> {now_day} | reset offsets", flush=True)
+                emit_log(engine, "info", f"day changed {today_ymd} -> {now_day} | reset offsets")
                 today_ymd = now_day
                 PROCESSED_OFFSET.clear()
                 _cursor_dirty_paths.clear()
                 global _last_cursor_save_ts
                 _last_cursor_save_ts = 0.0
 
-                # 날짜 변경 시에도 엔진 상태 점검/복구
                 engine = get_engine_blocking()
 
                 loaded2 = load_today_offsets_from_db(engine, today_ymd)
@@ -581,13 +659,16 @@ def main():
             files = list_target_files_realtime(BASE_DIR)
             if not files:
                 maybe_save_cursor(engine, force=False)
+                # 상태 확인용 sleep 로그 (너무 과다 적재 방지를 위해 1회/루프만)
+                log_to_db(engine, "sleep", f"no target files, sleep {SLEEP_SEC}s")
                 time_mod.sleep(SLEEP_SEC)
                 continue
+
+            emit_log(engine, "info", f"today target files: {len(files)}")
 
             all_rows = []
             new_offsets = {}
 
-            # ✅ 단일 프로세스: 파일별 순차 tail-follow
             for fp in files:
                 off = int(PROCESSED_OFFSET.get(fp, 0))
                 path_str, offset_after, rows = parse_main_log_file(fp, off)
@@ -595,7 +676,6 @@ def main():
                 if rows:
                     all_rows.extend(rows)
 
-            # ✅ offset 캐시 갱신 + dirty mark
             for fp, new_off in new_offsets.items():
                 new_off_int = int(new_off)
                 old_off = int(PROCESSED_OFFSET.get(fp, 0))
@@ -606,30 +686,43 @@ def main():
             if all_rows:
                 df = pd.DataFrame(all_rows)
                 insert_to_db(engine, df)
+            else:
+                log_to_db(engine, "info", "no new log lines parsed")
 
             maybe_save_cursor(engine, force=False)
 
         except KeyboardInterrupt:
             print("\n[STOP] Interrupted by user", flush=True)
             try:
+                log_to_db(engine, "info", "keyboardinterrupt stop requested")
                 maybe_save_cursor(engine, force=True)
             except Exception as e:
                 print(f"[WARN] Final cursor save failed: {e}", flush=True)
             break
 
         except Exception as e:
-            # ✅ 루프 레벨에서도 DB 끊김이면 엔진 재생성 후 계속
             if _is_connection_error(e):
                 print(f"[DB][RETRY] loop-level conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    log_to_db(engine, "down", f"loop-level conn error: {type(e).__name__}: {repr(e)}")
+                except Exception:
+                    pass
                 _dispose_engine()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
                 engine = get_engine_blocking()
             else:
                 print(f"[ERROR] Loop error: {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    log_to_db(engine, "error", f"loop error: {type(e).__name__}: {repr(e)}")
+                except Exception:
+                    pass
 
-        # 5초 pacing (원하면 elapsed 고려 가능하지만 기존 유지)
         elapsed = time_mod.perf_counter() - loop_t0
-        time_mod.sleep(max(0.0, SLEEP_SEC - elapsed))
+        sleep_left = max(0.0, SLEEP_SEC - elapsed)
+        if sleep_left > 0:
+            # 루프 sleep 상태도 health log에 남김
+            log_to_db(engine, "sleep", f"loop pacing sleep {sleep_left:.2f}s")
+        time_mod.sleep(sleep_left)
 
 
 if __name__ == "__main__":

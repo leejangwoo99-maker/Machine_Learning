@@ -2,7 +2,6 @@
 import os
 
 # ✅ (중요) psycopg2/libpq가 뿜는 에러 메시지 인코딩 때문에 EXE에서 UnicodeDecodeError가 나는 경우 방지
-# - DB 연결이 실패할 때(접속불가/인증실패/방화벽 등) 실제 원인 메시지를 UTF-8로 안전하게 출력하도록 강제
 os.environ.setdefault("PGCLIENTENCODING", "UTF8")
 os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
 
@@ -11,7 +10,9 @@ from datetime import datetime
 import time
 import multiprocessing as mp
 import traceback
+from typing import Optional, List, Dict
 
+import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_batch
 
@@ -45,6 +46,10 @@ TABLE_HISTORY  = "fct_vision_testlog_txt_processing_history"
 SCHEMA_RESULT = "a1_fct_vision_testlog_txt_processing_result"
 SCHEMA_DETAIL = "a1_fct_vision_testlog_txt_processing_result_detail"
 
+# ✅ 추가: 데몬 상태 로그 저장 스키마/테이블
+SCHEMA_HEALTH = "k_demon_heath_check"
+TABLE_HEALTH_LOG = "a1_log"
+
 REALTIME_WINDOW_SEC = 120
 
 # ✅ 요구사항: 멀티프로세스 = 1개
@@ -57,7 +62,6 @@ LOOP_INTERVAL_SEC = 5
 DB_RETRY_INTERVAL_SEC = 5
 
 # ✅ 요구사항: work_mem 폭증 방지 (세션별 cap)
-# - 환경변수로 조정 가능: PG_WORK_MEM (예: 4MB, 8MB, 16MB)
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
 # ✅ EXE 실행 시 문제 추적용 로그 파일(같은 폴더에 생성)
@@ -73,49 +77,28 @@ PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 # ============================================
 # 0-1. 콘솔 HOLD + 로깅 유틸
 # ============================================
-def log_print(msg: str) -> None:
-    """
-    콘솔 출력 + 파일 로그 동시 기록
-    """
-    try:
-        print(msg, flush=True)
-    except Exception:
-        pass
+_CONN = None  # 상시 1개 연결 유지(프로세스당)
+_HEALTH_TABLE_READY = False
+
+
+def _now_day_time():
+    n = datetime.now()
+    return n.strftime("%Y%m%d"), n.strftime("%H:%M:%S")
+
+
+def _normalize_info(info: str) -> str:
+    if not info:
+        return "info"
+    return str(info).strip().lower()
+
+
+def _safe_append_file_log(msg: str) -> None:
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prev = LOG_FILE.read_text(encoding="utf-8", errors="ignore") if LOG_FILE.exists() else ""
-        LOG_FILE.write_text(prev + f"[{ts}] {msg}\n", encoding="utf-8")
+        with open(LOG_FILE, "a", encoding="utf-8", errors="ignore") as f:
+            f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
-
-
-def hold_console(exit_code: int) -> None:
-    """
-    ✅ EXE 더블클릭 실행 시 에러가 나도 콘솔이 닫히지 않도록 대기
-    """
-    try:
-        log_print("\n" + "=" * 70)
-        log_print(f"[HOLD] exit_code={exit_code}")
-        log_print(f"[HOLD] 로그 파일: {LOG_FILE}")
-        log_print("[HOLD] 콘솔을 닫으려면 Enter를 누르세요...")
-        log_print("=" * 70)
-        input()
-    except EOFError:
-        time.sleep(10)
-    except Exception:
-        try:
-            time.sleep(10)
-        except Exception:
-            pass
-
-
-# ============================================
-# 1. DB 유틸 (요구사항 반영)
-# - 서버가 중간에 끊겨도 무한 재접속 시도
-# - 백엔드별 상시 연결 1개 고정(풀 최소화)
-# - work_mem 폭증 방지 => 연결 직후 세션에 SET work_mem 적용
-# ============================================
-_CONN = None  # 상시 1개 연결 유지(프로세스당)
 
 
 def _safe_close(conn):
@@ -125,29 +108,7 @@ def _safe_close(conn):
         pass
 
 
-def _reset_connection(reason: str = ""):
-    """
-    커넥션 강제 폐기 + 다음 ensure_connection()에서 무한 재연결 유도
-    """
-    global _CONN
-    try:
-        if reason:
-            log_print(f"[DB][RESET] {reason}")
-    except Exception:
-        pass
-    try:
-        _safe_close(_CONN)
-    except Exception:
-        pass
-    _CONN = None
-
-
 def _is_connection_error(e: Exception) -> bool:
-    """
-    서버 끊김/네트워크/소켓/세션 종료 등 '재연결'이 필요한 오류인지 판단
-    - OperationalError/InterfaceError는 거의 대부분 재연결 대상
-    - 그 외에도 메시지에 connection 관련 키워드가 있으면 재연결로 처리
-    """
     if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
         return True
 
@@ -170,11 +131,6 @@ def _is_connection_error(e: Exception) -> bool:
 
 
 def _apply_session_safety(conn):
-    """
-    세션(연결) 단위 안전 설정:
-    - work_mem cap (폭증 방지)
-    - SELECT 1로 연결 유효성 확인
-    """
     with conn.cursor() as cur:
         cur.execute("SET work_mem TO %s;", (WORK_MEM,))
         cur.execute("SELECT 1;")
@@ -184,37 +140,46 @@ def _apply_session_safety(conn):
         pass
 
 
+def _reset_connection(reason: str = ""):
+    global _CONN, _HEALTH_TABLE_READY
+    try:
+        if reason:
+            log_print(f"[DB][RESET] {reason}", info="down")
+    except Exception:
+        pass
+    try:
+        _safe_close(_CONN)
+    except Exception:
+        pass
+    _CONN = None
+    _HEALTH_TABLE_READY = False
+
+
 def get_connection_blocking():
-    """
-    ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
-    ✅ 연결 성공 시 work_mem cap 적용
-    ✅ (권장) keepalive로 죽은 연결 감지 가속
-    """
     while True:
         try:
             conn = psycopg2.connect(
                 **DB_CONFIG,
                 connect_timeout=5,
                 application_name="a1_fct_vision_testlog_txt_processing_factory",
-
-                # keepalive 옵션 (libpq 지원)
                 keepalives=PG_KEEPALIVES,
                 keepalives_idle=PG_KEEPALIVES_IDLE,
                 keepalives_interval=PG_KEEPALIVES_INTERVAL,
                 keepalives_count=PG_KEEPALIVES_COUNT,
             )
             conn.autocommit = False
-
             _apply_session_safety(conn)
-
             log_print(
                 f"[DB][OK] connected (work_mem={WORK_MEM}, "
-                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
+                info="info",
+                save_db=False,  # 연결 직후라 별도 저장은 아래 ensure_health_log_table 후 가능
             )
             return conn
 
         except Exception as e:
-            log_print(f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}")
+            msg = f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}"
+            log_print(msg, info="down", save_db=False)
             try:
                 time.sleep(DB_RETRY_INTERVAL_SEC)
             except Exception:
@@ -222,13 +187,7 @@ def get_connection_blocking():
 
 
 def ensure_connection():
-    """
-    ✅ 백엔드별 상시 연결 1개 고정(풀 최소화):
-      - 프로세스 전체에서 _CONN 1개만 유지/재사용
-      - 죽었으면 무한 재연결(블로킹)
-    """
     global _CONN
-
     if _CONN is None:
         _CONN = get_connection_blocking()
         return _CONN
@@ -238,28 +197,172 @@ def ensure_connection():
         _CONN = get_connection_blocking()
         return _CONN
 
-    # 살아있는지 가벼운 ping
     try:
         _apply_session_safety(_CONN)
         return _CONN
     except Exception as e:
         if _is_connection_error(e):
-            log_print(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}")
+            log_print(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}", info="down", save_db=False)
             _reset_connection("ping failed")
             _CONN = get_connection_blocking()
             return _CONN
-        # 연결문제가 아니라면 그대로 올려서 버그/SQL 문제를 드러냄
         raise
 
 
+def ensure_health_log_table(conn):
+    """
+    ✅ 사양:
+      - 스키마: k_demon_heath_check (없으면 생성)
+      - 테이블: a1_log (없으면 생성)
+      - 컬럼: end_day, end_time, info, contents
+    """
+    global _HEALTH_TABLE_READY
+    if _HEALTH_TABLE_READY:
+        return
+
+    cur = conn.cursor()
+    try:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_HEALTH};")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA_HEALTH}.{TABLE_HEALTH_LOG} (
+                id BIGSERIAL PRIMARY KEY,
+                end_day   TEXT NOT NULL,   -- yyyymmdd
+                end_time  TEXT NOT NULL,   -- hh:mi:ss
+                info      TEXT NOT NULL,   -- 소문자
+                contents  TEXT NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{TABLE_HEALTH_LOG}_day_time
+            ON {SCHEMA_HEALTH}.{TABLE_HEALTH_LOG}(end_day, end_time);
+            """
+        )
+        conn.commit()
+        _HEALTH_TABLE_READY = True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        cur.close()
+
+
+def _insert_health_logs_df(conn, df: pd.DataFrame):
+    """
+    ✅ 사양 6:
+      end_day, end_time, info, contents 순서 DataFrame화 후 저장
+    """
+    if df is None or df.empty:
+        return
+
+    cols = ["end_day", "end_time", "info", "contents"]
+    df = df[cols].copy()
+
+    rows = [tuple(x) for x in df.itertuples(index=False, name=None)]
+    cur = conn.cursor()
+    try:
+        execute_batch(
+            cur,
+            f"""
+            INSERT INTO {SCHEMA_HEALTH}.{TABLE_HEALTH_LOG}
+            (end_day, end_time, info, contents)
+            VALUES (%s, %s, %s, %s)
+            """,
+            rows,
+            page_size=500
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        cur.close()
+
+
+def save_health_log(info: str, contents: str, conn: Optional[psycopg2.extensions.connection] = None):
+    """
+    데몬 동작 로그를 DB에 저장.
+    - info는 소문자 강제
+    - end_day/end_time 자동 생성
+    - DataFrame으로 컬럼 순서 맞춰 저장
+    """
+    info = _normalize_info(info)
+    end_day, end_time = _now_day_time()
+
+    df = pd.DataFrame(
+        [{
+            "end_day": end_day,
+            "end_time": end_time,
+            "info": info,
+            "contents": str(contents) if contents is not None else "",
+        }],
+        columns=["end_day", "end_time", "info", "contents"]  # 컬럼 순서 고정
+    )
+
+    # conn이 주어지지 않으면 현재 글로벌 연결 사용 시도
+    local_conn = conn
+    if local_conn is None:
+        global _CONN
+        local_conn = _CONN
+
+    if local_conn is None or getattr(local_conn, "closed", 1) != 0:
+        return  # DB 미연결 상태에서 무리하게 블로킹하지 않음(기존 흐름 유지)
+
+    try:
+        ensure_health_log_table(local_conn)
+        _insert_health_logs_df(local_conn, df)
+    except Exception:
+        # health log 저장 실패는 본 로직을 막지 않음
+        pass
+
+
+def log_print(msg: str, info: str = "info", save_db: bool = True) -> None:
+    """
+    콘솔 출력 + 파일 로그 + (가능하면) DB 상태 로그 저장
+    """
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
+    _safe_append_file_log(msg)
+
+    if save_db:
+        save_health_log(info=info, contents=msg)
+
+
+def hold_console(exit_code: int) -> None:
+    try:
+        log_print("\n" + "=" * 70, info="info")
+        log_print(f"[HOLD] exit_code={exit_code}", info="info")
+        log_print(f"[HOLD] 로그 파일: {LOG_FILE}", info="info")
+        log_print("[HOLD] 콘솔을 닫으려면 Enter를 누르세요...", info="sleep")
+        log_print("=" * 70, info="info")
+        input()
+    except EOFError:
+        time.sleep(10)
+    except Exception:
+        try:
+            time.sleep(10)
+        except Exception:
+            pass
+
+
+# ============================================
+# 1. DB 초기화(기존 + health table)
+# ============================================
 def init_db(conn):
-    """
-    (2)(3) 스키마 삭제
-    (1) history 스키마/테이블 생성
-    (추가) file_path 단독 중복 방지용 UNIQUE 인덱스 + end_day 조회 인덱스
-    """
     cur = conn.cursor()
 
+    # 기존 요구사항 유지
     cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA_RESULT} CASCADE;")
     cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA_DETAIL} CASCADE;")
 
@@ -268,7 +371,6 @@ def init_db(conn):
         f"""
         CREATE TABLE IF NOT EXISTS {SCHEMA_HISTORY}.{TABLE_HISTORY} (
             id                  BIGSERIAL PRIMARY KEY,
-
             barcode_information TEXT,
             station             TEXT,
             end_day             TEXT,
@@ -301,15 +403,34 @@ def init_db(conn):
         f"CREATE INDEX IF NOT EXISTS idx_{TABLE_HISTORY}_barcode ON {SCHEMA_HISTORY}.{TABLE_HISTORY}(barcode_information);"
     )
 
+    # ✅ 추가: health log 저장 테이블 생성
+    cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_HEALTH};")
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {SCHEMA_HEALTH}.{TABLE_HEALTH_LOG} (
+            id BIGSERIAL PRIMARY KEY,
+            end_day   TEXT NOT NULL,
+            end_time  TEXT NOT NULL,
+            info      TEXT NOT NULL,
+            contents  TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{TABLE_HEALTH_LOG}_day_time
+        ON {SCHEMA_HEALTH}.{TABLE_HEALTH_LOG}(end_day, end_time);
+        """
+    )
+
     conn.commit()
     cur.close()
 
+    global _HEALTH_TABLE_READY
+    _HEALTH_TABLE_READY = True
+
 
 def load_processed_paths_today(conn, end_day_today: str):
-    """
-    (변경) 오늘(end_day=오늘) 처리 이력의 file_path만 set 로드
-    -> 메모리 사용량 대폭 감소
-    """
     cur = conn.cursor()
     cur.execute(
         f"""
@@ -324,12 +445,7 @@ def load_processed_paths_today(conn, end_day_today: str):
     return {fp for (fp,) in rows if fp}
 
 
-def insert_history_rows(conn, rows):
-    """
-    (변경) UNIQUE(file_path) 기준으로 중복 방지
-    - ON CONFLICT DO NOTHING 적용
-    - ✅ 서버가 여기서 끊겨도 예외를 올려서 상위(run_once)가 무한 재접속하도록 함
-    """
+def insert_history_rows(conn, rows: List[Dict]):
     if not rows:
         return 0
 
@@ -370,10 +486,8 @@ def insert_history_rows(conn, rows):
             conn.rollback()
         except Exception:
             pass
-        # ✅ 연결 관련이면 상위로 올려서 재연결 루프 진입
         if _is_connection_error(e):
             raise
-        # 연결 문제 아니면(예: 스키마/컬럼 오류) 역시 올려서 즉시 원인 노출
         raise
 
     finally:
@@ -387,9 +501,6 @@ def insert_history_rows(conn, rows):
 # 2. Vision 설비 분류
 # ============================================
 def classify_vision_equipment(file_path: Path):
-    """
-    파일 6번째 줄의 Test Program으로 Vision1/Vision2 결정
-    """
     equipment = "Vision3"
     test_program = None
     try:
@@ -413,18 +524,9 @@ def classify_vision_equipment(file_path: Path):
 
 
 # ============================================
-# 3. full_path(=file_path)에서 end_time / barcode / remark / result 추출
+# 3. full_path 파싱
 # ============================================
 def parse_fields_from_full_path(full_path_str: str):
-    """
-    a) '_'과 '_' 사이는 yyyymmddhhmiss -> hh:mi:ss 로 end_time
-    b) BA1WJ로 시작해서 '_' 전까지 barcode_information
-    c) barcode_information 18번째가 J/S -> PD else Non-PD
-    d) full_path 제일 뒤에서 5번째 글자:
-       - 'P' -> PASS
-       - 'F' -> FAIL
-       (그 외/판정불가 -> None)
-    """
     p = Path(full_path_str)
     filename = p.name
     stem = p.stem
@@ -436,11 +538,9 @@ def parse_fields_from_full_path(full_path_str: str):
 
     parts = stem.split("_")
 
-    # (b)
     if parts and parts[0].startswith("BA1WJ"):
         barcode_information = parts[0]
 
-    # (a)
     if len(parts) >= 2:
         ts = parts[1]
         if ts.isdigit() and len(ts) == 14:
@@ -449,12 +549,10 @@ def parse_fields_from_full_path(full_path_str: str):
             ss = ts[12:14]
             end_time = f"{hh}:{mi}:{ss}"
 
-    # (c)
     if barcode_information and len(barcode_information) >= 18:
         c18 = barcode_information[17]
         remark = "PD" if c18 in ("J", "S") else "Non-PD"
 
-    # (d)
     if len(full_path_str) >= 5:
         ch = full_path_str[-5]
         if ch == "P":
@@ -472,15 +570,12 @@ def process_one_file(args):
     file_path_str, mid, folder_date, gb = args
     p = Path(file_path_str)
 
-    # station 분류
     if mid in FCT_MAP:
         station = FCT_MAP[mid]
     else:
         station, _ = classify_vision_equipment(p)
 
-    barcode_information, end_time, remark, result, filename = parse_fields_from_full_path(
-        file_path_str
-    )
+    barcode_information, end_time, remark, result, filename = parse_fields_from_full_path(file_path_str)
 
     return {
         "barcode_information": barcode_information,
@@ -497,37 +592,33 @@ def process_one_file(args):
 
 
 # ============================================
-# 5. 한 번 실행(run_once): 오늘 폴더 + 120초 이내 파일만 처리
-# - ✅ 중간에 DB 서버가 끊겨도 무한 재연결 후 다시 수행
+# 5. 한 번 실행(run_once)
 # ============================================
 def run_once():
     started_at = datetime.now()
     now_ts = time.time()
     cutoff_ts = now_ts - REALTIME_WINDOW_SEC
+    today_yyyymmdd = datetime.now().strftime("%Y%m%d")
 
-    today_yyyymmdd = datetime.now().strftime("%Y%m%d")  # 오늘 날짜(end_day)
+    log_print("\n==================== run_once 시작 ====================", info="info")
+    log_print(f"시각: {started_at} / end_day(today)={today_yyyymmdd} / window={REALTIME_WINDOW_SEC}s", info="info")
 
-    log_print("\n==================== run_once 시작 ====================")
-    log_print(f"시각: {started_at} / end_day(today)={today_yyyymmdd} / window={REALTIME_WINDOW_SEC}s")
-
-    # ✅ DB 작업은 "연결 성공할 때까지" 무한 블로킹 재시도
     while True:
         conn = ensure_connection()
         try:
             init_db(conn)
 
             processed_paths = load_processed_paths_today(conn, today_yyyymmdd)
-            log_print(f"[이력] 오늘(end_day={today_yyyymmdd}) 처리된 file_path 수 : {len(processed_paths)}")
+            log_print(f"[이력] 오늘(end_day={today_yyyymmdd}) 처리된 file_path 수 : {len(processed_paths)}", info="info")
 
             file_infos = []
             total_scanned = 0
-
             seen_paths_this_run = set()
 
             for mid in MIDDLE_FOLDERS:
                 mid_path = BASE_LOG_DIR / mid
                 if not mid_path.exists():
-                    log_print(f"[SKIP] {mid_path} 없음")
+                    log_print(f"[SKIP] {mid_path} 없음", info="warn")
                     continue
 
                 date_folder = mid_path / today_yyyymmdd
@@ -547,7 +638,6 @@ def run_once():
 
                         total_scanned += 1
 
-                        # 120초 이내 수정된 파일만 처리
                         try:
                             mtime = f.stat().st_mtime
                         except Exception:
@@ -567,33 +657,30 @@ def run_once():
                         seen_paths_this_run.add(file_path_str)
                         file_infos.append((file_path_str, mid, folder_date, gb))
 
-            log_print(f"[스캔] 전체 스캔 파일 수(오늘 폴더 내): {total_scanned}")
-            log_print(f"[스캔] 이번 실행에서 새로 처리할 파일 수(120초 이내): {len(file_infos)}")
+            log_print(f"[스캔] 전체 스캔 파일 수(오늘 폴더 내): {total_scanned}", info="info")
+            log_print(f"[스캔] 이번 실행에서 새로 처리할 파일 수(120초 이내): {len(file_infos)}", info="info")
 
             if not file_infos:
-                log_print("[정보] 새로 처리할 파일이 없습니다.")
+                log_print("[정보] 새로 처리할 파일이 없습니다.", info="sleep")
                 return
 
-            log_print(f"[멀티프로세스] 사용 프로세스 수: {MP_PROCESSES}")
+            log_print(f"[멀티프로세스] 사용 프로세스 수: {MP_PROCESSES}", info="info")
 
             with mp.Pool(processes=MP_PROCESSES) as pool:
                 history_rows = pool.map(process_one_file, file_infos)
 
-            # ✅ 여기서 끊겨도 insert_history_rows가 예외를 올림 -> 아래 재연결 루프로 진입
             n_try = insert_history_rows(conn, history_rows)
-            log_print(f"[DB] history INSERT 시도 건수 : {n_try} (중복은 DB에서 자동 무시)")
+            log_print(f"[DB] history INSERT 시도 건수 : {n_try} (중복은 DB에서 자동 무시)", info="info")
 
-            return  # 정상 종료
+            return
 
         except psycopg2.Error as e:
-            # ✅ psycopg2 계열 오류 중 "연결 끊김"이면 무한 재연결 후 재시도
             if _is_connection_error(e):
-                log_print(f"[DB][RETRY] connection lost during operation: {type(e).__name__}: {repr(e)}")
+                log_print(f"[DB][RETRY] connection lost during operation: {type(e).__name__}: {repr(e)}", info="down", save_db=False)
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-
                 _reset_connection("operation failed (connection error)")
                 try:
                     time.sleep(DB_RETRY_INTERVAL_SEC)
@@ -601,17 +688,14 @@ def run_once():
                     pass
                 continue
 
-            # ✅ 연결 문제가 아닌 DB 오류(스키마/권한/SQL 등)는 무한루프 방지 위해 즉시 종료(상위로 전달)
-            log_print(f"[DB][FATAL] non-connection db error: {type(e).__name__}: {repr(e)}")
+            log_print(f"[DB][FATAL] non-connection db error: {type(e).__name__}: {repr(e)}", info="error")
             raise
 
         except Exception:
-            # 기타 예외는 그대로 상위로 전달
             raise
 
         finally:
-            # ✅ "상시 연결 1개 고정" 요구사항: 여기서 conn.close() 하지 않음
-            log_print("==================== run_once 종료 ====================")
+            log_print("==================== run_once 종료 ====================", info="info")
 
 
 # ============================================
@@ -623,15 +707,16 @@ if __name__ == "__main__":
     try:
         while True:
             run_once()
+            log_print(f"[SLEEP] {LOOP_INTERVAL_SEC}초 대기", info="sleep")
             time.sleep(LOOP_INTERVAL_SEC)
 
     except KeyboardInterrupt:
-        log_print("\n[ABORT] 사용자에 의해 중단되었습니다. 프로그램을 종료합니다.")
+        log_print("\n[ABORT] 사용자에 의해 중단되었습니다. 프로그램을 종료합니다.", info="error")
         exit_code = 130
 
     except Exception as e:
-        log_print("\n[ERROR] Unhandled exception: " + repr(e))
-        log_print(traceback.format_exc())
+        log_print("\n[ERROR] Unhandled exception: " + repr(e), info="error")
+        log_print(traceback.format_exc(), info="error")
         exit_code = 1
 
     finally:

@@ -20,10 +20,19 @@
   - ZoneInfo("Asia/Seoul") fallback to fixed KST offset if tzdata missing
   - Import failures are logged with stacktrace (critical for EXE packaging issues)
 
-Log path priority:
-  1) <exe_or_script_dir>/_logs/11_oee_calculation.log
-  2) <user_home>/oee_logs/11_oee_calculation.log
-  3) <cwd>/oee_logs/11_oee_calculation.log
+[PATCH]
+- Log path is FORCE-FIXED to: C:\AptivAgent\_logs\11_oee_calculation.log
+- If logger/file handler init fails, print immediately to stderr
+- If normal logger call fails at runtime, fallback to stderr
+
+[NEW PATCH]
+- Runtime health logs are also stored to DB:
+  - schema: k_demon_heath_check (create if not exists)
+  - table : "11_log" (create if not exists)
+  - columns: end_day, end_time, info, contents
+  - info is always lowercase
+  - each log write is dataframe-ized in column order:
+    [end_day, end_time, info, contents]
 """
 
 from __future__ import annotations
@@ -57,95 +66,201 @@ except Exception:
 
 
 # =========================
-# 1) Logging (console + rotating file)
+# 1) Logging (console + rotating file) [FORCE FIXED PATH + STDERR FALLBACK]
 # =========================
-def _app_base_dir() -> str:
+FORCED_LOG_DIR = r"C:\AptivAgent\_logs"
+LOG_FILE_NAME = "11_oee_calculation.log"
+
+# DB health-log target
+HEALTH_SCHEMA = "k_demon_heath_check"
+HEALTH_TABLE = "11_log"
+
+def _stderr_now(msg: str) -> None:
+    """Always-available emergency logger."""
     try:
-        if getattr(sys, "frozen", False):
-            return os.path.dirname(sys.executable)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sys.stderr.write(f"{ts} [STDERR] {msg}\n")
+        sys.stderr.flush()
     except Exception:
         pass
-    return os.path.dirname(os.path.abspath(__file__))
 
-def _ensure_log_dir() -> str:
-    candidates = [
-        os.path.join(_app_base_dir(), "_logs"),
-        os.path.join(os.path.expanduser("~"), "oee_logs"),
-        os.path.join(os.getcwd(), "oee_logs"),
-    ]
-    for d in candidates:
-        try:
-            os.makedirs(d, exist_ok=True)
-            test_path = os.path.join(d, ".__write_test")
-            with open(test_path, "w", encoding="utf-8") as f:
-                f.write("ok")
-            os.remove(test_path)
-            return d
-        except Exception:
-            continue
-    return os.getcwd()
+def _ensure_log_dir_fixed() -> str:
+    """
+    Force fixed log directory only.
+    If creation fails, raise so caller can fallback to stderr-only logger.
+    """
+    d = FORCED_LOG_DIR
+    os.makedirs(d, exist_ok=True)
+
+    # write-test (strict)
+    test_path = os.path.join(d, ".__write_test")
+    with open(test_path, "w", encoding="utf-8") as f:
+        f.write("ok")
+    os.remove(test_path)
+
+    return d
 
 def _init_logger() -> logging.Logger:
-    log_dir = _ensure_log_dir()
-    log_path = os.path.join(log_dir, "11_oee_calculation.log")
-
     logger = logging.getLogger("oee_daemon")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
+    # Prevent duplicate handlers in re-entry
     if logger.handlers:
         return logger
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    fh = RotatingFileHandler(
-        log_path,
-        maxBytes=10_000_000,  # 10MB
-        backupCount=10,
-        encoding="utf-8",
-        delay=True,
-    )
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
+    # 1) Console handler first (so at least stdout logging works)
+    try:
+        sh = logging.StreamHandler(stream=sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+    except Exception as e:
+        _stderr_now(f"StreamHandler init failed: {repr(e)}")
 
-    sh = logging.StreamHandler(stream=sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    # 2) Forced fixed file handler
+    try:
+        log_dir = _ensure_log_dir_fixed()
+        log_path = os.path.join(log_dir, LOG_FILE_NAME)
 
-    logger.info(f"[BOOT] logger initialized | dir={log_dir} | file={log_path}")
+        fh = RotatingFileHandler(
+            log_path,
+            maxBytes=10_000_000,  # 10MB
+            backupCount=10,
+            encoding="utf-8",
+            delay=True,
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+        try:
+            logger.info(f"[BOOT] logger initialized | dir={log_dir} | file={log_path}")
+        except Exception:
+            _stderr_now(f"[BOOT] logger initialized | dir={log_dir} | file={log_path}")
+
+    except Exception as e:
+        _stderr_now(
+            "File logger init failed. "
+            f"forced_dir={FORCED_LOG_DIR} err={repr(e)} | fallback=stderr+stdout(if available)"
+        )
+
+    if not logger.handlers:
+        _stderr_now("No logging handlers available. Using stderr only fallback.")
+
     return logger
 
 LOGGER = _init_logger()
 
+# -------------------------
+# DB log bridge globals
+# -------------------------
+DB_LOG_ENGINE = None
+_DB_LOG_ENABLED = False
+_DB_LOG_REENTRANT_GUARD = False
+
+def _safe_logger_call(level: str, msg: str) -> None:
+    """Wrapper to avoid losing logs when logger itself fails."""
+    try:
+        if level == "info":
+            LOGGER.info(msg)
+        elif level == "warning":
+            LOGGER.warning(msg)
+        elif level == "error":
+            LOGGER.error(msg)
+        else:
+            LOGGER.info(msg)
+    except Exception as e:
+        _stderr_now(f"LOGGER_CALL_FAIL level={level} msg={msg} err={repr(e)}")
+
+def _db_health_log(info: str, contents: str) -> None:
+    """
+    Write log row to DB (best effort).
+    Required order via DataFrame:
+      end_day, end_time, info, contents
+    """
+    global _DB_LOG_REENTRANT_GUARD
+
+    if (not _DB_LOG_ENABLED) or (DB_LOG_ENGINE is None):
+        return
+    if _DB_LOG_REENTRANT_GUARD:
+        return
+
+    try:
+        _DB_LOG_REENTRANT_GUARD = True
+
+        # local import already loaded later; guard for very early stage
+        if "pd" not in globals():
+            return
+
+        now = datetime.now(tz=KST)
+        end_day = now.strftime("%Y%m%d")
+        end_time = now.strftime("%H:%M:%S")
+        info_l = str(info).strip().lower()
+
+        df_log = pd.DataFrame(
+            [[end_day, end_time, info_l, str(contents)]],
+            columns=["end_day", "end_time", "info", "contents"],
+        )
+
+        sql = text(f"""
+            INSERT INTO "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (end_day, end_time, info, contents)
+            VALUES (:end_day, :end_time, :info, :contents)
+        """)
+        payload = df_log.to_dict(orient="records")
+
+        with DB_LOG_ENGINE.begin() as conn:
+            conn.execute(sql, payload)
+
+    except Exception as e:
+        # absolutely no recursive log path here
+        _stderr_now(f"DB_HEALTH_LOG_FAIL info={info} err={repr(e)}")
+    finally:
+        _DB_LOG_REENTRANT_GUARD = False
+
+def _log(level: str, tag: str, info_for_db: str, msg: str) -> None:
+    line = f"[{tag}] {msg}"
+    _safe_logger_call(level, line)
+    _db_health_log(info_for_db.lower(), line)
+
 def log_boot(msg: str) -> None:
-    LOGGER.info(f"[BOOT] {msg}")
+    _log("info", "BOOT", "boot", msg)
 
 def log_info(msg: str) -> None:
-    LOGGER.info(f"[INFO] {msg}")
+    _log("info", "INFO", "info", msg)
 
 def log_warn(msg: str) -> None:
-    LOGGER.warning(f"[WARN] {msg}")
+    _log("warning", "WARN", "warn", msg)
 
 def log_retry(msg: str) -> None:
-    LOGGER.error(f"[RETRY] {msg}")
+    _log("error", "RETRY", "retry", msg)
+
+def log_down(msg: str) -> None:
+    _log("error", "DOWN", "down", msg)
+
+def log_sleep(sec: int, reason: str) -> None:
+    _log("info", "SLEEP", "sleep", f"{sec}s | {reason}")
 
 def log_exc(prefix: str, e: BaseException) -> None:
     tb = traceback.format_exc()
-    LOGGER.error(f"[RETRY] {prefix}: {type(e).__name__}: {e}\n{tb}")
+    line = f"[RETRY] {prefix}: {type(e).__name__}: {e}\n{tb}"
+    _safe_logger_call("error", line)
+    _db_health_log("error", line)
+    _stderr_now(f"[EXC-FALLBACK] {prefix}: {type(e).__name__}: {e}")
 
 def log_diag_startup() -> None:
     try:
-        LOGGER.info("[BOOT] ===== EXE DIAGNOSTICS =====")
-        LOGGER.info(f"[BOOT] frozen={getattr(sys, 'frozen', False)}")
-        LOGGER.info(f"[BOOT] executable={sys.executable}")
-        LOGGER.info(f"[BOOT] argv={' '.join(sys.argv)}")
-        LOGGER.info(f"[BOOT] cwd={os.getcwd()}")
-        LOGGER.info(f"[BOOT] base_dir={_app_base_dir()}")
-        LOGGER.info(f"[BOOT] python={sys.version.replace(os.linesep,' ')}")
-        LOGGER.info(f"[BOOT] platform={sys.platform}")
-        LOGGER.info(f"[BOOT] pid={os.getpid()}")
-        LOGGER.info(f"[BOOT] KST_tzinfo={KST}")
-        LOGGER.info("[BOOT] ===========================")
+        log_boot("===== EXE DIAGNOSTICS =====")
+        log_boot(f"frozen={getattr(sys, 'frozen', False)}")
+        log_boot(f"executable={sys.executable}")
+        log_boot(f"argv={' '.join(sys.argv)}")
+        log_boot(f"cwd={os.getcwd()}")
+        log_boot(f"python={sys.version.replace(os.linesep,' ')}")
+        log_boot(f"platform={sys.platform}")
+        log_boot(f"pid={os.getpid()}")
+        log_boot(f"KST_tzinfo={KST}")
+        log_boot(f"FORCED_LOG_DIR={FORCED_LOG_DIR}")
+        log_boot("===========================")
     except Exception as e:
         log_exc("diag log failed", e)
 
@@ -253,6 +368,28 @@ def make_engine() -> Engine:
 
     return eng
 
+def ensure_health_log_table(engine: Engine) -> None:
+    ddl_schema = text(f'CREATE SCHEMA IF NOT EXISTS "{HEALTH_SCHEMA}";')
+    ddl_table = text(f"""
+        CREATE TABLE IF NOT EXISTS "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (
+            end_day   text NOT NULL,
+            end_time  text NOT NULL,
+            info      text NOT NULL,
+            contents  text
+        );
+    """)
+    with engine.begin() as conn:
+        conn.execute(ddl_schema)
+        conn.execute(ddl_table)
+
+def enable_db_health_logging(engine: Engine) -> None:
+    global DB_LOG_ENGINE, _DB_LOG_ENABLED
+    DB_LOG_ENGINE = engine
+    ensure_health_log_table(DB_LOG_ENGINE)
+    _DB_LOG_ENABLED = True
+    # first DB log record
+    _db_health_log("info", "health logging enabled")
+
 def connect_blocking() -> Engine:
     log_boot("DB connect blocking loop start")
     log_info(f"DB target={DB_CONFIG['host']}:{DB_CONFIG['port']} db={DB_CONFIG['dbname']} user={DB_CONFIG['user']} work_mem={DEFAULT_WORK_MEM}")
@@ -262,9 +399,20 @@ def connect_blocking() -> Engine:
             with eng.begin() as conn:
                 conn.exec_driver_sql("SELECT 1;")
             log_info(f"DB engine OK (pool_size=5, work_mem={DEFAULT_WORK_MEM})")
+
+            # enable DB logging after DB is alive
+            try:
+                enable_db_health_logging(eng)
+                log_info(f'DB health log target ready => "{HEALTH_SCHEMA}"."{HEALTH_TABLE}"')
+            except Exception as e:
+                # keep daemon running even if health log table creation failed
+                _stderr_now(f"enable_db_health_logging failed: {repr(e)}")
+
             return eng
         except Exception as e:
+            log_down("db connect failed; retrying")
             log_exc("DB connect failed", e)
+            log_sleep(SLEEP_SEC, "waiting before reconnect")
             time_mod.sleep(SLEEP_SEC)
 
 # -----------------------------
@@ -410,8 +558,8 @@ def clean_remark(v) -> Optional[str]:
 class SeenPK:
     def __init__(self, maxlen: int = 5):
         self.maxlen = maxlen
-        self.q = deque()   # type: deque[str]
-        self.s = set()     # type: set[str]
+        self.q = deque()
+        self.s = set()
 
     def add(self, key: str) -> None:
         if key in self.s:
@@ -463,10 +611,6 @@ def load_remark_changes_incremental(
     last_at_time_by_station: Dict[str, str],
     seen_pk: SeenPK,
 ) -> pd.DataFrame:
-    """
-    Incremental: fetch at_time > last_at_time[station]
-    (string compare ok, HH:MM:SS)
-    """
     conds = []
     params: Dict[str, Any] = {"prod_day": prod_day, "shift_type": shift_type, "stations": stations}
     for i, st in enumerate(stations):
@@ -651,10 +795,6 @@ def build_segments_for_station(
     shift_type: str,
     base_remark: str,
 ) -> List[Tuple[str, Interval]]:
-    """
-    half-open [start,end)
-    boundary = at_time + 1sec (at_time included in previous segment)
-    """
     events = df_remark_all[df_remark_all["station"] == station].copy()
     events = events.sort_values("at_time")
 
@@ -865,7 +1005,6 @@ def calc_oee(
         p, t, q = parse_quality_text(q_row.get(station))
         return {"pass": p, "total": t, "Q": q}
 
-    # ---- Station OEE ----
     station_rows = []
     station_intermediate: Dict[str, Dict[str, Any]] = {}
 
@@ -910,7 +1049,6 @@ def calc_oee(
 
     df_oee_by_station = pd.DataFrame(station_rows)
 
-    # ---- Line OEE (Vision-based) ----
     LINES = [
         {"line": "left",  "vision": "Vision1"},
         {"line": "right", "vision": "Vision2"},
@@ -947,7 +1085,6 @@ def calc_oee(
 
     df_oee_by_line = pd.DataFrame(line_rows)
 
-    # ---- Total OEE (sum line APQ) ----
     PPT_tot   = sum(v["PPT"] for v in line_intermediate.values())
     run_tot   = sum(v["run"] for v in line_intermediate.values())
     ideal_tot = sum(v["ideal_qty"] for v in line_intermediate.values())
@@ -1091,11 +1228,10 @@ def upsert_outputs(
 def run_daemon():
     log_boot("OEE daemon starting (5-thread fetch, 5s loop)")
 
-    # IMPORTANT: log DB target at startup (no password)
     log_info(f"DB target={DB_CONFIG['host']}:{DB_CONFIG['port']} db={DB_CONFIG['dbname']} user={DB_CONFIG['user']}")
     engine = connect_blocking()
 
-    last_window_key = None  # (prod_day, shift_type)
+    last_window_key = None
     df_ideal: Optional[pd.DataFrame] = None
 
     last_at_time_by_station: Dict[str, str] = {}
@@ -1142,7 +1278,6 @@ def run_daemon():
                 df_ideal = load_ideal_ct(engine)
                 log_info(f"ideal_ct loaded rows={0 if df_ideal is None else len(df_ideal)}")
 
-            # parallel fetch (5 tables)
             with ThreadPoolExecutor(max_workers=5) as ex:
                 fut_remark = ex.submit(
                     load_remark_changes_incremental,
@@ -1160,7 +1295,6 @@ def run_daemon():
                 df_q          = fut_q.result()
                 df_final      = fut_final.result()
 
-            # apply incremental remark updates
             if not df_remark_inc.empty:
                 before = len(df_remark_all)
                 df_remark_all = pd.concat([df_remark_all, df_remark_inc], ignore_index=True)
@@ -1200,21 +1334,26 @@ def run_daemon():
                     "ensure_output_tables failed (likely duplicates prevent UNIQUE index). "
                     f"Need manual cleanup. err={repr(e)}"
                 )
+                log_sleep(SLEEP_SEC, "ensure_output_tables failed")
                 time_mod.sleep(SLEEP_SEC)
                 continue
 
             upsert_outputs(engine, f_total, f_line, f_station, df_oee_total, df_oee_by_line, df_oee_by_station)
             log_info(f"UPSERT OK => {f_total}, {f_line}, {f_station}")
 
+            log_sleep(SLEEP_SEC, "normal loop")
             time_mod.sleep(SLEEP_SEC)
 
         except (OperationalError, DBAPIError) as e:
+            log_down("db operational error; reconnecting")
             log_exc("DB error", e)
+            log_sleep(SLEEP_SEC, "before reconnect")
             time_mod.sleep(SLEEP_SEC)
             engine = connect_blocking()
 
         except Exception as e:
             log_exc("loop error", e)
+            log_sleep(SLEEP_SEC, "loop exception")
             time_mod.sleep(SLEEP_SEC)
 
 if __name__ == "__main__":

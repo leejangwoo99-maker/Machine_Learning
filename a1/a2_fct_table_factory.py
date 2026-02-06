@@ -20,6 +20,12 @@ a2_fct_table_parser_mp_realtime.py (Nuitka/Windows onefile + realtime loop)
 - ✅ 실행 중(쿼리/커밋/INSERT 중 포함) 서버 연결이 끊겨도 무한 재접속 후 자동 재시도
 - ✅ keepalive 옵션(권장) 추가: 죽은 TCP 세션 감지 가속
 - ✅ 연결 오류 판별 강화(OperationalError/InterfaceError + 메시지 키워드)
+
+[로그 DB 저장 사양 추가]
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: k_demon_heath_check.a2_log (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- 로그를 dataframe 형식(end_day, end_time, info, contents 순서)으로 적재하는 개념으로 DB 저장
 """
 
 from __future__ import annotations
@@ -65,15 +71,19 @@ DB_CONFIG = {
 }
 
 SCHEMA_NAME = "a2_fct_table"
-TABLE_NAME  = "fct_table"
+TABLE_NAME = "fct_table"
+
+# 로그 저장 스키마/테이블
+LOG_SCHEMA_NAME = "k_demon_heath_check"
+LOG_TABLE_NAME = "a2_log"
 
 # =========================
 # Realtime / Loop 사양
 # =========================
 
 # ✅ 요구사항: 멀티프로세스 = 1개
-USE_MULTIPROCESSING = False   # 기능은 유지(코드 구조), 하지만 요구사항에 따라 비활성
-MAX_WORKERS = 1               # 명시적으로 1
+USE_MULTIPROCESSING = False
+MAX_WORKERS = 1
 
 # ✅ 요구사항: 무한 루프 인터벌 5초
 LOOP_INTERVAL_SEC = 5.0
@@ -96,19 +106,13 @@ POOL_CHUNKSIZE = 500
 FLUSH_ROWS_REALTIME = 20_000
 EXECUTE_VALUES_PAGE_SIZE = 5_000
 
-HEARTBEAT_EVERY_LOOPS = 30  # 30루프마다 상태 로그
-
-# ✅ DB에서 "오늘 end_day" 기준 file_path 재로딩 주기(루프 횟수)
-DB_RELOAD_EVERY_LOOPS = 120  # 약 10분(5초 루프 기준)
-
-# ✅ 요구사항: DB 접속 실패 시 무한 재시도(블로킹)
+HEARTBEAT_EVERY_LOOPS = 30
+DB_RELOAD_EVERY_LOOPS = 120
 DB_RETRY_INTERVAL_SEC = 5.0
 
-# ✅ 요구사항: work_mem 폭증 방지(세션별 cap) - 환경변수로 조정 가능
-#    예) set PG_WORK_MEM=8MB
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
-# ✅ (추가/권장) 끊긴 TCP 세션을 빠르게 감지하기 위한 keepalive
+# ✅ keepalive
 PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
 PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
@@ -119,11 +123,11 @@ PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 # 1) 로깅/유틸
 # =========================
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
 def today_yyyymmdd() -> str:
     return datetime.now().strftime("%Y%m%d")
+
+def now_hhmmss() -> str:
+    return datetime.now().strftime("%H:%M:%S")
 
 def safe_stat(fp: Path):
     try:
@@ -149,16 +153,12 @@ def is_recent_file(fp: Path, now_ts: float, recent_sec: int) -> bool:
     return (now_ts - st.st_mtime) <= recent_sec
 
 def has_lock_files_in_dir(dir_path: Path) -> bool:
-    """
-    폴더 내 lock/tmp/part 등 저장 중을 암시하는 파일이 있으면 True
-    """
     try:
         for pat in LOCK_GLOB_PATTERNS:
             if any(dir_path.glob(pat)):
                 return True
         return False
     except Exception:
-        # 에러 시 보수적으로 "락 있음" 처리 -> 미완성 파싱 방지
         return True
 
 def is_suspect_filename(fp: Path) -> bool:
@@ -170,63 +170,116 @@ def is_suspect_filename(fp: Path) -> bool:
         return True
     return False
 
-def is_file_complete(fp: Path, now_ts: float) -> bool:
-    """
-    저장 중(미완성) 파일 파싱 방지 (강화 버전)
-    """
-    if is_suspect_filename(fp):
-        return False
 
-    parent = fp.parent
+# =========================
+# 1-1) DB 로그 버퍼/적재
+# =========================
 
-    if has_lock_files_in_dir(parent):
-        return False
+# 컬럼 순서 고정: end_day, end_time, info, contents
+LogRow = Tuple[str, str, str, str]
+LOG_BUFFER: List[LogRow] = []
+LOG_FLUSH_MIN_ROWS = 1
+LOG_CONTENTS_MAX_LEN = 4000
 
-    st1 = safe_stat(fp)
-    if st1 is None:
-        return False
+DDL_LOG_SQL = f"""
+CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA_NAME};
 
-    if st1.st_size <= 0:
-        return False
+CREATE TABLE IF NOT EXISTS {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (
+    end_day  TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    info     TEXT NOT NULL,
+    contents TEXT
+);
 
-    if (now_ts - st1.st_mtime) < MIN_FILE_AGE_SEC:
-        return False
+CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE_NAME}_end_day
+    ON {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (end_day);
 
-    size_prev = st1.st_size
-    mtime_prev = st1.st_mtime
+CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE_NAME}_info
+    ON {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (info);
 
-    stable_hits = 0
-    for _ in range(STABILITY_RETRY):
-        time.sleep(STABILITY_CHECK_SEC)
+CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE_NAME}_end_day_time
+    ON {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (end_day, end_time);
+"""
 
-        st2 = safe_stat(fp)
-        if st2 is None:
-            return False
+INSERT_LOG_SQL = f"""
+INSERT INTO {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (end_day, end_time, info, contents)
+VALUES %s
+"""
 
-        if has_lock_files_in_dir(parent):
-            return False
+def _norm_info(info: str) -> str:
+    s = (info or "").strip().lower()
+    if not s:
+        s = "info"
+    return re.sub(r"[^a-z0-9_ -]", "", s)[:64] or "info"
 
-        if st2.st_size == size_prev and st2.st_mtime == mtime_prev and st2.st_size > 0:
-            stable_hits += 1
-        else:
-            stable_hits = 0
-            size_prev = st2.st_size
-            mtime_prev = st2.st_mtime
+def log(msg: str, info: str = "info", save_db: bool = True) -> None:
+    print(msg, flush=True)
+    if not save_db:
+        return
+    row: LogRow = (
+        today_yyyymmdd(),
+        now_hhmmss(),
+        _norm_info(info),
+        (msg or "")[:LOG_CONTENTS_MAX_LEN],
+    )
+    LOG_BUFFER.append(row)
 
-    if stable_hits < STABILITY_RETRY:
-        return False
+def _flush_log_buffer_once(conn) -> int:
+    if not LOG_BUFFER:
+        return 0
+    rows = list(LOG_BUFFER)
+    with conn.cursor() as cur:
+        execute_values(cur, INSERT_LOG_SQL, rows, page_size=1000)
+    conn.commit()
+    LOG_BUFFER.clear()
+    return len(rows)
 
-    try:
-        with open(fp, "rb") as f:
-            _ = f.read(64)
-    except Exception:
-        return False
+def ensure_log_table() -> None:
+    while True:
+        conn = ensure_conn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(DDL_LOG_SQL)
+            conn.autocommit = False
+            log(f"[OK] log table ready: {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME}", info="info", save_db=True)
+            return
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] ensure_log_table failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("ensure_log_table connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][FATAL] ensure_log_table db error: {type(e).__name__}: {repr(e)}", flush=True)
+            raise
 
-    lines = safe_read_text(fp)
-    if lines is None:
-        return False
-
-    return True
+def flush_log_buffer_blocking() -> None:
+    # 로그 적재 실패 시에도 메인 기능 살리기 위해 무한 재시도
+    while LOG_BUFFER:
+        conn = ensure_conn()
+        try:
+            inserted = _flush_log_buffer_once(conn)
+            if inserted:
+                print(f"[LOG][DB] inserted={inserted}", flush=True)
+            return
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                print(f"[DB][RETRY] flush_log_buffer failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("flush_log_buffer connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            print(f"[DB][WARN] flush_log_buffer db error(drop this batch): {type(e).__name__}: {repr(e)}", flush=True)
+            # 치명적 오류(스키마 권한 등)에서 무한 적체 방지: 현재 배치 폐기
+            LOG_BUFFER.clear()
+            return
 
 
 # =========================
@@ -307,18 +360,12 @@ def parse_test_lines(lines: List[str]) -> List[Tuple[str, str, str, str, str]]:
 
 
 # =========================
-# 4) 파일 1개 파싱 (반환을 tuple로 경량화)
+# 4) 파일 1개 파싱
 # =========================
 
 RowTuple = Tuple[str, str, str, str, str, str, str, str, str, str, str, str]
-# (barcode_information, remark, station, end_day, end_time, run_time,
-#  step_description, value, min, max, result, file_path)
 
 def parse_one_file(args: Tuple[str, str, str]) -> List[RowTuple]:
-    """
-    args = (file_path_str, station, today_str)
-    - today_str와 end_day가 다르면 즉시 제외
-    """
     file_path_str, station, today_str = args
     fp = Path(file_path_str)
 
@@ -359,31 +406,75 @@ def parse_one_file(args: Tuple[str, str, str]) -> List[RowTuple]:
 
 
 # =========================
-# 5) 실시간 파일 수집 (오늘 폴더 + 최근 120초 + 미완성 방지)
+# 5) 파일 수집
 # =========================
 
-ProcessedInfo = Tuple[float, int, float]  # (mtime, size, last_seen_ts)
+ProcessedInfo = Tuple[float, int, float]
+
+def is_file_complete(fp: Path, now_ts: float) -> bool:
+    if is_suspect_filename(fp):
+        return False
+
+    parent = fp.parent
+
+    if has_lock_files_in_dir(parent):
+        return False
+
+    st1 = safe_stat(fp)
+    if st1 is None:
+        return False
+
+    if st1.st_size <= 0:
+        return False
+
+    if (now_ts - st1.st_mtime) < MIN_FILE_AGE_SEC:
+        return False
+
+    size_prev = st1.st_size
+    mtime_prev = st1.st_mtime
+
+    stable_hits = 0
+    for _ in range(STABILITY_RETRY):
+        time.sleep(STABILITY_CHECK_SEC)
+
+        st2 = safe_stat(fp)
+        if st2 is None:
+            return False
+
+        if has_lock_files_in_dir(parent):
+            return False
+
+        if st2.st_size == size_prev and st2.st_mtime == mtime_prev and st2.st_size > 0:
+            stable_hits += 1
+        else:
+            stable_hits = 0
+            size_prev = st2.st_size
+            mtime_prev = st2.st_mtime
+
+    if stable_hits < STABILITY_RETRY:
+        return False
+
+    try:
+        with open(fp, "rb") as f:
+            _ = f.read(64)
+    except Exception:
+        return False
+
+    lines = safe_read_text(fp)
+    if lines is None:
+        return False
+
+    return True
 
 def collect_recent_files(
     processed: Dict[str, ProcessedInfo],
     already_in_db_paths_today: Set[str],
     today_str: str,
 ) -> List[Tuple[str, str, str]]:
-    """
-    return [(file_path_str, station, today_str), ...]
-    조건:
-      - \\...\\TCx\\YYYYMMDD\\{GoodFile,BadFile}\\*.txt
-      - YYYYMMDD = 오늘
-      - fp.mtime >= now - 120초
-      - file_path가 DB에 이미 존재(오늘 end_day)하면 스킵  (✅ file_path 단독 기준)
-      - processed dict는 run-time 중복 방지(변경없으면 스킵)
-      - 미완성(저장 중) 파일은 스킵
-    """
     jobs: List[Tuple[str, str, str]] = []
     now_ts = time.time()
     cutoff_ts = now_ts - RECENT_SECONDS
 
-    # 캐시 정리(메모리 폭증 방지): 마지막 관측이 10분 넘은 항목 제거
     expire_before = now_ts - 600
     stale_keys = [k for k, v in processed.items() if v[2] < expire_before]
     for k in stale_keys:
@@ -412,13 +503,11 @@ def collect_recent_files(
 
                 fkey = str(fp)
 
-                # ✅ DB 중복 스킵 (file_path 단독, 오늘 end_day 기준)
                 if fkey in already_in_db_paths_today:
                     continue
 
                 prev = processed.get(fkey)
 
-                # 변경이 없는 파일은 스킵 (중복 파싱 방지)
                 if prev is not None:
                     prev_mtime, prev_size, _ = prev
                     if prev_mtime == st.st_mtime and prev_size == st.st_size:
@@ -481,10 +570,6 @@ VALUES %s
 """
 
 def _apply_session_safety(conn) -> None:
-    """
-    ✅ work_mem 폭증 방지: 세션에 cap 적용
-    + ping(SELECT 1)으로 연결 유효성 확인
-    """
     with conn.cursor() as cur:
         cur.execute("SET work_mem TO %s;", (WORK_MEM,))
         cur.execute("SELECT 1;")
@@ -493,7 +578,7 @@ def _apply_session_safety(conn) -> None:
     except Exception:
         pass
 
-_CONN = None  # ✅ 백엔드별 상시 연결 1개 고정(프로세스 전체 1개)
+_CONN = None
 
 def _safe_close(conn):
     try:
@@ -502,11 +587,10 @@ def _safe_close(conn):
         pass
 
 def _reset_conn(reason: str = ""):
-    """커넥션 강제 폐기 + 다음 ensure_conn에서 무한 재연결 유도"""
     global _CONN
     try:
         if reason:
-            log(f"[DB][RESET] {reason}")
+            print(f"[DB][RESET] {reason}", flush=True)
     except Exception:
         pass
     try:
@@ -516,9 +600,6 @@ def _reset_conn(reason: str = ""):
     _CONN = None
 
 def _is_connection_error(e: Exception) -> bool:
-    """
-    서버 끊김/네트워크/소켓/세션 종료 등 '재연결'이 필요한 오류인지 판단
-    """
     if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
         return True
 
@@ -540,9 +621,6 @@ def _is_connection_error(e: Exception) -> bool:
     return any(k in msg for k in keywords)
 
 def get_conn_blocking():
-    """
-    ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
-    """
     while True:
         try:
             conn = psycopg2.connect(
@@ -553,8 +631,6 @@ def get_conn_blocking():
                 password=DB_CONFIG["password"],
                 connect_timeout=5,
                 application_name="a2_fct_table_parser_mp_realtime",
-
-                # keepalive 옵션 (libpq 지원)
                 keepalives=PG_KEEPALIVES,
                 keepalives_idle=PG_KEEPALIVES_IDLE,
                 keepalives_interval=PG_KEEPALIVES_INTERVAL,
@@ -562,22 +638,20 @@ def get_conn_blocking():
             )
             conn.autocommit = False
             _apply_session_safety(conn)
-            log(
+            print(
                 f"[DB][OK] connected (work_mem={WORK_MEM}, "
-                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
+                flush=True
             )
             return conn
         except Exception as e:
-            log(f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}")
+            print(f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}", flush=True)
             try:
                 time.sleep(DB_RETRY_INTERVAL_SEC)
             except Exception:
                 pass
 
 def ensure_conn():
-    """
-    ✅ 상시 연결 1개 유지 + 죽으면 무한 재연결(블로킹)
-    """
     global _CONN
     if _CONN is None:
         _CONN = get_conn_blocking()
@@ -593,17 +667,13 @@ def ensure_conn():
         return _CONN
     except Exception as e:
         if _is_connection_error(e):
-            log(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}")
+            print(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}", flush=True)
             _reset_conn("ping failed")
             _CONN = get_conn_blocking()
             return _CONN
         raise
 
 def ensure_schema_table() -> None:
-    """
-    schema/table/index 생성.
-    ✅ 실행 중 끊김 포함: 실패 시 무한 재시도.
-    """
     while True:
         conn = ensure_conn()
         try:
@@ -614,7 +684,7 @@ def ensure_schema_table() -> None:
             return
         except psycopg2.Error as e:
             if _is_connection_error(e):
-                log(f"[DB][RETRY] ensure_schema_table failed(conn): {type(e).__name__}: {repr(e)}")
+                print(f"[DB][RETRY] ensure_schema_table failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
                 try:
                     conn.rollback()
                 except Exception:
@@ -622,9 +692,7 @@ def ensure_schema_table() -> None:
                 _reset_conn("ensure_schema_table connection error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
                 continue
-            log(f"[DB][FATAL] ensure_schema_table db error: {type(e).__name__}: {repr(e)}")
-            raise
-        except Exception:
+            print(f"[DB][FATAL] ensure_schema_table db error: {type(e).__name__}: {repr(e)}", flush=True)
             raise
 
 def flush_rows(cur, buffer_rows: List[RowTuple]) -> int:
@@ -639,12 +707,6 @@ def flush_rows(cur, buffer_rows: List[RowTuple]) -> int:
     return len(buffer_rows)
 
 def load_db_file_paths_today(conn, end_day_today: str) -> Set[str]:
-    """
-    ✅ 오늘(end_day=오늘) 기준으로 fct_table에 이미 저장된 file_path 목록을 로드 (DISTINCT)
-    - file_path 단독 중복 방지
-    - 메모리 절감을 위해 '오늘'만
-    ✅ 실행 중 끊김 포함: 호출부에서 무한 재시도
-    """
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -668,56 +730,58 @@ def realtime_loop() -> int:
     job_name = "a2_fct_table_parser_mp_realtime"
     start_dt = datetime.now()
 
-    log("============================================================")
-    log(f"[START] {job_name} | {start_dt:%Y-%m-%d %H:%M:%S}")
-    log(f"[INFO] BASE_DIR = {BASE_DIR}")
-    log(f"[INFO] TODAY(end_day) ONLY = {today_yyyymmdd()}")
-    log(f"[INFO] RECENT_SECONDS(mtime) = {RECENT_SECONDS}")
-    log(f"[INFO] LOOP_INTERVAL_SEC = {LOOP_INTERVAL_SEC}")
-    log(f"[INFO] MULTIPROCESSING = {USE_MULTIPROCESSING} | workers=1")
-    log(f"[INFO] TARGET = {SCHEMA_NAME}.{TABLE_NAME}")
-    log(f"[INFO] MIN_FILE_AGE_SEC={MIN_FILE_AGE_SEC} | STABILITY_CHECK_SEC={STABILITY_CHECK_SEC} | STABILITY_RETRY={STABILITY_RETRY}")
-    log(f"[INFO] LOCK_GLOB_PATTERNS={LOCK_GLOB_PATTERNS}")
-    log(f"[INFO] DB_RELOAD_EVERY_LOOPS={DB_RELOAD_EVERY_LOOPS}")
-    log(f"[INFO] DB_RETRY_INTERVAL_SEC={DB_RETRY_INTERVAL_SEC}")
-    log(f"[INFO] WORK_MEM(cap)={WORK_MEM}")
-    log(f"[INFO] keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}")
-    log("============================================================")
+    print("============================================================", flush=True)
+    log(f"[START] {job_name} | {start_dt:%Y-%m-%d %H:%M:%S}", info="info")
+    log(f"[INFO] BASE_DIR = {BASE_DIR}", info="info")
+    log(f"[INFO] TODAY(end_day) ONLY = {today_yyyymmdd()}", info="info")
+    log(f"[INFO] RECENT_SECONDS(mtime) = {RECENT_SECONDS}", info="info")
+    log(f"[INFO] LOOP_INTERVAL_SEC = {LOOP_INTERVAL_SEC}", info="info")
+    log(f"[INFO] MULTIPROCESSING = {USE_MULTIPROCESSING} | workers=1", info="info")
+    log(f"[INFO] TARGET = {SCHEMA_NAME}.{TABLE_NAME}", info="info")
+    log(f"[INFO] LOG_TARGET = {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME}", info="info")
+    log(f"[INFO] MIN_FILE_AGE_SEC={MIN_FILE_AGE_SEC} | STABILITY_CHECK_SEC={STABILITY_CHECK_SEC} | STABILITY_RETRY={STABILITY_RETRY}", info="info")
+    log(f"[INFO] LOCK_GLOB_PATTERNS={LOCK_GLOB_PATTERNS}", info="info")
+    log(f"[INFO] DB_RELOAD_EVERY_LOOPS={DB_RELOAD_EVERY_LOOPS}", info="info")
+    log(f"[INFO] DB_RETRY_INTERVAL_SEC={DB_RETRY_INTERVAL_SEC}", info="info")
+    log(f"[INFO] WORK_MEM(cap)={WORK_MEM}", info="info")
+    log(f"[INFO] keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}", info="info")
+    print("============================================================", flush=True)
 
-    log("[STEP] Ensure schema/table/index ...")
+    # fct 테이블 / log 테이블 생성
+    log("[STEP] Ensure schema/table/index ...", info="info")
     ensure_schema_table()
-    log("[OK] Schema/table ready.")
+    log("[OK] main table ready.", info="info")
+
+    ensure_log_table()
+    flush_log_buffer_blocking()
 
     processed: Dict[str, ProcessedInfo] = {}
     loop_count = 0
 
-    # ✅ 상시 연결 1개 유지
     conn = ensure_conn()
-
-    # pool 변수는 기존 기능 구조를 유지하기 위해 남겨두되, 요구사항에 따라 사용하지 않음
     pool = None
 
-    # ✅ 오늘 기준 DB file_path 캐시
     current_day = today_yyyymmdd()
     while True:
         try:
             conn = ensure_conn()
             already_in_db_paths_today: Set[str] = load_db_file_paths_today(conn, current_day)
-            log(f"[DB] Loaded DISTINCT file_path for end_day={current_day}: {len(already_in_db_paths_today):,}")
+            log(f"[DB] Loaded DISTINCT file_path for end_day={current_day}: {len(already_in_db_paths_today):,}", info="info")
+            flush_log_buffer_blocking()
             break
         except psycopg2.Error as e:
             if _is_connection_error(e):
-                log(f"[DB][RETRY] load_db_file_paths_today failed(conn): {type(e).__name__}: {repr(e)}")
+                log(f"[DB][RETRY] load_db_file_paths_today failed(conn): {type(e).__name__}: {repr(e)}", info="down")
                 try:
                     conn.rollback()
                 except Exception:
                     pass
                 _reset_conn("load_db_file_paths_today connection error")
+                flush_log_buffer_blocking()
                 time.sleep(DB_RETRY_INTERVAL_SEC)
                 continue
-            log(f"[DB][FATAL] load_db_file_paths_today db error: {type(e).__name__}: {repr(e)}")
-            raise
-        except Exception:
+            log(f"[DB][FATAL] load_db_file_paths_today db error: {type(e).__name__}: {repr(e)}", info="error")
+            flush_log_buffer_blocking()
             raise
 
     try:
@@ -727,7 +791,6 @@ def realtime_loop() -> int:
             now_dt = datetime.now()
             today_str = now_dt.strftime("%Y%m%d")
 
-            # ✅ 날짜 변경 감지(자정): 캐시 초기화 + DB file_path 재로딩
             if today_str != current_day:
                 current_day = today_str
                 processed.clear()
@@ -736,65 +799,69 @@ def realtime_loop() -> int:
                     try:
                         conn = ensure_conn()
                         already_in_db_paths_today = load_db_file_paths_today(conn, current_day)
-                        log(f"[DAY-CHANGE] today={current_day} | reset caches | db_paths={len(already_in_db_paths_today):,}")
+                        log(f"[DAY-CHANGE] today={current_day} | reset caches | db_paths={len(already_in_db_paths_today):,}", info="info")
+                        flush_log_buffer_blocking()
                         break
                     except psycopg2.Error as e:
                         if _is_connection_error(e):
-                            log(f"[DB][RETRY] day-change reload failed(conn): {type(e).__name__}: {repr(e)}")
+                            log(f"[DB][RETRY] day-change reload failed(conn): {type(e).__name__}: {repr(e)}", info="down")
                             try:
                                 conn.rollback()
                             except Exception:
                                 pass
                             _reset_conn("day-change reload connection error")
+                            flush_log_buffer_blocking()
                             time.sleep(DB_RETRY_INTERVAL_SEC)
                             continue
-                        log(f"[DB][FATAL] day-change reload db error: {type(e).__name__}: {repr(e)}")
-                        raise
-                    except Exception:
+                        log(f"[DB][FATAL] day-change reload db error: {type(e).__name__}: {repr(e)}", info="error")
+                        flush_log_buffer_blocking()
                         raise
 
-            # ✅ 주기적 DB file_path 재로딩(프로그램 재시작/타 프로세스 적재 반영)
             if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
                 while True:
                     try:
                         conn = ensure_conn()
                         already_in_db_paths_today = load_db_file_paths_today(conn, current_day)
-                        log(f"[DB-RELOAD] end_day={current_day} | db_paths={len(already_in_db_paths_today):,}")
+                        log(f"[DB-RELOAD] end_day={current_day} | db_paths={len(already_in_db_paths_today):,}", info="info")
+                        flush_log_buffer_blocking()
                         break
                     except psycopg2.Error as e:
                         if _is_connection_error(e):
-                            log(f"[DB][RETRY] periodic reload failed(conn): {type(e).__name__}: {repr(e)}")
+                            log(f"[DB][RETRY] periodic reload failed(conn): {type(e).__name__}: {repr(e)}", info="down")
                             try:
                                 conn.rollback()
                             except Exception:
                                 pass
                             _reset_conn("periodic reload connection error")
+                            flush_log_buffer_blocking()
                             time.sleep(DB_RETRY_INTERVAL_SEC)
                             continue
-                        log(f"[DB][FATAL] periodic reload db error: {type(e).__name__}: {repr(e)}")
-                        raise
-                    except Exception:
+                        log(f"[DB][FATAL] periodic reload db error: {type(e).__name__}: {repr(e)}", info="error")
+                        flush_log_buffer_blocking()
                         raise
 
-            # 1) 최근 파일 수집 (✅ DB에 이미 있는 file_path는 스킵)
             jobs = collect_recent_files(processed, already_in_db_paths_today, current_day)
 
             if (loop_count % HEARTBEAT_EVERY_LOOPS) == 0:
-                log(f"[HEARTBEAT] {now_dt:%Y-%m-%d %H:%M:%S} | jobs={len(jobs):,} | cache={len(processed):,} | db_paths={len(already_in_db_paths_today):,} | today={current_day}")
+                log(
+                    f"[HEARTBEAT] {now_dt:%Y-%m-%d %H:%M:%S} | jobs={len(jobs):,} | cache={len(processed):,} | db_paths={len(already_in_db_paths_today):,} | today={current_day}",
+                    info="info"
+                )
 
             if not jobs:
                 elapsed = time.perf_counter() - loop_start
                 sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
                 if sleep_sec > 0:
+                    log(f"[SLEEP] no jobs | sleep={sleep_sec:.2f}s", info="sleep")
+                    if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                        flush_log_buffer_blocking()
                     time.sleep(sleep_sec)
                 continue
 
-            # 2) 파싱 + insert
             buffer: List[RowTuple] = []
             files_processed = 0
             rows_inserted = 0
 
-            # ✅ 요구사항: 멀티프로세스 1개 -> 단일 프로세스로 순차 파싱
             for j in jobs:
                 rows = parse_one_file(j)
                 files_processed += 1
@@ -802,7 +869,6 @@ def realtime_loop() -> int:
                     buffer.extend(rows)
 
                 if len(buffer) >= FLUSH_ROWS_REALTIME:
-                    # ✅ DB 작업 도중 끊겨도 무한 재연결 후 flush 재시도
                     while True:
                         conn = ensure_conn()
                         try:
@@ -811,27 +877,30 @@ def realtime_loop() -> int:
                             conn.commit()
                             rows_inserted += inserted
 
-                            # ✅ 방금 처리된 파일들 file_path를 DB캐시에 즉시 반영(중복 방지 강화)
                             for r in buffer:
                                 already_in_db_paths_today.add(r[-1])
 
-                            log(f"[FLUSH] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
+                            log(f"[FLUSH] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}", info="info")
                             buffer.clear()
+                            if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                                flush_log_buffer_blocking()
                             break
 
                         except psycopg2.Error as e:
                             if _is_connection_error(e):
-                                log(f"[DB][RETRY] flush failed(conn): {type(e).__name__}: {repr(e)}")
+                                log(f"[DB][RETRY] flush failed(conn): {type(e).__name__}: {repr(e)}", info="down")
                                 try:
                                     conn.rollback()
                                 except Exception:
                                     pass
                                 _reset_conn("flush connection error")
+                                if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                                    flush_log_buffer_blocking()
                                 time.sleep(DB_RETRY_INTERVAL_SEC)
                                 continue
-                            log(f"[DB][FATAL] flush db error: {type(e).__name__}: {repr(e)}")
-                            raise
-                        except Exception:
+                            log(f"[DB][FATAL] flush db error: {type(e).__name__}: {repr(e)}", info="error")
+                            if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                                flush_log_buffer_blocking()
                             raise
 
             if buffer:
@@ -846,34 +915,49 @@ def realtime_loop() -> int:
                         for r in buffer:
                             already_in_db_paths_today.add(r[-1])
 
-                        log(f"[FLUSH-LAST] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}")
+                        log(f"[FLUSH-LAST] inserted={inserted:,} | loop_rows={rows_inserted:,} | loop_files={files_processed:,}/{len(jobs):,}", info="info")
                         buffer.clear()
+                        if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                            flush_log_buffer_blocking()
                         break
 
                     except psycopg2.Error as e:
                         if _is_connection_error(e):
-                            log(f"[DB][RETRY] flush-last failed(conn): {type(e).__name__}: {repr(e)}")
+                            log(f"[DB][RETRY] flush-last failed(conn): {type(e).__name__}: {repr(e)}", info="down")
                             try:
                                 conn.rollback()
                             except Exception:
                                 pass
                             _reset_conn("flush-last connection error")
+                            if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                                flush_log_buffer_blocking()
                             time.sleep(DB_RETRY_INTERVAL_SEC)
                             continue
-                        log(f"[DB][FATAL] flush-last db error: {type(e).__name__}: {repr(e)}")
-                        raise
-                    except Exception:
+                        log(f"[DB][FATAL] flush-last db error: {type(e).__name__}: {repr(e)}", info="error")
+                        if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                            flush_log_buffer_blocking()
                         raise
 
-            log(f"[LOOP] {now_dt:%H:%M:%S} | jobs={len(jobs):,} | files={files_processed:,} | inserted_rows={rows_inserted:,}")
+            log(f"[LOOP] {now_dt:%H:%M:%S} | jobs={len(jobs):,} | files={files_processed:,} | inserted_rows={rows_inserted:,}", info="info")
+            if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                flush_log_buffer_blocking()
 
-            # 3) 5초 주기 유지
             elapsed = time.perf_counter() - loop_start
             sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
             if sleep_sec > 0:
+                log(f"[SLEEP] loop done | sleep={sleep_sec:.2f}s", info="sleep")
+                if len(LOG_BUFFER) >= LOG_FLUSH_MIN_ROWS:
+                    flush_log_buffer_blocking()
                 time.sleep(sleep_sec)
 
     finally:
+        # 종료 직전 로그 버퍼 최대한 반영
+        try:
+            if LOG_BUFFER:
+                flush_log_buffer_blocking()
+        except Exception:
+            pass
+
         if pool is not None:
             try:
                 pool.close()
@@ -885,14 +969,10 @@ def realtime_loop() -> int:
 
 
 # =========================
-# 8) 엔트리포인트 (EXE 콘솔 자동 종료 방지)
+# 8) 엔트리포인트
 # =========================
 
 def hold_console(exit_code: int) -> None:
-    """
-    exe 더블클릭 실행 시 콘솔 자동 종료 방지.
-    무한루프이므로 일반적으로 호출되지 않지만, 예외/중단 시 유효.
-    """
     try:
         print("\n" + "=" * 60)
         print(f"[HOLD] 종료 코드(exit_code) = {exit_code}")
@@ -916,9 +996,20 @@ if __name__ == "__main__":
         exit_code = realtime_loop()
     except KeyboardInterrupt:
         print("\n[ABORT] 사용자 중단(CTRL+C)")
+        # 종료 이벤트를 DB 로그에 남기고 시도
+        try:
+            LOG_BUFFER.append((today_yyyymmdd(), now_hhmmss(), "error", "[ABORT] keyboard interrupt"))
+            flush_log_buffer_blocking()
+        except Exception:
+            pass
         exit_code = 130
     except Exception as e:
         print("\n[ERROR] Unhandled exception:", repr(e))
+        try:
+            LOG_BUFFER.append((today_yyyymmdd(), now_hhmmss(), "error", f"[ERROR] unhandled exception: {repr(e)}"))
+            flush_log_buffer_blocking()
+        except Exception:
+            pass
         exit_code = 1
     finally:
         hold_console(exit_code)

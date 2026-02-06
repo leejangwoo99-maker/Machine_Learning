@@ -4,7 +4,7 @@ backend4_repeat_fail_daemon.py
 ------------------------------------------------------------
 Backend-4: Vision FAIL repeat step_description daily daemon
 
-요구사항 반영:
+[기존 요구사항 유지]
 1) dataframe 콘솔 출력 없음
 2) 날짜는 WINDOW 기준 현재날짜/현재시각으로 자동 전환
 3) 멀티프로세스 1개
@@ -33,6 +33,17 @@ Backend-4: Vision FAIL repeat step_description daily daemon
 주의:
 - 컬럼명은 bucket별로 그대로 사용(한글/공백 포함)
 - 유일키: (prod_day, shift_type, pn, <bucket_col>)
+
+[추가된 로그 DB 사양]
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: "4_log" (없으면 생성)
+- 컬럼:
+  1) end_day   : yyyymmdd
+  2) end_time  : hh:mi:ss
+  3) info      : 소문자
+  4) contents  : 나머지 로그 내용
+- 저장 시 컬럼 순서: end_day, end_time, info, contents
+- DataFrame화 후 append 저장
 """
 
 from __future__ import annotations
@@ -42,8 +53,9 @@ import time as time_mod
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
-from typing import Dict, Tuple, Optional, Set, List, Iterable, DefaultDict
+from typing import Dict, Tuple, Optional, Set, List, Iterable
 
+import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, DBAPIError
@@ -90,17 +102,17 @@ BUCKET_COL = {
     "3+": "3회 이상 반복_FAIL_step_description",
 }
 
+# 로그 DB
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "4_log"
+
+# 전역 로깅 엔진 핸들(연결 성공 후 활성화)
+LOG_ENGINE: Optional[Engine] = None
+_LOG_DB_REENTRANT_GUARD = False
+
 
 # =========================
-# 1) 로깅
-# =========================
-def log(level: str, msg: str) -> None:
-    now = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{now} [{level}] {msg}", flush=True)
-
-
-# =========================
-# 2) 유틸
+# 1) 공통 유틸
 # =========================
 def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
@@ -133,6 +145,72 @@ def bucket_for(cnt: int) -> Optional[str]:
 
 
 # =========================
+# 2) 로그 DB 저장
+# =========================
+def ensure_log_table(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(LOG_SCHEMA)};"))
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {quote_ident(LOG_SCHEMA)}.{quote_ident(LOG_TABLE)} (
+                {quote_ident("end_day")}  text,
+                {quote_ident("end_time")} text,
+                {quote_ident("info")}     text,
+                {quote_ident("contents")} text
+            );
+        """))
+
+
+def write_log_to_db(level: str, msg: str) -> None:
+    """
+    컬럼 순서(end_day, end_time, info, contents)로 DataFrame화 후 append 저장.
+    info는 반드시 소문자 저장.
+    """
+    global _LOG_DB_REENTRANT_GUARD
+
+    if LOG_ENGINE is None:
+        return
+    if _LOG_DB_REENTRANT_GUARD:
+        return
+
+    ts = datetime.now(tz=KST)
+    end_day = ts.strftime("%Y%m%d")
+    end_time = ts.strftime("%H:%M:%S")
+    info = (level or "").strip().lower()
+    contents = str(msg)
+
+    df = pd.DataFrame(
+        [[end_day, end_time, info, contents]],
+        columns=["end_day", "end_time", "info", "contents"],
+    )
+
+    try:
+        _LOG_DB_REENTRANT_GUARD = True
+        # pandas.to_sql 사용 (append)
+        df.to_sql(
+            name=LOG_TABLE,
+            con=LOG_ENGINE,
+            schema=LOG_SCHEMA,
+            if_exists="append",
+            index=False,
+            method="multi",
+        )
+    except Exception:
+        # 로그 저장 실패는 콘솔 동작에 영향 주지 않음
+        pass
+    finally:
+        _LOG_DB_REENTRANT_GUARD = False
+
+
+def log(level: str, msg: str) -> None:
+    now = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+    lv = (level or "").upper()
+    print(f"{now} [{lv}] {msg}", flush=True)
+
+    # DB에도 저장 (info는 소문자 변환)
+    write_log_to_db(level=level, msg=msg)
+
+
+# =========================
 # 3) WINDOW 자동 결정
 # =========================
 @dataclass(frozen=True)
@@ -156,7 +234,6 @@ def current_window(now: datetime) -> WindowKey:
 
     day_start = time(8, 30, 0, tzinfo=KST)
     day_end = time(20, 29, 59, tzinfo=KST)
-    night_start = time(20, 30, 0, tzinfo=KST)
     night_end = time(8, 29, 59, tzinfo=KST)
 
     today = now.date()
@@ -209,15 +286,25 @@ def make_engine() -> Engine:
 
 
 def connect_with_retry() -> Engine:
+    global LOG_ENGINE
+
     engine = make_engine()
     while True:
         try:
             with engine.begin() as conn:
                 conn.execute(text(f"SET work_mem = '{WORK_MEM}';"))
-            log("INFO", f"DB connected (work_mem={WORK_MEM})")
+
+            # 로그 테이블 먼저 보장 후 로깅 엔진 활성화
+            ensure_log_table(engine)
+            LOG_ENGINE = engine
+
+            log("info", f"db connected (work_mem={WORK_MEM})")
             return engine
         except Exception as e:
-            log("RETRY", f"DB connect failed: {type(e).__name__}: {e} (retry in {DB_RETRY_INTERVAL_SEC}s)")
+            # 연결 자체 실패 시에는 콘솔 출력만(아직 LOG_ENGINE 미보장 가능)
+            now = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+            msg = f"db connect failed: {type(e).__name__}: {e} (retry in {DB_RETRY_INTERVAL_SEC}s)"
+            print(f"{now} [RETRY] {msg}", flush=True)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = make_engine()
 
@@ -243,8 +330,6 @@ def ensure_schema_and_tables(engine: Engine) -> None:
             {ddl_cols}
         );
         """
-        # 유일키: (prod_day, shift_type, pn, bucket_col)
-        # (없으면 ON CONFLICT 사용 불가)
         idx_name = f"uq_{table}_key"
         create_idx_sql = f"""
         CREATE UNIQUE INDEX IF NOT EXISTS {quote_ident(idx_name)}
@@ -279,25 +364,19 @@ def load_pn_map(engine: Engine) -> Dict[str, str]:
 
 
 # =========================
-# 6) vision_table fetch (window + upper_dt)
+# 6) vision_table fetch
 # =========================
 def build_window_filter(win: WindowKey) -> Tuple[str, Dict[str, str]]:
-    """
-    end_day/end_time(text)로 window 범위를 구성.
-    upper_dt = now 제한 적용(bootstrap/start~now)
-    """
     prod_d = yyyymmdd_to_date(win.prod_day)
     d0 = prod_d
     d1 = prod_d + timedelta(days=1)
     d0s = date_to_yyyymmdd(d0)
     d1s = date_to_yyyymmdd(d1)
 
-    # upper_dt가 어느 날짜인지에 따라 night 구간 상한이 달라짐
     upper_date = win.upper_dt.date()
     upper_time_str = win.upper_dt.strftime("%H:%M:%S")
 
     if win.shift_type == "day":
-        # day: d0 08:30:00 ~ d0 min(20:29:59, upper_time)
         where_sql = """
             end_day = :d0
             AND end_time >= '08:30:00'
@@ -306,9 +385,6 @@ def build_window_filter(win: WindowKey) -> Tuple[str, Dict[str, str]]:
         params = {"d0": d0s, "upper_t": upper_time_str}
         return where_sql, params
 
-    # night:
-    # 기본 구간: d0 20:30:00~23:59:59 + d1 00:00:00~08:29:59
-    # upper_dt가 d0이면 d0 구간만 upper_t 까지 제한
     if upper_date == d0:
         where_sql = """
             (end_day = :d0 AND end_time >= '20:30:00' AND end_time <= :upper_t)
@@ -316,7 +392,6 @@ def build_window_filter(win: WindowKey) -> Tuple[str, Dict[str, str]]:
         params = {"d0": d0s, "upper_t": upper_time_str}
         return where_sql, params
 
-    # upper_dt가 d1이면 d0 구간은 full, d1 구간은 upper_t까지
     where_sql = """
         (
             (end_day = :d0 AND end_time >= '20:30:00' AND end_time <= '23:59:59')
@@ -334,10 +409,6 @@ def fetch_rows_incremental(
     last_pk: Optional[Tuple[str, str, str]],
     limit: int = FETCH_BATCH_LIMIT,
 ) -> List[Tuple[str, str, str, str]]:
-    """
-    반환 row: (end_day, end_time, barcode_information, step_description)
-    증분 PK: (end_day, end_time, barcode_information) > last_pk (text 비교)
-    """
     where_win, params = build_window_filter(win)
 
     pk_cond = ""
@@ -371,10 +442,6 @@ def fetch_rows_incremental(
 
 
 def fetch_rows_bootstrap(engine: Engine, win: WindowKey) -> Iterable[Tuple[str, str, str, str]]:
-    """
-    start~upper_dt 범위를 전부 스캔(bootstrap).
-    batch 반복 fetch를 위해 last_pk를 내부적으로 사용.
-    """
     last_pk: Optional[Tuple[str, str, str]] = None
     while True:
         rows = fetch_rows_incremental(engine, win, last_pk, limit=FETCH_BATCH_LIMIT)
@@ -382,7 +449,6 @@ def fetch_rows_bootstrap(engine: Engine, win: WindowKey) -> Iterable[Tuple[str, 
             break
         for r in rows:
             yield r
-        # last_pk 갱신: (end_day, end_time, barcode_information)
         last = rows[-1]
         last_pk = (last[0], last[1], last[2])
 
@@ -392,22 +458,16 @@ def fetch_rows_bootstrap(engine: Engine, win: WindowKey) -> Iterable[Tuple[str, 
 # =========================
 @dataclass
 class State:
-    win_key: Optional[Tuple[str, str]] = None  # (prod_day, shift_type)
-    last_pk: Optional[Tuple[str, str, str]] = None  # (end_day, end_time, barcode_information)
+    win_key: Optional[Tuple[str, str]] = None
+    last_pk: Optional[Tuple[str, str, str]] = None
     pn_map: Dict[str, str] = field(default_factory=dict)
 
     seen_pk: Set[Tuple[str, str, str, str]] = field(default_factory=set)
-    # (barcode, step) 누적 반복 횟수
     pair_cnt: Dict[Tuple[str, str], int] = field(default_factory=dict)
-    # (barcode, step) 현재 bucket
     pair_bucket: Dict[Tuple[str, str], str] = field(default_factory=dict)
-    # barcode -> pn
     barcode_pn: Dict[str, str] = field(default_factory=dict)
 
-    # agg: bucket -> (pn, step) -> count(=해당 bucket에 속한 barcode 수)
     agg: Dict[str, Dict[Tuple[str, str], int]] = field(default_factory=lambda: {"1": {}, "2": {}, "3+": {}})
-
-    # dirty keys: (bucket, pn, step) 업데이트 필요
     dirty: Set[Tuple[str, str, str]] = field(default_factory=set)
 
     def reset_for_new_window(self, win: WindowKey, pn_map: Dict[str, str]) -> None:
@@ -424,19 +484,12 @@ class State:
 
 
 def apply_event(st: State, end_day: str, end_time: str, barcode: str, step: str) -> None:
-    """
-    신규 row 1건을 반영하여
-    - seen_pk 중복 방지
-    - (barcode, step) 반복횟수 증가
-    - bucket 이동 시 agg 카운트 조정(증분)
-    """
-    end_time_norm = end_time  # 이미 "HH:MM:SS" 보장
+    end_time_norm = end_time
     pk4 = (end_day, end_time_norm, barcode, step)
     if pk4 in st.seen_pk:
         return
     st.seen_pk.add(pk4)
 
-    # pn 결정(처음 보는 barcode면 고정 저장)
     if barcode not in st.barcode_pn:
         k = get_barcode_key_18th(barcode)
         pn = st.pn_map.get(k, "Unknown") if k else "Unknown"
@@ -453,36 +506,26 @@ def apply_event(st: State, end_day: str, end_time: str, barcode: str, step: str)
     if new_bucket is None:
         return
 
-    # bucket 변화가 있을 때만 agg 이동
     if old_bucket == new_bucket:
-        # 같은 bucket 안에서는 "해당 barcode가 그 bucket에 속한다" 사실은 변함없음
         return
 
-    # old bucket decrement
     if old_bucket is not None:
         key = (pn, step)
         prev = st.agg[old_bucket].get(key, 0)
         st.agg[old_bucket][key] = max(prev - 1, 0)
         st.dirty.add((old_bucket, pn, step))
 
-    # new bucket increment
     key = (pn, step)
     st.agg[new_bucket][key] = st.agg[new_bucket].get(key, 0) + 1
     st.dirty.add((new_bucket, pn, step))
 
-    # 현재 bucket 기록
     st.pair_bucket[pair] = new_bucket
 
 
 # =========================
-# 8) DB UPSERT(DELETE 금지)
+# 8) DB UPSERT
 # =========================
 def upsert_counts(engine: Engine, win: WindowKey, st: State) -> None:
-    """
-    dirty에 쌓인 (bucket,pn,step)에 대해 DB 반영.
-    - count > 0 : INSERT ... ON CONFLICT ... DO UPDATE
-    - count == 0: UPDATE만 수행(없으면 생성 X)  -> 불필요한 0-row 신규 생성 방지
-    """
     if not st.dirty:
         return
 
@@ -490,7 +533,6 @@ def upsert_counts(engine: Engine, win: WindowKey, st: State) -> None:
     shift_type = win.shift_type
     now_ts = datetime.now(tz=KST)
 
-    # 버킷별로 모아서 처리
     by_bucket: Dict[str, List[Tuple[str, str]]] = {"1": [], "2": [], "3+": []}
     for bucket, pn, step in st.dirty:
         by_bucket[bucket].append((pn, step))
@@ -504,7 +546,6 @@ def upsert_counts(engine: Engine, win: WindowKey, st: State) -> None:
         table = TABLES[(shift_type, bucket)]
         bucket_col = BUCKET_COL[bucket]
 
-        # UPDATE(0 포함) / UPSERT(>0) 분리
         to_update_only = []
         to_upsert = []
 
@@ -515,7 +556,6 @@ def upsert_counts(engine: Engine, win: WindowKey, st: State) -> None:
             else:
                 to_upsert.append((pn, step, cnt))
 
-        # 1) UPDATE ONLY (count=0 포함, 존재할 때만 갱신)
         if to_update_only:
             upd_sql = text(f"""
                 UPDATE {quote_ident(SAVE_SCHEMA)}.{quote_ident(table)}
@@ -526,22 +566,20 @@ def upsert_counts(engine: Engine, win: WindowKey, st: State) -> None:
                    AND {quote_ident("pn")} = :pn
                    AND {quote_ident(bucket_col)} = :step
             """)
-            payload = []
-            for pn, step, cnt in to_update_only:
-                payload.append({
-                    "prod_day": prod_day,
-                    "shift_type": shift_type,
-                    "pn": pn,
-                    "step": step,
-                    "cnt": str(cnt),
-                    "updated_at": now_ts,
-                })
+            payload = [{
+                "prod_day": prod_day,
+                "shift_type": shift_type,
+                "pn": pn,
+                "step": step,
+                "cnt": str(cnt),
+                "updated_at": now_ts,
+            } for pn, step, cnt in to_update_only]
+
             with engine.begin() as conn:
                 conn.execute(text(f"SET work_mem = '{WORK_MEM}';"))
                 res = conn.execute(upd_sql, payload)
                 total_updates += (res.rowcount or 0)
 
-        # 2) UPSERT (count>0)
         if to_upsert:
             ins_sql = text(f"""
                 INSERT INTO {quote_ident(SAVE_SCHEMA)}.{quote_ident(table)}
@@ -553,36 +591,33 @@ def upsert_counts(engine: Engine, win: WindowKey, st: State) -> None:
                     {quote_ident("count")} = EXCLUDED.{quote_ident("count")},
                     {quote_ident("updated_at")} = EXCLUDED.{quote_ident("updated_at")}
             """)
-            payload = []
-            for pn, step, cnt in to_upsert:
-                payload.append({
-                    "prod_day": prod_day,
-                    "shift_type": shift_type,
-                    "pn": pn,
-                    "step": step,
-                    "cnt": str(cnt),
-                    "updated_at": now_ts,
-                })
+            payload = [{
+                "prod_day": prod_day,
+                "shift_type": shift_type,
+                "pn": pn,
+                "step": step,
+                "cnt": str(cnt),
+                "updated_at": now_ts,
+            } for pn, step, cnt in to_upsert]
+
             with engine.begin() as conn:
                 conn.execute(text(f"SET work_mem = '{WORK_MEM}';"))
-                res = conn.execute(ins_sql, payload)
-                total_upserts += (len(payload))
+                conn.execute(ins_sql, payload)
+                total_upserts += len(payload)
 
     st.dirty.clear()
-    log("INFO", f"[UPSERT] window={win.prod_day}:{win.shift_type} upserted={total_upserts}, updated={total_updates}")
+    log("info", f"[UPSERT] window={win.prod_day}:{win.shift_type} upserted={total_upserts}, updated={total_updates}")
 
 
 # =========================
 # 9) Bootstrap + Incremental Loop
 # =========================
 def bootstrap(engine: Engine, win: WindowKey, st: State) -> None:
-    log("INFO", f"[BOOTSTRAP] start window={win.prod_day}:{win.shift_type} ({win.start_dt} ~ {win.upper_dt})")
+    log("info", f"[BOOTSTRAP] start window={win.prod_day}:{win.shift_type} ({win.start_dt} ~ {win.upper_dt})")
 
-    # pn_map 갱신
     pn_map = load_pn_map(engine)
     st.reset_for_new_window(win, pn_map)
 
-    # window 전체 스캔(start~now)
     n = 0
     last_pk: Optional[Tuple[str, str, str]] = None
 
@@ -594,19 +629,15 @@ def bootstrap(engine: Engine, win: WindowKey, st: State) -> None:
         last_pk = (end_day, end_time, str(barcode))
 
     st.last_pk = last_pk
-    # bootstrap 후에는 현재 agg 전체를 dirty로(정상값으로 UPSERT)
     for bucket in ("1", "2", "3+"):
         for (pn, step), _cnt in st.agg[bucket].items():
             st.dirty.add((bucket, pn, step))
 
-    log("INFO", f"[BOOTSTRAP] done fetched={n} last_pk={st.last_pk}")
+    log("info", f"[BOOTSTRAP] done fetched={n} last_pk={st.last_pk}")
 
 
 def incremental_step(engine: Engine, win: WindowKey, st: State) -> int:
-    """
-    last_pk 이후 신규 fetch -> in-memory 증분 반영
-    """
-    log("INFO", f"[LAST_PK] {st.last_pk}")
+    log("info", f"[LAST_PK] {st.last_pk}")
 
     total_new = 0
     while True:
@@ -620,20 +651,18 @@ def incremental_step(engine: Engine, win: WindowKey, st: State) -> int:
             apply_event(st, end_day, end_time, str(barcode), str(step))
             total_new += 1
 
-        # last_pk 갱신
         last = rows[-1]
         st.last_pk = (last[0], last[1], str(last[2]))
 
-        # batch가 꽉 찼으면 더 있을 수 있으니 이어서 fetch
         if len(rows) < FETCH_BATCH_LIMIT:
             break
 
-    log("INFO", f"[FETCH] new_rows={total_new} last_pk={st.last_pk}")
+    log("info", f"[FETCH] new_rows={total_new} last_pk={st.last_pk}")
     return total_new
 
 
 def main() -> None:
-    log("BOOT", "backend4 repeat-fail daemon starting")
+    log("boot", "backend4 repeat-fail daemon starting")
 
     engine = connect_with_retry()
     ensure_schema_and_tables(engine)
@@ -648,46 +677,47 @@ def main() -> None:
             win = current_window(now)
             win_key = (win.prod_day, win.shift_type)
 
-            # window 전환 감지 -> reset + bootstrap
             if prev_win_key != win_key:
-                log("INFO", f"[WINDOW] changed => {win.prod_day}:{win.shift_type} "
-                            f"(start={win.start_dt}, end={win.end_dt}, upper={win.upper_dt})")
+                log(
+                    "info",
+                    f"[WINDOW] changed => {win.prod_day}:{win.shift_type} "
+                    f"(start={win.start_dt}, end={win.end_dt}, upper={win.upper_dt})"
+                )
                 bootstrap(engine, win, st)
                 upsert_counts(engine, win, st)
                 prev_win_key = win_key
             else:
-                # upper_dt 갱신(현재 now 기준)
-                win = current_window(now)  # upper_dt 업데이트 목적
-                # 신규 fetch -> 증분 집계
-                new_n = incremental_step(engine, win, st)
-                # dirty 반영(신규가 없어도 bucket 이동/dirty가 생길 수 있으므로 st.dirty 기준)
+                win = current_window(now)
+                _ = incremental_step(engine, win, st)
                 if st.dirty:
                     upsert_counts(engine, win, st)
 
-            # (선택) 메모리 보호: seen_pk가 비정상 폭증 시 전체 재부팅
             if len(st.seen_pk) > 2_000_000:
-                log("RETRY", f"seen_pk too large ({len(st.seen_pk)}). force bootstrap.")
-                bootstrap(engine, current_window(datetime.now(tz=KST)), st)
-                upsert_counts(engine, current_window(datetime.now(tz=KST)), st)
+                log("down", f"seen_pk too large ({len(st.seen_pk)}). force bootstrap.")
+                now2 = datetime.now(tz=KST)
+                win2 = current_window(now2)
+                bootstrap(engine, win2, st)
+                upsert_counts(engine, win2, st)
 
         except (OperationalError, DBAPIError) as e:
-            log("RETRY", f"DB error: {type(e).__name__}: {e} (reconnect in {DB_RETRY_INTERVAL_SEC}s)")
+            log("down", f"db error: {type(e).__name__}: {e} (reconnect in {DB_RETRY_INTERVAL_SEC}s)")
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
             engine = connect_with_retry()
             ensure_schema_and_tables(engine)
-            # 재연결 후 현재 window로 bootstrap해서 정상값 UPSERT
+
             win = current_window(datetime.now(tz=KST))
             bootstrap(engine, win, st)
             upsert_counts(engine, win, st)
             prev_win_key = (win.prod_day, win.shift_type)
 
         except Exception as e:
-            # 예상 외 에러는 로그만 남기고 루프 지속
-            log("RETRY", f"Unhandled error: {type(e).__name__}: {e}")
+            log("error", f"unhandled error: {type(e).__name__}: {e}")
 
-        # pacing
         elapsed = time_mod.time() - loop_t0
         sleep_s = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+        if sleep_s > 0:
+            log("sleep", f"loop sleep {sleep_s:.2f}s")
         time_mod.sleep(sleep_s)
 
 

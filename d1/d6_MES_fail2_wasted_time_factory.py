@@ -14,6 +14,12 @@ d6_MES_fail2_wasted_time.py
 - pool 최소화: pool_size=1, max_overflow=0, pool_pre_ping=True
 - work_mem 폭증 방지: 세션마다 SET work_mem
 - 증분 커서: DEST의 last_pk 이후 데이터만(>) 조회
+
+[추가] 데몬 헬스 로그 DB 저장
+- schema: k_demon_heath_check (없으면 생성)
+- table : d6_log (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- 저장 순서: end_day, end_time, info, contents
 """
 
 from __future__ import annotations
@@ -50,6 +56,11 @@ DST_SCHEMA = "d1_machine_log"
 DST_TABLE = "mes_fail2_wasted_time"
 DST_FQN = f"{DST_SCHEMA}.{DST_TABLE}"
 
+# ✅ 데몬 로그 저장 대상
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "d6_log"
+LOG_FQN = f"{LOG_SCHEMA}.{LOG_TABLE}"
+
 STATIONS = ("FCT1", "FCT2", "FCT3", "FCT4")
 GOODORBAD_VALUE = "BadFile"
 
@@ -64,7 +75,7 @@ WARM_START_LOOKBACK_MIN = int(os.getenv("WARM_START_LOOKBACK_MIN", "60"))
 
 
 # =========================
-# LOG
+# LOG (console)
 # =========================
 def log(msg: str) -> None:
     ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
@@ -91,6 +102,7 @@ def set_session_guards(conn) -> None:
 def get_engine_blocking() -> Engine:
     """DB 붙을 때까지 무한 재시도"""
     while True:
+        eng = None
         try:
             log("[DB] creating engine...")
             eng = make_engine()
@@ -103,7 +115,8 @@ def get_engine_blocking() -> Engine:
         except Exception as e:
             log(f"[RETRY] DB connect failed: {type(e).__name__}: {e}")
             try:
-                eng.dispose()
+                if eng is not None:
+                    eng.dispose()
             except Exception:
                 pass
             time.sleep(LOOP_SLEEP_SEC)
@@ -148,6 +161,79 @@ def ensure_dest_table(engine: Engine) -> None:
     with engine.begin() as conn:
         set_session_guards(conn)
         conn.execute(text(ddl))
+
+
+# =========================
+# DDL: DEMON HEALTH LOG TABLE
+# =========================
+def ensure_demon_log_table(engine: Engine) -> None:
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};
+
+    CREATE TABLE IF NOT EXISTS {LOG_FQN} (
+        end_day   TEXT NOT NULL,   -- yyyymmdd
+        end_time  TEXT NOT NULL,   -- hh:mi:ss
+        info      TEXT NOT NULL,   -- 반드시 소문자 저장
+        contents  TEXT
+    );
+    """
+    with engine.begin() as conn:
+        set_session_guards(conn)
+        conn.execute(text(ddl))
+
+
+def write_demon_log(engine: Engine | None, info: str, contents: str) -> None:
+    """
+    DB 헬스 로그 저장.
+    - info는 강제로 소문자화
+    - 컬럼 순서(end_day, end_time, info, contents)로 DataFrame 생성 후 저장
+    - 본 함수 실패는 상위 로직 중단시키지 않음
+    """
+    if engine is None:
+        return
+
+    try:
+        now = datetime.now(KST)
+        row = {
+            "end_day": now.strftime("%Y%m%d"),
+            "end_time": now.strftime("%H:%M:%S"),
+            "info": (info or "").strip().lower(),
+            "contents": str(contents) if contents is not None else None,
+        }
+
+        df_log = pd.DataFrame([row], columns=["end_day", "end_time", "info", "contents"])
+        records = [tuple(r) for r in df_log.itertuples(index=False, name=None)]
+        if not records:
+            return
+
+        sql_ins = f"""
+        INSERT INTO {LOG_FQN} (end_day, end_time, info, contents)
+        VALUES %s
+        """
+
+        with engine.begin() as conn:
+            set_session_guards(conn)
+            raw = conn.connection
+            with raw.cursor() as cur:
+                execute_values(
+                    cur,
+                    sql_ins,
+                    records,
+                    template="(%s, %s, %s, %s)",
+                    page_size=1000,
+                )
+    except Exception as e:
+        # 로그 저장 실패는 콘솔만 남기고 무시
+        log(f"[LOG-DB][ERROR] {type(e).__name__}: {e}")
+
+
+def logx(engine: Engine | None, info: str, contents: str) -> None:
+    """
+    콘솔 + DB 로그 동시 기록
+    """
+    msg = f"[{info.lower()}] {contents}"
+    log(msg)
+    write_demon_log(engine, info, contents)
 
 
 # =========================
@@ -257,25 +343,25 @@ def fetch_new_rows(engine: Engine, last_pk: tuple[str, str, str] | None) -> pd.D
 
 # =========================
 # WARM-START BACKFILL (부팅 시 1회)
-# - DEST last_pk가 있으면: last_end_ts - LOOKBACK_MIN 부터 재조회(>=)
-# - DEST 비어있으면: 오늘 00:00:00(KST)부터 재조회(>=)
-# - 저장은 DO NOTHING => 중복은 스킵, 누락만 보충
 # =========================
 def warm_start_backfill(engine: Engine) -> int:
     last_pk = get_last_pk(engine)
 
     if last_pk is None:
-        # 최초 실행: KST 오늘 00:00:00부터
         now_kst = datetime.now(KST)
         start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
         start_ts_str = start_kst.strftime("%Y%m%d %H:%M:%S")
-        log(f"[WARM] no last_pk -> bootstrap from KST today 00:00:00 ({start_ts_str})")
+        logx(engine, "info", f"[WARM] no last_pk -> bootstrap from KST today 00:00:00 ({start_ts_str})")
     else:
         last_end_day, last_end_time, _ = last_pk
         last_dt = datetime.strptime(f"{last_end_day} {last_end_time}", "%Y%m%d %H:%M:%S").replace(tzinfo=KST)
         start_dt = last_dt - timedelta(minutes=WARM_START_LOOKBACK_MIN)
         start_ts_str = start_dt.strftime("%Y%m%d %H:%M:%S")
-        log(f"[WARM] last_pk={last_pk} -> backfill from {start_ts_str} (lookback={WARM_START_LOOKBACK_MIN}m)")
+        logx(
+            engine,
+            "info",
+            f"[WARM] last_pk={last_pk} -> backfill from {start_ts_str} (lookback={WARM_START_LOOKBACK_MIN}m)",
+        )
 
     params = {
         "stations": list(STATIONS),
@@ -295,7 +381,7 @@ def warm_start_backfill(engine: Engine) -> int:
         df = pd.read_sql_query(text(sql), conn, params=params)
 
     inserted = insert_rows(engine, df)
-    log(f"[WARM] fetched={len(df)} inserted_attempt={inserted} (duplicates skipped)")
+    logx(engine, "info", f"[WARM] fetched={len(df)} inserted_attempt={inserted} (duplicates skipped)")
     return inserted
 
 
@@ -371,49 +457,57 @@ def insert_rows(engine: Engine, df: pd.DataFrame) -> int:
 # MAIN
 # =========================
 def main() -> None:
+    # 엔진 전 콘솔 부트로그
     log("[BOOT] start d6_MES_fail2_wasted_time")
     log(f"[CFG] DB={DB_CONFIG['host']}:{DB_CONFIG['port']} db={DB_CONFIG['dbname']} user={DB_CONFIG['user']}")
     log(f"[CFG] sleep={LOOP_SLEEP_SEC}s work_mem={PG_WORK_MEM} dst={DST_FQN}")
     log(f"[CFG] warm_start_lookback_min={WARM_START_LOOKBACK_MIN}")
 
     engine = get_engine_blocking()
+
+    # 테이블 보장
     ensure_dest_table(engine)
-    log("[DDL] ensured dest table")
+    ensure_demon_log_table(engine)
+
+    logx(engine, "info", "[DDL] ensured dest table")
+    logx(engine, "info", f"[DDL] ensured demon log table: {LOG_FQN}")
 
     # ✅ Warm-start backfill (부팅 시 1회)
     try:
         warm_start_backfill(engine)
     except Exception as e:
-        log(f"[WARM][ERROR] {type(e).__name__}: {e}")
-        # warm-start 실패해도 데몬은 계속 돈다(다음 loop에서 증분 수행)
+        logx(engine, "error", f"[WARM][ERROR] {type(e).__name__}: {e}")
+        # warm-start 실패해도 데몬은 계속 돈다
 
     while True:
         try:
-            log("[LOOP] tick")
+            logx(engine, "info", "[LOOP] tick")
 
             last_pk = get_last_pk(engine)
-            log(f"[CURSOR] last_pk={last_pk}")
+            logx(engine, "info", f"[CURSOR] last_pk={last_pk}")
 
-            log("[FETCH] querying new rows...")
+            logx(engine, "info", "[FETCH] querying new rows...")
             df_new = fetch_new_rows(engine, last_pk)
-            log(f"[FETCH] rows={len(df_new)}")
+            logx(engine, "info", f"[FETCH] rows={len(df_new)}")
 
-            log("[WRITE] inserting (duplicates skipped by PK)...")
+            logx(engine, "info", "[WRITE] inserting (duplicates skipped by PK)...")
             n = insert_rows(engine, df_new)
-            log(f"[WRITE] inserted_attempt={n}")
+            logx(engine, "info", f"[WRITE] inserted_attempt={n}")
 
+            logx(engine, "sleep", f"sleep {LOOP_SLEEP_SEC}s")
             time.sleep(LOOP_SLEEP_SEC)
 
         except KeyboardInterrupt:
-            log("[STOP] KeyboardInterrupt")
+            logx(engine, "down", "[STOP] KeyboardInterrupt")
             return
+
         except Exception as e:
-            log(f"[ERROR] {type(e).__name__}: {e}")
+            logx(engine, "error", f"[ERROR] {type(e).__name__}: {e}")
 
             if is_disconnect_error(e):
-                log("[RECOVER] detected disconnect -> reconnect blocking...")
+                logx(engine, "down", "[RECOVER] detected disconnect -> reconnect blocking...")
             else:
-                log("[RECOVER] unexpected error -> reconnect anyway...")
+                logx(engine, "down", "[RECOVER] unexpected error -> reconnect anyway...")
 
             try:
                 engine.dispose()
@@ -421,19 +515,21 @@ def main() -> None:
                 pass
 
             engine = get_engine_blocking()
+
             try:
                 ensure_dest_table(engine)
-                log("[DDL] ensured dest table (after reconnect)")
+                ensure_demon_log_table(engine)
+                logx(engine, "info", "[DDL] ensured tables (after reconnect)")
             except Exception as e2:
-                log(f"[RETRY] DDL ensure failed after reconnect: {type(e2).__name__}: {e2}")
+                logx(engine, "error", f"[RETRY] DDL ensure failed after reconnect: {type(e2).__name__}: {e2}")
 
-            # reconnect 후엔 warm-start를 또 할 필요는 없지만,
-            # 혹시 reconnect 동안 누락이 생길 수 있으니 "가벼운 backfill" 1회 수행(원치 않으면 주석처리)
+            # reconnect 동안 누락 보정용 가벼운 backfill 1회
             try:
                 warm_start_backfill(engine)
             except Exception as e3:
-                log(f"[WARM][RETRY-ERROR] {type(e3).__name__}: {e3}")
+                logx(engine, "error", f"[WARM][RETRY-ERROR] {type(e3).__name__}: {e3}")
 
+            logx(engine, "sleep", f"sleep {LOOP_SLEEP_SEC}s after recover")
             time.sleep(LOOP_SLEEP_SEC)
 
 

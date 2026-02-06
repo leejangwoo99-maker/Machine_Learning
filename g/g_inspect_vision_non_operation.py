@@ -5,23 +5,35 @@
 - 실행 시작/종료 시간 콘솔 출력
 - EXE(Nuitka/PyInstaller) 실행 시 콘솔 자동 종료 방지
 
-NOTE:
-- 본 스크립트는 원본 노트북 로직을 최대한 유지하되, 노트북 전용 출력(display/df 출력)만 제거했습니다.
+[추가 반영]
+- 실행/상태 로그를 DB에 저장
+- 로그 스키마/테이블 자동 생성:
+  - schema: k_demon_heath_check
+  - table : gv_log
+- 로그 컬럼:
+  - end_day   (yyyymmdd)
+  - end_time  (hh:mi:ss)
+  - info      (소문자: error, down, sleep, ...)
+  - contents  (상세 내용)
+- 로그는 end_day, end_time, info, contents 순서 DataFrame으로 저장
 """
 
 import sys
 from datetime import datetime
+
 
 def _print_run_banner(start_dt: datetime):
     print("=" * 110, flush=True)
     print(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}", flush=True)
     print("=" * 110, flush=True)
 
+
 def _print_end_banner(start_dt: datetime, end_dt: datetime):
     print("=" * 110, flush=True)
     print(f"[END]   {end_dt:%Y-%m-%d %H:%M:%S}", flush=True)
     print(f"[ELAPSED] {end_dt - start_dt}", flush=True)
     print("=" * 110, flush=True)
+
 
 def main():
     import pandas as pd
@@ -36,16 +48,76 @@ def main():
         "password": "leejangwoo1!",
     }
 
+    # 로그 저장 대상
+    LOG_SCHEMA = "k_demon_heath_check"
+    LOG_TABLE = "gv_log"
+
+    # 결과 저장 대상
+    SAVE_SCHEMA = "g_production_film"
+    SAVE_TABLE = "vision_non_operation_time"
+
+    SCHEMA = "d1_machine_log"
+    TARGET_END_DAY = "20260107"  # end_day가 VARCHAR이므로 문자열 고정
+
     engine = create_engine(
         f"postgresql+psycopg2://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
         f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
     )
 
-    SCHEMA = "d1_machine_log"
-    TARGET_END_DAY = "20260107"  # end_day가 VARCHAR이므로 문자열로 고정
+    # -----------------------------
+    # DB 로그 유틸
+    # -----------------------------
+    def _normalize_info(info: str) -> str:
+        return (str(info).strip().lower() or "info")
 
+    def _build_log_df(info: str, contents: str) -> "pd.DataFrame":
+        now = datetime.now()
+        return pd.DataFrame(
+            [{
+                "end_day": now.strftime("%Y%m%d"),
+                "end_time": now.strftime("%H:%M:%S"),
+                "info": _normalize_info(info),     # 반드시 소문자
+                "contents": str(contents),
+            }],
+            columns=["end_day", "end_time", "info", "contents"],  # 컬럼 순서 고정
+        )
+
+    def _ensure_log_table(conn):
+        conn.execute(text(f"""
+            CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};
+
+            CREATE TABLE IF NOT EXISTS {LOG_SCHEMA}.{LOG_TABLE} (
+                end_day  TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                info     TEXT NOT NULL,
+                contents TEXT
+            );
+        """))
+
+    def log_db(info: str, contents: str):
+        """
+        로그를 DB에 저장.
+        - 실패해도 본 처리 중단하지 않음(콘솔 출력만)
+        """
+        df_log = _build_log_df(info, contents)
+        insert_sql = text(f"""
+            INSERT INTO {LOG_SCHEMA}.{LOG_TABLE}
+            (end_day, end_time, info, contents)
+            VALUES (:end_day, :end_time, :info, :contents)
+        """)
+
+        try:
+            with engine.begin() as conn:
+                _ensure_log_table(conn)
+                conn.execute(insert_sql, df_log.to_dict(orient="records"))
+        except Exception as e:
+            print(f"[LOG-ERROR] failed to write log DB: {repr(e)}", flush=True)
+
+    # -----------------------------
+    # 시작 로그
+    # -----------------------------
     print("[OK] engine ready")
-
+    log_db("start", "engine ready")
 
     def load_vision_table(table_name: str) -> pd.DataFrame:
         sql = text(f"""
@@ -58,21 +130,30 @@ def main():
             WHERE end_day = :end_day
             ORDER BY end_time ASC
         """)
-        with engine.connect() as conn:
-            df = pd.read_sql(sql, conn, params={"end_day": TARGET_END_DAY})
+
+        try:
+            with engine.connect() as conn:
+                df = pd.read_sql(sql, conn, params={"end_day": TARGET_END_DAY})
+        except Exception as e:
+            msg = f"load failed table={table_name}, reason={repr(e)}"
+            print(f"[ERROR] {msg}", flush=True)
+            log_db("down", msg)
+            raise
 
         if not df.empty:
             df["no_operation_time"] = np.nan
 
-        print(f"[LOAD] {table_name}: rows={len(df)}")
+        msg = f"load table={table_name}, rows={len(df)}"
+        print(f"[LOAD] {msg}")
+        log_db("info", msg)
         return df
 
-
+    # Vision1/2 로드
     vision_tables = [f"Vision{i}_machine_log" for i in range(1, 3)]
     df_vision_raw = pd.concat([load_vision_table(t) for t in vision_tables], ignore_index=True)
 
     print("[OK] total rows:", len(df_vision_raw))
-
+    log_db("info", f"vision raw total rows={len(df_vision_raw)}")
 
     # a / b 조건
     A_PREFIXES = ("검사 양품 신호 출력", "검사 불량 신호 출력")
@@ -84,7 +165,9 @@ def main():
     df = df_vision_raw[df_vision_raw["contents"].astype(str).str.startswith(VALID_PREFIXES)].copy()
 
     if df.empty:
+        warn_msg = "filtered dataframe is empty. check end_day or contents prefixes"
         print("[WARN] 필터 후 데이터가 0건입니다. (end_day 또는 contents 문구를 확인)")
+        log_db("sleep", warn_msg)
     else:
         # station + end_time 오름차순 정렬 보강
         df = df.sort_values(["station", "end_time"], ascending=[True, True]).reset_index(drop=True)
@@ -129,32 +212,32 @@ def main():
 
         df.drop(columns=["_ts"], inplace=True)
 
-    # 최종 출력
-    out_cols = ["end_day", "station", "contents", "end_time", "no_operation_time"]
-
     print("\n========== VISION FILTERED OUTPUT ==========")
     print("rows:", len(df))
-
+    log_db("info", f"vision filtered rows={len(df)}")
 
     # ============================================
-    # Cell 추가) Vision op_ct_gap(del_out_av) 기준 비교 -> real_no_operation_time 생성
+    # Vision op_ct_gap(del_out_av) 기준 비교 -> real_no_operation_time 생성
     # ============================================
 
-    from sqlalchemy import text
-    import numpy as np
-    import pandas as pd
-
-    # (1) op_ct_gap에서 Vision1/Vision2 del_out_av 로드
     sql_gap = text("""
         SELECT station, del_out_av
         FROM g_production_film.op_ct_gap
         WHERE station IN ('Vision1', 'Vision2')
     """)
 
-    with engine.connect() as conn:
-        df_gap_v = pd.read_sql(sql_gap, conn)
+    try:
+        with engine.connect() as conn:
+            df_gap_v = pd.read_sql(sql_gap, conn)
+    except Exception as e:
+        msg = f"op_ct_gap load failed, reason={repr(e)}"
+        print(f"[ERROR] {msg}", flush=True)
+        log_db("down", msg)
+        raise
 
     if df_gap_v.empty:
+        msg = "op_ct_gap missing stations Vision1/Vision2"
+        log_db("error", msg)
         raise RuntimeError("[ERROR] g_production_film.op_ct_gap 에서 station IN ('Vision1','Vision2') 데이터를 찾지 못했습니다.")
 
     df_gap_v["del_out_av"] = pd.to_numeric(df_gap_v["del_out_av"], errors="coerce")
@@ -162,16 +245,15 @@ def main():
     # station별 threshold 딕셔너리
     th_map = dict(zip(df_gap_v["station"].astype(str), df_gap_v["del_out_av"]))
     print("[OK] thresholds:", th_map)
+    log_db("info", f"threshold map loaded: {th_map}")
 
-    # (2) 현재 df(비전 필터+gap 결과)에 threshold 매핑
-    df2 = df.copy()  # df는 직전 셀 결과 (Vision filtered output)
+    # 현재 df에 threshold 매핑
+    df2 = df.copy()
 
     df2["threshold_del_out_av"] = df2["station"].astype(str).map(th_map)
-
-    # no_operation_time은 문자열("30.00")일 수 있으므로 numeric 변환
     df2["no_operation_time_num"] = pd.to_numeric(df2["no_operation_time"], errors="coerce")
 
-    # (3) 비교: no_operation_time > del_out_av 이면 real_no_operation_time = 1
+    # 비교: no_operation_time > del_out_av => real_no_operation_time = 1
     df2["real_no_operation_time"] = np.where(
         (df2["no_operation_time_num"].notna()) &
         (df2["threshold_del_out_av"].notna()) &
@@ -179,18 +261,12 @@ def main():
         1, 0
     )
 
-    # (4) 최종 출력
-    out_cols2 = ["end_day", "station", "contents", "end_time", "no_operation_time", "real_no_operation_time"]
-
     print("\n========== VISION OUTPUT + real_no_operation_time ==========")
-
+    log_db("info", "computed real_no_operation_time")
 
     # ============================================
-    # [Vision 전용] real_no_operation_time=1 -> from_time/to_time 생성 + 출력
-    # 입력 DF: df2  (Vision용, real_no_operation_time 포함)
+    # real_no_operation_time=1 -> from_time/to_time 생성
     # ============================================
-
-    import numpy as np
 
     df_vis_evt = df2.copy()
 
@@ -201,7 +277,7 @@ def main():
     # to_time: real_no_operation_time=1인 행의 end_time
     df_vis_evt["to_time"] = np.where(df_vis_evt["real_no_operation_time"] == 1, df_vis_evt["end_time_str"], np.nan)
 
-    # from_time: real_no_operation_time=1인 행의 "바로 위 행" end_time (station별 shift)
+    # from_time: real_no_operation_time=1인 행의 바로 위 행 end_time (station별)
     df_vis_evt["from_time"] = np.where(
         df_vis_evt["real_no_operation_time"] == 1,
         df_vis_evt.groupby("station")["end_time_str"].shift(1),
@@ -215,19 +291,17 @@ def main():
     ].reset_index(drop=True)
 
     print("========== VISION OUTPUT (real_no_operation_time=1) ==========")
+    log_db("info", f"vision output rows(real_no_operation_time=1)={len(df_vis_out)}")
 
-
-    import pandas as pd
-    from sqlalchemy import text
-
-    SAVE_SCHEMA = "g_production_film"
-    SAVE_TABLE  = "vision_non_operation_time"
-
-    # 0) 입력 DF 검증
+    # --------------------------------------------
+    # 결과 저장 (vision_non_operation_time)
+    # --------------------------------------------
     required_cols = ["end_day", "station", "from_time", "to_time", "no_operation_time"]
     missing = [c for c in required_cols if c not in df_vis_out.columns]
     if missing:
-        raise ValueError(f"[ERROR] df_vis_out missing columns: {missing}")
+        msg = f"df_vis_out missing columns: {missing}"
+        log_db("error", msg)
+        raise ValueError(f"[ERROR] {msg}")
 
     df_save = df_vis_out.copy()
     df_save["end_day"] = df_save["end_day"].astype(str)
@@ -236,8 +310,7 @@ def main():
     df_save["to_time"] = df_save["to_time"].astype(str)
     df_save["no_operation_time"] = pd.to_numeric(df_save["no_operation_time"], errors="coerce")
 
-    # 1) 스키마/테이블 생성
-    create_sql = text(f"""
+    create_save_sql = text(f"""
     CREATE SCHEMA IF NOT EXISTS {SAVE_SCHEMA};
 
     CREATE TABLE IF NOT EXISTS {SAVE_SCHEMA}.{SAVE_TABLE} (
@@ -251,7 +324,6 @@ def main():
     );
     """)
 
-    # 2) UPSERT
     upsert_sql = text(f"""
     INSERT INTO {SAVE_SCHEMA}.{SAVE_TABLE}
     (end_day, station, from_time, to_time, no_operation_time)
@@ -265,11 +337,11 @@ def main():
 
     try:
         with engine.begin() as conn:
-            conn.execute(create_sql)
+            conn.execute(create_save_sql)
             if rows:
                 conn.execute(upsert_sql, rows)
 
-            # 3) 검증: 테이블 존재 + 건수 + 샘플
+            # 검증
             cnt = conn.execute(text(f"SELECT COUNT(*) FROM {SAVE_SCHEMA}.{SAVE_TABLE}")).scalar()
             sample = conn.execute(text(f"""
                 SELECT end_day, station, from_time, to_time, no_operation_time
@@ -285,14 +357,22 @@ def main():
         for r in sample:
             print(r)
 
+        log_db("info", f"save ok table={SAVE_SCHEMA}.{SAVE_TABLE}, run_rows={len(rows)}, total_rows={cnt}")
+
     except Exception as e:
+        msg = f"vision save failed: {repr(e)}"
         print("[ERROR] Vision save failed:", repr(e))
+        log_db("error", msg)
         raise
+
+    log_db("end", "main completed successfully")
+
 
 if __name__ == "__main__":
     start = datetime.now()
     _print_run_banner(start)
     exit_code = 0
+
     try:
         main()
     except KeyboardInterrupt:
@@ -310,4 +390,5 @@ if __name__ == "__main__":
                 input("Press Enter to exit...")
             except Exception:
                 pass
+
     sys.exit(exit_code)

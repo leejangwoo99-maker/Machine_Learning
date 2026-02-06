@@ -22,6 +22,12 @@ Station PASS percentage daemon (incremental PK, 5s loop)
 
 ✅ 추가 조건:
 - goodorbad = 'GoodFile' 인 row만 집계 대상으로 포함
+
+✅ 추가(로그 DB 모니터링):
+- 로그를 DB에 저장
+- 컬럼: end_day, end_time, info, contents
+- info는 반드시 소문자
+- 저장 위치: schema k_demon_heath_check, table "2_log"
 """
 
 from __future__ import annotations
@@ -64,6 +70,10 @@ SRC_FQN    = f"{SRC_SCHEMA}.{SRC_TABLE}"
 # ✅ 추가 조건
 GOODORBAD_FILTER_VALUE = "GoodFile"
 
+# ✅ 로그 저장 위치
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "2_log"  # 숫자 시작 -> 반드시 쿼팅
+
 # =========================
 # DB Config (환경변수 권장)
 # =========================
@@ -77,7 +87,7 @@ DB_CONFIG = {
 }
 
 # =========================
-# Logging
+# Time / Logging helpers
 # =========================
 def now_kst() -> datetime:
     return datetime.now(KST)
@@ -85,17 +95,77 @@ def now_kst() -> datetime:
 def ts() -> str:
     return now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
-def log_boot(msg: str) -> None:
-    print(f"{ts()} [BOOT] {msg}")
+def to_log_row(level: str, contents: str) -> pd.DataFrame:
+    """
+    요구사항:
+    - end_day: yyyymmdd
+    - end_time: hh:mi:ss
+    - info: 소문자
+    - contents: 나머지 내용
+    - 컬럼 순서 고정
+    """
+    n = now_kst()
+    return pd.DataFrame([{
+        "end_day": n.strftime("%Y%m%d"),
+        "end_time": n.strftime("%H:%M:%S"),
+        "info": str(level).lower(),
+        "contents": str(contents),
+    }], columns=["end_day", "end_time", "info", "contents"])
 
-def log_info(msg: str) -> None:
-    print(f"{ts()} [INFO] {msg}")
+def console_log(level: str, msg: str) -> None:
+    print(f"{ts()} [{level.upper()}] {msg}")
 
-def log_retry(msg: str) -> None:
-    print(f"{ts()} [RETRY] {msg}")
+def set_session_params(conn) -> None:
+    conn.execute(text(f"SET work_mem = '{PG_WORK_MEM}'"))
+    conn.execute(text("SET client_encoding = 'UTF8'"))
+
+def ensure_log_table(engine: Engine) -> None:
+    with engine.begin() as conn:
+        set_session_params(conn)
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};'))
+        conn.execute(text(f'''
+            CREATE TABLE IF NOT EXISTS {LOG_SCHEMA}."{LOG_TABLE}" (
+                end_day  text,
+                end_time text,
+                info     text,
+                contents text
+            );
+        '''))
+
+def write_log_db(engine: Optional[Engine], level: str, msg: str) -> None:
+    """
+    로그를 DataFrame화 후 DB 저장.
+    - engine 없거나 DB 오류면 조용히 스킵(콘솔 로그는 유지)
+    """
+    if engine is None:
+        return
+    try:
+        df = to_log_row(level, msg)  # 컬럼 순서 보장
+        row = df.iloc[0].to_dict()
+        with engine.begin() as conn:
+            set_session_params(conn)
+            conn.execute(
+                text(f'''
+                    INSERT INTO {LOG_SCHEMA}."{LOG_TABLE}"
+                    (end_day, end_time, info, contents)
+                    VALUES (:end_day, :end_time, :info, :contents)
+                '''),
+                row
+            )
+    except Exception:
+        # 로그 저장 실패로 메인 루프 중단 금지
+        pass
+
+def emit_log(level: str, msg: str, engine: Optional[Engine] = None) -> None:
+    """
+    콘솔 + DB 동시 로그
+    """
+    lvl = str(level).lower()
+    console_log(lvl, msg)
+    write_log_db(engine, lvl, msg)
 
 # =========================
-# Engine / Session
+# Engine / Connection
 # =========================
 def make_engine() -> Engine:
     user = urllib.parse.quote_plus(DB_CONFIG["user"])
@@ -113,10 +183,6 @@ def make_engine() -> Engine:
         pool_recycle=1800,
     )
 
-def set_session_params(conn) -> None:
-    conn.execute(text(f"SET work_mem = '{PG_WORK_MEM}'"))
-    conn.execute(text("SET client_encoding = 'UTF8'"))
-
 def connect_with_retry() -> Engine:
     """엔진 생성 + 첫 연결 확인까지 무한 재시도."""
     while True:
@@ -127,7 +193,8 @@ def connect_with_retry() -> Engine:
                 conn.execute(text("SELECT 1")).scalar()
             return engine
         except Exception as e:
-            log_retry(f"DB connect failed: {type(e).__name__}: {e}")
+            # 이 시점엔 engine이 없거나 불안정할 수 있으므로 콘솔만
+            console_log("retry", f"DB connect failed: {type(e).__name__}: {e}")
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
 # =========================
@@ -429,9 +496,14 @@ def target_table(shift_type: str) -> str:
 # Main loop
 # =========================
 def main() -> None:
-    log_boot(f"backend station daily percentage daemon starting (goodorbad='{GOODORBAD_FILTER_VALUE}')")
+    # DB 연결 전 로그는 콘솔만
+    emit_log("boot", f"backend station daily percentage daemon starting (goodorbad='{GOODORBAD_FILTER_VALUE}')", None)
+
     engine = connect_with_retry()
-    log_info(f"DB connected (work_mem={PG_WORK_MEM})")
+    ensure_log_table(engine)  # 로그 테이블 보장
+
+    emit_log("info", f"DB connected (work_mem={PG_WORK_MEM})", engine)
+    emit_log("info", f"log table ready => {LOG_SCHEMA}.\"{LOG_TABLE}\"", engine)
 
     ensure_schema(engine, SAVE_SCHEMA)
 
@@ -445,8 +517,16 @@ def main() -> None:
     t0 = target_table(state.window.shift_type)
     ensure_table(engine, SAVE_SCHEMA, t0, df0, KEY_COLS)
     upsert_df(engine, SAVE_SCHEMA, t0, df0, KEY_COLS)
-    log_info(f"[UPSERT] bootstrap saved => {SAVE_SCHEMA}.{t0} prod_day={state.window.prod_day} shift={state.window.shift_type}")
-    log_info(f"[LAST_PK] {pk_str(state.last_pk)} window={state.window.start_dt}~{state.window.end_dt}")
+    emit_log(
+        "info",
+        f"[upsert] bootstrap saved => {SAVE_SCHEMA}.{t0} prod_day={state.window.prod_day} shift={state.window.shift_type}",
+        engine,
+    )
+    emit_log(
+        "info",
+        f"[last_pk] {pk_str(state.last_pk)} window={state.window.start_dt}~{state.window.end_dt}",
+        engine,
+    )
 
     while True:
         loop_start = time_mod.time()
@@ -455,11 +535,13 @@ def main() -> None:
             now = now_kst()
             w_new = current_window(now)
 
-            # 윈도우 변경 시 bootstrap rebuild (요구: DB 삭제/초기화는 금지, in-memory만 재구성)
+            # 윈도우 변경 시 bootstrap rebuild (DB 삭제/초기화 금지, in-memory만 재구성)
             if (w_new.prod_day != state.window.prod_day) or (w_new.shift_type != state.window.shift_type):
-                log_info(
-                    f"[WINDOW] changed => prod_day={w_new.prod_day} shift={w_new.shift_type} "
-                    f"(start={w_new.start_dt}, end={w_new.end_dt})"
+                emit_log(
+                    "info",
+                    f"[window] changed => prod_day={w_new.prod_day} shift={w_new.shift_type} "
+                    f"(start={w_new.start_dt}, end={w_new.end_dt})",
+                    engine,
                 )
                 agg, last_pk = bootstrap(engine, w_new)
                 state.window = w_new
@@ -471,24 +553,28 @@ def main() -> None:
                 tw = target_table(state.window.shift_type)
                 ensure_table(engine, SAVE_SCHEMA, tw, dfw, KEY_COLS)
                 upsert_df(engine, SAVE_SCHEMA, tw, dfw, KEY_COLS)
-                log_info(f"[UPSERT] window-change saved => {SAVE_SCHEMA}.{tw} prod_day={state.window.prod_day} shift={state.window.shift_type}")
-                log_info(f"[LAST_PK] {pk_str(state.last_pk)}")
+                emit_log(
+                    "info",
+                    f"[upsert] window-change saved => {SAVE_SCHEMA}.{tw} prod_day={state.window.prod_day} shift={state.window.shift_type}",
+                    engine,
+                )
+                emit_log("info", f"[last_pk] {pk_str(state.last_pk)}", engine)
             else:
                 # 같은 윈도우면 end_dt(now)만 갱신
                 state.window = Window(state.window.prod_day, state.window.shift_type, state.window.start_dt, now)
 
                 if state.last_pk is None:
-                    log_info("[LAST_PK] None => bootstrap rebuild (no rows yet)")
+                    emit_log("info", "[last_pk] none => bootstrap rebuild (no rows yet)", engine)
                     agg, last_pk = bootstrap(engine, state.window)
                     state.agg = agg
                     state.last_pk = last_pk
-                    log_info(f"[LAST_PK] {pk_str(state.last_pk)}")
+                    emit_log("info", f"[last_pk] {pk_str(state.last_pk)}", engine)
                 else:
-                    log_info(f"[LAST_PK] {pk_str(state.last_pk)}")
+                    emit_log("info", f"[last_pk] {pk_str(state.last_pk)}", engine)
                     new_rows, new_last_pk = fetch_incremental(engine, state.window, state.last_pk)
 
                     if new_rows:
-                        log_info(f"[FETCH] rows={len(new_rows)}")
+                        emit_log("info", f"[fetch] rows={len(new_rows)}", engine)
                         apply_rows(state.agg, new_rows)
                         state.last_pk = new_last_pk
 
@@ -497,26 +583,35 @@ def main() -> None:
                         tbl = target_table(state.window.shift_type)
                         ensure_table(engine, SAVE_SCHEMA, tbl, df, KEY_COLS)
                         upsert_df(engine, SAVE_SCHEMA, tbl, df, KEY_COLS)
-                        log_info(
-                            f"[UPSERT] done => {SAVE_SCHEMA}.{tbl} prod_day={state.window.prod_day} "
-                            f"shift={state.window.shift_type} last_pk={pk_str(state.last_pk)}"
+                        emit_log(
+                            "info",
+                            f"[upsert] done => {SAVE_SCHEMA}.{tbl} prod_day={state.window.prod_day} "
+                            f"shift={state.window.shift_type} last_pk={pk_str(state.last_pk)}",
+                            engine,
                         )
                     else:
-                        log_info("[FETCH] rows=0 (no update)")
+                        emit_log("sleep", "[fetch] rows=0 (no update)", engine)
 
         except (OperationalError, DBAPIError) as e:
-            log_retry(f"DB error: {type(e).__name__}: {e}")
+            emit_log("down", f"db error: {type(e).__name__}: {e}", engine)
             try:
                 engine.dispose()
             except Exception:
                 pass
+
+            # 재연결 중에는 engine 불안정할 수 있으므로 콘솔 우선
             engine = connect_with_retry()
-            log_info("DB reconnected")
+            ensure_log_table(engine)
+            emit_log("info", "db reconnected", engine)
+
         except Exception as e:
-            log_retry(f"Unhandled error: {type(e).__name__}: {e}")
+            emit_log("error", f"unhandled error: {type(e).__name__}: {e}", engine)
 
         elapsed = time_mod.time() - loop_start
-        time_mod.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
+        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+        if sleep_sec > 0:
+            emit_log("sleep", f"loop sleep {sleep_sec:.2f}s", engine)
+        time_mod.sleep(sleep_sec)
 
 if __name__ == "__main__":
     main()

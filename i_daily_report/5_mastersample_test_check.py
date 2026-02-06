@@ -27,6 +27,11 @@ Backend-5: Mastersample All OK daemon (incremental PK, 5s loop)
 - 안전체크 2개:
   (S2) Mastersample='O'이면 first_time이 반드시 not null
   (S4 정책) 위 위반 시 ERROR 로그 후 강등/종료 없이 즉시 bootstrap 재시도(soft reboot)
+
+[추가] 데몬 헬스 로그 DB 저장
+- 로그 스키마/테이블: k_demon_heath_check."5_log" (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- 저장 순서: end_day, end_time, info, contents (단건 dataframe 형태로 구성 후 insert)
 """
 
 from __future__ import annotations
@@ -41,7 +46,6 @@ from typing import Optional, Tuple, Set, List, Dict
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import OperationalError, DBAPIError
 
 # =========================
 # Constants
@@ -54,7 +58,7 @@ LOOP_INTERVAL_SEC = 5
 WORK_MEM = "4MB"  # 고정
 
 SRC_SCHEMA = "d1_machine_log"
-SRC_TABLE  = "Main_machine_log"  # 대소문자 고정 (따옴표로 감싸서 사용)
+SRC_TABLE = "Main_machine_log"  # 대소문자 고정 (따옴표로 감싸서 사용)
 
 SAVE_SCHEMA = "i_daily_report"
 SAVE_DAY_TABLE = "e_mastersample_test_day_daily"
@@ -63,16 +67,62 @@ SAVE_NIGHT_TABLE = "e_mastersample_test_night_daily"
 LIKE_ALL_OK = "%Mastersample All OK%"
 
 DAY_START = dtime(8, 20, 0)
-DAY_END   = dtime(20, 19, 59)
+DAY_END = dtime(20, 19, 59)
 NIGHT_START = dtime(20, 20, 0)
-NIGHT_END   = dtime(8, 19, 59)  # next day
+NIGHT_END = dtime(8, 19, 59)  # next day
+
+# Health log target
+HEALTH_SCHEMA = "k_demon_heath_check"
+HEALTH_TABLE = "5_log"
+
+# DB log runtime flags
+_DB_LOG_ENGINE: Optional[Engine] = None
+_DB_LOG_READY: bool = False
+
 
 # =========================
-# Logging
+# Logging (console + DB)
 # =========================
+def _log_db_insert(info: str, contents: str) -> None:
+    """
+    DB 로그 저장(실패해도 본 로직 영향 없음)
+    컬럼 순서: end_day, end_time, info, contents
+    """
+    global _DB_LOG_ENGINE, _DB_LOG_READY
+    if (not _DB_LOG_READY) or (_DB_LOG_ENGINE is None):
+        return
+
+    now = datetime.now(KST)
+    row = {
+        "end_day": now.strftime("%Y%m%d"),
+        "end_time": now.strftime("%H:%M:%S"),
+        "info": (info or "").lower(),
+        "contents": str(contents),
+    }
+
+    # 요구사항: dataframe화하여 저장
+    df = pd.DataFrame([[row["end_day"], row["end_time"], row["info"], row["contents"]]],
+                      columns=["end_day", "end_time", "info", "contents"])
+
+    insert_sql = f"""
+    INSERT INTO "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (end_day, end_time, info, contents)
+    VALUES (:end_day, :end_time, :info, :contents);
+    """
+
+    try:
+        with _DB_LOG_ENGINE.begin() as conn:
+            conn.execute(text(f"SET work_mem TO '{WORK_MEM}';"))
+            conn.execute(text(insert_sql), df.iloc[0].to_dict())
+    except Exception:
+        # 로그 저장 실패는 조용히 무시(데몬 본 기능 우선)
+        pass
+
+
 def log(level: str, msg: str) -> None:
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     print(f"{now} [{level}] {msg}", flush=True)
+    _log_db_insert(level.lower(), msg)
+
 
 # =========================
 # DB Engine
@@ -97,6 +147,7 @@ def make_engine() -> Engine:
         pool_recycle=1800,
     )
 
+
 def connect_with_retry(engine: Engine) -> None:
     """DB 연결 될 때까지 무한 재시도 + work_mem 세팅"""
     while True:
@@ -107,8 +158,14 @@ def connect_with_retry(engine: Engine) -> None:
             log("INFO", f"DB connected (work_mem={WORK_MEM})")
             return
         except Exception as e:
-            log("RETRY", f"DB connect failed: {type(e).__name__}: {e} | retry in {DB_RETRY_INTERVAL_SEC}s")
+            # 아직 DB 로그 준비 전일 수 있으므로 콘솔 중심으로 동작
+            print(
+                f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} [RETRY] "
+                f"DB connect failed: {type(e).__name__}: {e} | retry in {DB_RETRY_INTERVAL_SEC}s",
+                flush=True,
+            )
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
 
 # =========================
 # Window
@@ -118,28 +175,29 @@ class WindowKey:
     prod_day: str
     shift_type: str  # 'day' | 'night'
 
+
 @dataclass(frozen=True)
 class WindowRange:
     key: WindowKey
     start_dt: datetime
-    end_dt: datetime  # "now" (for logging / bootstrap 설명용)
+    end_dt: datetime  # "now"
+
 
 def yyyymmdd(d: date) -> str:
     return f"{d.year:04d}{d.month:02d}{d.day:02d}"
 
+
 def parse_yyyymmdd(s: str) -> date:
     return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+
 
 def shift_window_by_now(now: datetime) -> WindowRange:
     """
     now(KST) 기준으로 현재 윈도우(key + start~now) 계산
-    - day:   today 08:20:00 ~ now (if now in day band)
-    - night: (if now >=20:20) prod_day=today, start=today 20:20
-             (if now <08:20)  prod_day=yesterday, start=yesterday 20:20
     """
     assert now.tzinfo is not None
 
-    t = now.timetz().replace(tzinfo=None)  # naive time for compare
+    t = now.timetz().replace(tzinfo=None)
     today = now.date()
 
     if DAY_START <= t <= DAY_END:
@@ -147,16 +205,15 @@ def shift_window_by_now(now: datetime) -> WindowRange:
         start_dt = datetime.combine(today, DAY_START, tzinfo=KST)
         return WindowRange(key=key, start_dt=start_dt, end_dt=now)
 
-    # night
     if t >= NIGHT_START:
         prod = today
     else:
-        # t < 08:20:00 -> belongs to previous night's window
         prod = today - timedelta(days=1)
 
     key = WindowKey(prod_day=yyyymmdd(prod), shift_type="night")
     start_dt = datetime.combine(prod, NIGHT_START, tzinfo=KST)
     return WindowRange(key=key, start_dt=start_dt, end_dt=now)
+
 
 # =========================
 # Schema/Table init
@@ -165,15 +222,8 @@ def ensure_schema(engine: Engine, schema: str) -> None:
     with engine.begin() as conn:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}";'))
 
+
 def ensure_save_table(engine: Engine, schema: str, table: str) -> None:
-    """
-    저장 테이블:
-      prod_day text PRIMARY KEY,
-      shift_type text,
-      "Mastersample" text,
-      first_time text,
-      updated_at timestamptz
-    """
     ddl = f"""
 CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
   prod_day    text PRIMARY KEY,
@@ -186,19 +236,32 @@ CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
     with engine.begin() as conn:
         conn.execute(text(ddl))
 
+
+def ensure_health_log_table(engine: Engine) -> None:
+    ensure_schema(engine, HEALTH_SCHEMA)
+    ddl = f"""
+CREATE TABLE IF NOT EXISTS "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (
+  end_day  text,
+  end_time text,
+  info     text,
+  contents text
+);
+"""
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
 # =========================
 # Source FQN (quoted)
 # =========================
 def source_fqn() -> str:
     return f'"{SRC_SCHEMA}"."{SRC_TABLE}"'
 
+
 # =========================
 # SQL: normalize half-up + window expr
 # =========================
 def build_window_expr(shift_type: str) -> str:
-    """
-    norm2 columns: end_day(text), rounded_time_text(text 'HH:MI:SS')
-    """
     if shift_type == "day":
         return f"""
 ( end_day = :prod_day
@@ -207,7 +270,6 @@ def build_window_expr(shift_type: str) -> str:
 )
 """
     if shift_type == "night":
-        # prod_day night spans prod_day 20:20~23:59:59 and next_day 00:00~08:19:59
         return f"""
 (
     ( end_day = :prod_day AND rounded_time_text >= '{NIGHT_START.strftime("%H:%M:%S")}' )
@@ -216,13 +278,8 @@ def build_window_expr(shift_type: str) -> str:
 """
     raise ValueError("shift_type must be 'day' or 'night'")
 
+
 def normalize_cte_sql() -> str:
-    """
-    end_time(text 'HH:MI:SS.xx') -> rounded_time_text('HH:MI:SS') half-up
-    - base_ts: end_day + substring(end_time,1,8)
-    - frac_num: substring(end_time from 9) => '.xx' numeric
-    - rounded_ts: base_ts + 1 sec if frac>=0.5
-    """
     fqn = source_fqn()
     return f"""
 WITH norm AS (
@@ -247,6 +304,7 @@ norm2 AS (
 )
 """
 
+
 # =========================
 # Bootstrap / Incremental
 # =========================
@@ -254,23 +312,18 @@ norm2 AS (
 class State:
     window: Optional[WindowKey] = None
     mastersample: str = "X"
-    first_time: Optional[str] = None  # HH:MI:SS text
+    first_time: Optional[str] = None
     last_pk: Optional[Tuple[str, str]] = None  # (end_day, end_time_norm)
     seen_pk: Set[Tuple[str, str, str]] = None  # (end_day, end_time_norm, md5(contents))
-    locked_o: bool = False  # O가 나오면 window 종료까지 DB 조회 중단
-    need_recover: bool = False  # S4 soft reboot flag
+    locked_o: bool = False
+    need_recover: bool = False
+
 
 def init_state() -> State:
     return State(seen_pk=set())
 
+
 def bootstrap(engine: Engine, wk: WindowKey) -> Tuple[str, Optional[str], Tuple[str, str], Set[Tuple[str, str, str]]]:
-    """
-    현재 윈도우 전체를 1회 스캔하여:
-    - mastersample (O/X)
-    - first_time (All OK 최초 발생 HH:MI:SS)
-    - last_pk (윈도우 내 최대 (end_day, rounded_time_text))
-    - seen_pk set (윈도우 내 모든 row의 (end_day, rounded_time_text, md5(contents)))
-    """
     prod_day = wk.prod_day
     next_day = yyyymmdd(parse_yyyymmdd(prod_day) + timedelta(days=1))
     window_expr = build_window_expr(wk.shift_type)
@@ -313,12 +366,11 @@ WHERE {window_expr}
         ).mappings().all()
 
     mastersample = row["mastersample"]
-    first_ts = row["first_ts"]  # datetime or None
+    first_ts = row["first_ts"]
     first_time = None if first_ts is None else first_ts.strftime("%H:%M:%S")
 
     max_day = row["max_day"]
     max_time = row["max_time"]
-    # window에 row가 0개면 last_pk 초기값을 (prod_day, '00:00:00')로 둔다
     if not max_day or not max_time:
         max_day = prod_day
         max_time = "00:00:00"
@@ -329,18 +381,14 @@ WHERE {window_expr}
 
     return mastersample, first_time, (max_day, max_time), seen_set
 
+
 def fetch_incremental(engine: Engine, wk: WindowKey, last_pk: Tuple[str, str]) -> List[Dict]:
-    """
-    last_pk 이후 신규 row만 fetch (end_day, end_time_norm) 기준 증분
-    반환 row: end_day, end_time_norm, contents_md5, is_all_ok
-    """
     prod_day = wk.prod_day
     next_day = yyyymmdd(parse_yyyymmdd(prod_day) + timedelta(days=1))
     window_expr = build_window_expr(wk.shift_type)
 
     last_day, last_time = last_pk
 
-    # (end_day > last_day) OR (end_day = last_day AND end_time_norm > last_time)
     pk_expr = """
 (
   (end_day > :last_day)
@@ -375,21 +423,19 @@ ORDER BY end_day ASC, rounded_time_text ASC, contents_md5 ASC
 
     return [dict(r) for r in rows]
 
+
 # =========================
 # UPSERT
 # =========================
 def save_fqn_day() -> str:
     return f'"{SAVE_SCHEMA}"."{SAVE_DAY_TABLE}"'
 
+
 def save_fqn_night() -> str:
     return f'"{SAVE_SCHEMA}"."{SAVE_NIGHT_TABLE}"'
 
+
 def upsert_result(engine: Engine, wk: WindowKey, mastersample: str, first_time: Optional[str], updated_at: datetime) -> None:
-    """
-    일반 UPSERT (계산 결과 갱신)
-    - X면 first_time은 NULL로 overwrite 허용
-    - NULL 덮어쓰기 방지: 일부 컬럼은 COALESCE, 단 first_time은 X일 때 NULL 허용
-    """
     fqn = save_fqn_day() if wk.shift_type == "day" else save_fqn_night()
 
     sql = f"""
@@ -414,16 +460,13 @@ SET
                 "prod_day": wk.prod_day,
                 "shift_type": wk.shift_type,
                 "mastersample": mastersample,
-                "first_time": first_time,  # O면 HH:MI:SS, X면 None
+                "first_time": first_time,
                 "updated_at": updated_at,
             },
         )
 
+
 def heartbeat_update(engine: Engine, wk: WindowKey, updated_at: datetime) -> None:
-    """
-    O 상태에서 DB 조회 없이 5초마다 updated_at만 갱신(모니터링 목적)
-    - 다른 컬럼은 건드리지 않음
-    """
     fqn = save_fqn_day() if wk.shift_type == "day" else save_fqn_night()
 
     sql = f"""
@@ -444,22 +487,22 @@ SET updated_at = EXCLUDED.updated_at
             },
         )
 
+
 # =========================
 # Safety checks
 # =========================
 def safety_check_S2_S4(state: State) -> None:
-    """
-    (S2) Mastersample='O'이면 first_time not null
-    (S4) 위반 시 ERROR 로그 + 강등/종료 금지 + soft reboot(bootstrap 재시도) 플래그
-    """
     if state.mastersample == "O" and not state.first_time:
         log("ERROR", "SAFETY(S2/S4) violated: Mastersample='O' but first_time is NULL. Will soft-recover by bootstrap.")
-        state.need_recover = True  # 다음 loop에서 bootstrap 강제
+        state.need_recover = True
+
 
 # =========================
 # Main loop
 # =========================
 def main() -> None:
+    global _DB_LOG_ENGINE, _DB_LOG_READY
+
     log("BOOT", "backend5 mastersample daemon starting")
 
     engine = make_engine()
@@ -470,35 +513,53 @@ def main() -> None:
     ensure_save_table(engine, SAVE_SCHEMA, SAVE_DAY_TABLE)
     ensure_save_table(engine, SAVE_SCHEMA, SAVE_NIGHT_TABLE)
 
+    # ensure health log table + enable db log sink
+    ensure_health_log_table(engine)
+    _DB_LOG_ENGINE = engine
+    _DB_LOG_READY = True
+    log("INFO", f'health log target ready: "{HEALTH_SCHEMA}"."{HEALTH_TABLE}"')
+
     state = init_state()
 
     while True:
         t0 = time_mod.time()
         now = datetime.now(KST)
 
-        # window 계산
         wr = shift_window_by_now(now)
         wk = wr.key
 
-        # DB 재연결 감지/복구: 각 loop에서 간단 ping (끊기면 connect_with_retry로 복구)
         try:
             with engine.begin() as conn:
                 conn.execute(text("SELECT 1;"))
                 conn.execute(text(f"SET work_mem TO '{WORK_MEM}';"))
         except Exception as e:
+            # 재연결 중에도 로그 DB 저장이 실패할 수 있으니 우선 콘솔 + 재시도
+            _DB_LOG_READY = False
             log("RETRY", f"DB ping failed: {type(e).__name__}: {e} | reconnecting...")
             connect_with_retry(engine)
-            # 다음 loop로 (현재 loop는 종료)
+            # reconnect 성공 시 로그 sink 재활성화
+            try:
+                ensure_health_log_table(engine)
+                _DB_LOG_ENGINE = engine
+                _DB_LOG_READY = True
+                log("INFO", "health log sink re-enabled after reconnect")
+            except Exception as ee:
+                print(
+                    f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} [error] "
+                    f"health log sink enable failed: {type(ee).__name__}: {ee}",
+                    flush=True,
+                )
+
             elapsed = time_mod.time() - t0
             sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-            time_mod.sleep(sleep_sec)
+            if sleep_sec > 0:
+                log("SLEEP", f"loop sleep {sleep_sec:.2f}s")
+                time_mod.sleep(sleep_sec)
             continue
 
-        # 윈도우 변경 or 재시작(처음) or S4 soft recover
         window_changed = (state.window != wk)
         if window_changed:
             log("INFO", f"[WINDOW] changed => prod_day={wk.prod_day} shift={wk.shift_type} start={wr.start_dt} now={wr.end_dt}")
-            # window reset
             state.window = wk
             state.mastersample = "X"
             state.first_time = None
@@ -507,7 +568,6 @@ def main() -> None:
             state.locked_o = False
             state.need_recover = False
 
-            # bootstrap
             log("INFO", "[BOOTSTRAP] start (window full-scan)")
             ms, ft, last_pk, seen = bootstrap(engine, wk)
             state.mastersample = ms
@@ -516,23 +576,18 @@ def main() -> None:
             state.seen_pk = seen
             log("INFO", f"[BOOTSTRAP] done | Mastersample={ms}, first_time={ft}, last_pk={last_pk}, seen={len(seen)}")
 
-            # UPSERT 결과
             upsert_result(engine, wk, state.mastersample, state.first_time, now)
             log("INFO", "[UPSERT] bootstrap result saved")
 
-            # O면 조회 중단(lock)
             if state.mastersample == "O":
                 state.locked_o = True
                 log("INFO", "[LOCK] Mastersample=O => stop DB fetch until window ends (heartbeat only)")
 
-            # safety check
             safety_check_S2_S4(state)
 
         elif state.need_recover:
-            # S4: soft reboot => bootstrap 재시도
             log("INFO", "[RECOVER] soft reboot by bootstrap (due to safety violation)")
             state.need_recover = False
-            # unlock temporarily
             state.locked_o = False
 
             log("INFO", "[BOOTSTRAP] start (recover)")
@@ -553,16 +608,12 @@ def main() -> None:
             safety_check_S2_S4(state)
 
         else:
-            # 정상 loop
             if state.locked_o:
-                # DB 조회 중단, updated_at만 heartbeat
                 log("INFO", "[HEARTBEAT] Mastersample=O (no fetch)")
                 heartbeat_update(engine, wk, now)
-                safety_check_S2_S4(state)  # 계속 체크
+                safety_check_S2_S4(state)
             else:
-                # incremental fetch
                 if state.last_pk is None:
-                    # 이론상 window_changed에서 bootstrap 했으므로 여기 안 들어와야 함.
                     state.last_pk = (wk.prod_day, "00:00:00")
 
                 log("INFO", f"[FETCH] start | last_pk={state.last_pk}")
@@ -570,11 +621,7 @@ def main() -> None:
                 log("INFO", f"[FETCH] done | fetched_rows={len(rows)}")
 
                 if rows:
-                    # dedup + last_pk advance + O 판단
-                    # last_pk 갱신은 "fetched rows 전체" 기준으로 max를 잡는다(중복이라도 PK는 전진시켜야 함)
                     max_day, max_time = state.last_pk
-
-                    # 신규 유효 rows(중복 제거)
                     new_unique = 0
                     found_all_ok_time: Optional[str] = None
 
@@ -584,7 +631,6 @@ def main() -> None:
                         md5v = r["contents_md5"]
                         pk3 = (end_day, end_time_norm, md5v)
 
-                        # last_pk advance
                         if (end_day > max_day) or (end_day == max_day and end_time_norm > max_time):
                             max_day, max_time = end_day, end_time_norm
 
@@ -593,44 +639,33 @@ def main() -> None:
                         state.seen_pk.add(pk3)
                         new_unique += 1
 
-                        # All OK 발견
                         if r["is_all_ok"] and state.mastersample != "O":
-                            # earliest in this batch (ordered ASC)
                             if found_all_ok_time is None:
                                 found_all_ok_time = end_time_norm
 
-                    # last_pk update
                     state.last_pk = (max_day, max_time)
                     log("INFO", f"[PK] advanced => last_pk={state.last_pk} | new_unique={new_unique} | seen={len(state.seen_pk)}")
 
-                    # 상태 업데이트
                     if found_all_ok_time is not None:
                         state.mastersample = "O"
                         state.first_time = found_all_ok_time
                         log("INFO", f"[STATE] Mastersample becomes O | first_time={state.first_time}")
 
-                    # UPSERT 결과 (X든 O든 현재 상태 저장)
                     upsert_result(engine, wk, state.mastersample, state.first_time, now)
                     log("INFO", "[UPSERT] incremental result saved")
 
-                    # O가 됐으면 lock
                     if state.mastersample == "O":
                         state.locked_o = True
                         log("INFO", "[LOCK] Mastersample=O => stop DB fetch until window ends (heartbeat only)")
 
-                    # safety check
                     safety_check_S2_S4(state)
 
-                else:
-                    # 신규 row 없으면: 모니터링 updated_at은? (요구사항에 명시 없지만 운영상 유용)
-                    # 여기서는 "O일 때만 updated_at 계속"을 강제했으니,
-                    # X 상태에서는 불필요한 write 줄이기 위해 no-op.
-                    pass
-
-        # loop pacing
         elapsed = time_mod.time() - t0
         sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
-        time_mod.sleep(sleep_sec)
+        if sleep_sec > 0:
+            log("SLEEP", f"loop sleep {sleep_sec:.2f}s")
+            time_mod.sleep(sleep_sec)
+
 
 if __name__ == "__main__":
     main()

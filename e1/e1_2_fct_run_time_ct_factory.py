@@ -44,6 +44,12 @@ FCT RunTime CT 분석 파이프라인 (iqz step 전용) - FACTORY DAEMON (file_p
 - ✅ work_mem 폭증 방지( SQLAlchemy/psycopg2 세션마다 SET work_mem )
 - ✅ (추가) keepalive(connect_args) + connection error 감지 시 engine dispose/rebuild
 
+[로그 모니터링 추가]
+- ✅ 스키마: k_demon_heath_check (없으면 생성)
+- ✅ 테이블: e1_2_log (없으면 생성)
+- ✅ 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- ✅ 저장 시 DataFrame 컬럼 순서: end_day, end_time, info, contents
+
 [기타]
 - DataFrame 콘솔 출력 없음
 - 진행상황만 표시
@@ -60,7 +66,7 @@ import numpy as np
 import pandas as pd
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError, OperationalError, DBAPIError
+from sqlalchemy.exc import OperationalError, DBAPIError
 
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -81,20 +87,24 @@ DB_CONFIG = {
 }
 
 SRC_SCHEMA = "a2_fct_table"
-SRC_TABLE  = "fct_table"
+SRC_TABLE = "fct_table"
 
 TARGET_SCHEMA = "e1_FCT_ct"
 
 # LATEST(summary)
 TBL_RUN_TIME_LATEST = "fct_run_time_ct"
 # HIST(summary) 하루 1개 롤링
-TBL_RUN_TIME_HIST   = "fct_run_time_ct_hist"
+TBL_RUN_TIME_HIST = "fct_run_time_ct_hist"
 # OUTLIER(detail) 누적 적재
-TBL_OUTLIER_LIST    = "fct_upper_outlier_ct_list"
+TBL_OUTLIER_LIST = "fct_upper_outlier_ct_list"
+
+# 로그 저장(헬스체크)
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "e1_2_log"
 
 # 데몬 루프
-LOOP_INTERVAL_SEC = 5         # ✅ 5초마다 무한 루프
-FETCH_LIMIT = 200000          # 1회 조회 최대 row
+LOOP_INTERVAL_SEC = 5
+FETCH_LIMIT = 200000
 
 # (설명은 유지하되, 구현은 MP=1로 통합 운용)
 PROC_1_STATIONS = ["FCT1", "FCT2"]
@@ -102,19 +112,17 @@ PROC_2_STATIONS = ["FCT3", "FCT4"]
 
 
 # =========================
-# ✅ 안정화 파라미터
+# 안정화 파라미터
 # =========================
 DB_RETRY_INTERVAL_SEC = 5
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 CONNECT_TIMEOUT_SEC = 5
 
-# ✅ keepalive (환경변수로 조정)
 PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
 PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
 PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
-# 엔진 싱글톤(상시 연결 1개 고정 목적)
 _ENGINE = None
 
 
@@ -196,7 +204,119 @@ def _dispose_engine():
 
 
 # =========================
-# 1-1) DB: 엔진/커넥션 (무한 재시도 + 풀 최소화 + work_mem 제한)
+# 1-2) DB 로그 (best-effort)
+# =========================
+def _now_day_time():
+    now = datetime.now()
+    return now.strftime("%Y%m%d"), now.strftime("%H:%M:%S")
+
+def _normalize_info(info: str) -> str:
+    if info is None:
+        return "info"
+    s = str(info).strip().lower()
+    return s if s else "info"
+
+def ensure_log_table_blocking():
+    while True:
+        conn = None
+        try:
+            conn = get_conn_psycopg2_blocking(DB_CONFIG)
+            with conn.cursor() as cur:
+                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{LOG_SCHEMA}";')
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS "{LOG_SCHEMA}".{LOG_TABLE} (
+                        id BIGSERIAL PRIMARY KEY,
+                        end_day   TEXT NOT NULL,
+                        end_time  TEXT NOT NULL,
+                        info      TEXT NOT NULL,
+                        contents  TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                """)
+            conn.commit()
+            return
+        except Exception as e:
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            log(f"[DB][RETRY] ensure_log_table_blocking failed: {type(e).__name__}: {repr(e)}")
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+def write_db_log_best_effort(info: str, contents: str):
+    """
+    요청 사양:
+    - end_day(yyyymmdd), end_time(hh:mi:ss), info, contents
+    - DataFrame 컬럼 순서대로 저장
+    - info는 소문자
+    """
+    end_day, end_time = _now_day_time()
+    info_norm = _normalize_info(info)
+    contents = "" if contents is None else str(contents)
+
+    # DataFrame 컬럼 순서 강제
+    df_log = pd.DataFrame(
+        [(end_day, end_time, info_norm, contents)],
+        columns=["end_day", "end_time", "info", "contents"],
+    )
+
+    rows = [tuple(r) for r in df_log.itertuples(index=False, name=None)]
+    insert_sql = f"""
+    INSERT INTO "{LOG_SCHEMA}".{LOG_TABLE} (end_day, end_time, info, contents)
+    VALUES %s
+    """
+    template = "(%s,%s,%s,%s)"
+
+    conn = None
+    try:
+        # 로그는 데몬 흐름 방해하지 않도록 단발성 best-effort
+        conn = psycopg2.connect(
+            host=DB_CONFIG["host"],
+            port=DB_CONFIG["port"],
+            dbname=DB_CONFIG["dbname"],
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            connect_timeout=2,
+            keepalives=PG_KEEPALIVES,
+            keepalives_idle=PG_KEEPALIVES_IDLE,
+            keepalives_interval=PG_KEEPALIVES_INTERVAL,
+            keepalives_count=PG_KEEPALIVES_COUNT,
+            application_name="fct_runtime_ct_daemon_log",
+        )
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute("SET work_mem TO %s;", (WORK_MEM,))
+            execute_values(cur, insert_sql, rows, template=template, page_size=1000)
+        conn.commit()
+    except Exception:
+        # 로그 저장 실패는 콘솔만 유지 (무한루프 방지)
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def log_event(info: str, contents: str):
+    line = f"[{_normalize_info(info).upper()}] {contents}"
+    log(line)
+    write_db_log_best_effort(info, contents)
+
+
+# =========================
+# 2) DB: 엔진/커넥션
 # =========================
 def _build_engine(config=DB_CONFIG):
     user = config["user"]
@@ -210,9 +330,8 @@ def _build_engine(config=DB_CONFIG):
         f"?connect_timeout={CONNECT_TIMEOUT_SEC}"
     )
 
-    log(f"[INFO] DB = {_masked_db_info()}")
+    log_event("info", f"DB = {_masked_db_info()}")
 
-    # ✅ 상시 연결 1개 고정(풀 최소화) + keepalive
     return create_engine(
         conn_str,
         pool_pre_ping=True,
@@ -232,11 +351,6 @@ def _build_engine(config=DB_CONFIG):
     )
 
 def get_engine_blocking(config=DB_CONFIG):
-    """
-    ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공까지 블로킹)
-    ✅ pool 최소화 (pool_size=1, max_overflow=0)
-    ✅ work_mem 제한 (세션마다 SET)
-    """
     global _ENGINE
 
     if _ENGINE is not None:
@@ -247,7 +361,7 @@ def get_engine_blocking(config=DB_CONFIG):
                     conn.execute(text("SELECT 1"))
                 return _ENGINE
             except Exception as e:
-                log(f"[DB][RETRY] engine ping failed -> rebuild: {type(e).__name__}: {repr(e)}")
+                log_event("down", f"engine ping failed -> rebuild: {type(e).__name__}: {repr(e)}")
                 _dispose_engine()
                 time.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -257,21 +371,18 @@ def get_engine_blocking(config=DB_CONFIG):
             with _ENGINE.connect() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
-            log(
-                f"[DB][OK] engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
-                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
+            log_event(
+                "info",
+                f"engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
             )
             return _ENGINE
         except Exception as e:
-            log(f"[DB][RETRY] engine create/connect failed: {type(e).__name__}: {repr(e)}")
+            log_event("down", f"engine create/connect failed: {type(e).__name__}: {repr(e)}")
             _dispose_engine()
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 def get_conn_psycopg2_blocking(config=DB_CONFIG):
-    """
-    ✅ psycopg2 연결도 접속 실패/끊김 시 무한 재시도(블로킹)
-    ✅ work_mem 제한을 세션에 적용
-    """
     while True:
         conn = None
         try:
@@ -294,7 +405,7 @@ def get_conn_psycopg2_blocking(config=DB_CONFIG):
             conn.commit()
             return conn
         except Exception as e:
-            log(f"[DB][RETRY] psycopg2 connect failed: {type(e).__name__}: {repr(e)}")
+            log_event("down", f"psycopg2 connect failed: {type(e).__name__}: {repr(e)}")
             try:
                 if conn:
                     conn.close()
@@ -304,7 +415,7 @@ def get_conn_psycopg2_blocking(config=DB_CONFIG):
 
 
 # =========================
-# 2) 테이블/인덱스/ID 보정 (무한 재시도 적용)
+# 3) 테이블/인덱스/ID 보정
 # =========================
 def ensure_tables_and_indexes():
     while True:
@@ -400,14 +511,14 @@ def ensure_tables_and_indexes():
             break
 
         except Exception as e:
-            log(f"[DB][RETRY] ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}")
+            log_event("down", f"ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
     fix_id_sequence(TARGET_SCHEMA, TBL_RUN_TIME_LATEST, "fct_run_time_ct_id_seq")
-    fix_id_sequence(TARGET_SCHEMA, TBL_RUN_TIME_HIST,   "fct_run_time_ct_hist_id_seq")
-    fix_id_sequence(TARGET_SCHEMA, TBL_OUTLIER_LIST,    "fct_upper_outlier_ct_list_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_RUN_TIME_HIST, "fct_run_time_ct_hist_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_OUTLIER_LIST, "fct_upper_outlier_ct_list_id_seq")
 
-    log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"')
+    log_event("info", f'target tables ensured in schema "{TARGET_SCHEMA}"')
 
 
 def fix_id_sequence(schema: str, table: str, seq_name: str):
@@ -464,7 +575,7 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
             conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] fix_id_sequence({schema}.{table}) failed: {type(e).__name__}: {repr(e)}")
+            log_event("down", f"fix_id_sequence({schema}.{table}) failed: {type(e).__name__}: {repr(e)}")
             time.sleep(DB_RETRY_INTERVAL_SEC)
         finally:
             try:
@@ -475,7 +586,7 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
 
 
 # =========================
-# 3) 로딩 + 전처리 (월 필터, station subset) / PK=file_path
+# 4) 로딩 + 전처리 (PK=file_path)
 # =========================
 def fetch_new_rows_by_file_path(engine, stations: List[str], run_month: str, seen_file_paths: set[str]) -> pd.DataFrame:
     query = f"""
@@ -515,12 +626,11 @@ def fetch_new_rows_by_file_path(engine, stations: List[str], run_month: str, see
                 )
             break
         except Exception as e:
-            # ✅ 실행 중 끊김이면 엔진 폐기 후 재생성
             if _is_connection_error(e):
-                log(f"[DB][RETRY] fetch_new_rows conn error -> rebuild: {type(e).__name__}: {repr(e)}")
+                log_event("down", f"fetch_new_rows conn error -> rebuild: {type(e).__name__}: {repr(e)}")
                 _dispose_engine()
             else:
-                log(f"[DB][RETRY] fetch_new_rows failed: {type(e).__name__}: {repr(e)}")
+                log_event("error", f"fetch_new_rows failed: {type(e).__name__}: {repr(e)}")
             time.sleep(DB_RETRY_INTERVAL_SEC)
             engine = get_engine_blocking(DB_CONFIG)
 
@@ -532,12 +642,10 @@ def fetch_new_rows_by_file_path(engine, stations: List[str], run_month: str, see
     if df.empty:
         return df
 
-    # 신규만 필터 (PK=file_path)
     df = df[~df["file_path"].isin(seen_file_paths)].copy()
     if df.empty:
         return df
 
-    # 전처리
     df["end_day"] = df["end_day"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
     df["end_time"] = df["end_time"].astype(str).str.strip()
 
@@ -546,7 +654,7 @@ def fetch_new_rows_by_file_path(engine, stations: List[str], run_month: str, see
     df = df.dropna(subset=["run_time"]).reset_index(drop=True)
     dropped = before - len(df)
     if dropped:
-        log(f"[INFO] run_time NaN 제거: {dropped} rows drop (new rows)")
+        log_event("info", f"run_time NaN 제거: {dropped} rows drop (new rows)")
 
     if df.empty:
         return df
@@ -557,7 +665,7 @@ def fetch_new_rows_by_file_path(engine, stations: List[str], run_month: str, see
 
 
 # =========================
-# 4) 요약 생성 (boxplot 통계 + plotly_json)
+# 5) 요약 생성
 # =========================
 def boxplot_summary_from_values(vals: np.ndarray, name: str) -> dict:
     n = int(vals.size)
@@ -612,9 +720,6 @@ def build_summary_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# =========================
-# 5) Upper outlier 상세 DF 생성
-# =========================
 def build_upper_outlier_df(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty or summary_df is None or summary_df.empty:
         return pd.DataFrame()
@@ -624,11 +729,11 @@ def build_upper_outlier_df(df_raw: pd.DataFrame, summary_df: pd.DataFrame) -> pd
 
     for i, row in summary_df.iterrows():
         if (i + 1) % 20 == 0 or i == 0 or (i + 1) == total:
-            log(f"[PROGRESS] outlier scan {i+1}/{total} ...")
+            log_event("info", f"outlier scan {i+1}/{total} ...")
 
         station = row["station"]
-        remark  = row["remark"]
-        month   = row["month"]
+        remark = row["remark"]
+        month = row["month"]
 
         g = df_raw[
             (df_raw["station"] == station) &
@@ -722,7 +827,7 @@ def upsert_latest_run_time_ct(summary_df: pd.DataFrame):
             conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] upsert_latest_run_time_ct failed: {type(e).__name__}: {repr(e)}")
+            log_event("down", f"upsert_latest_run_time_ct failed: {type(e).__name__}: {repr(e)}")
             try:
                 if conn:
                     conn.rollback()
@@ -793,7 +898,7 @@ def upsert_hist_run_time_ct_daily(summary_df: pd.DataFrame, snapshot_day: str):
             conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] upsert_hist_run_time_ct_daily failed: {type(e).__name__}: {repr(e)}")
+            log_event("down", f"upsert_hist_run_time_ct_daily failed: {type(e).__name__}: {repr(e)}")
             try:
                 if conn:
                     conn.rollback()
@@ -810,7 +915,7 @@ def upsert_hist_run_time_ct_daily(summary_df: pd.DataFrame, snapshot_day: str):
 
 def insert_outlier_list(upper_outlier_df: pd.DataFrame):
     if upper_outlier_df is None or upper_outlier_df.empty:
-        log("[SKIP] upper outlier 저장 생략 (데이터 없음)")
+        log_event("info", "upper outlier 저장 생략 (데이터 없음)")
         return
 
     df = upper_outlier_df.copy()
@@ -842,10 +947,10 @@ def insert_outlier_list(upper_outlier_df: pd.DataFrame):
                 if rows:
                     execute_values(cur, insert_sql, rows, template=template, page_size=2000)
             conn.commit()
-            log(f"[OK] upper outlier 누적 저장 완료: insert candidates={len(rows)} (중복키는 PASS)")
+            log_event("info", f"upper outlier 누적 저장 완료: insert candidates={len(rows)} (중복키는 pass)")
             return
         except Exception as e:
-            log(f"[DB][RETRY] insert_outlier_list failed: {type(e).__name__}: {repr(e)}")
+            log_event("down", f"insert_outlier_list failed: {type(e).__name__}: {repr(e)}")
             try:
                 if conn:
                     conn.rollback()
@@ -877,14 +982,18 @@ def recompute_and_upsert(cache_df: pd.DataFrame):
 
 
 # =========================
-# 8) main: 5초 무한루프 데몬 + 콘솔 대기
+# 8) main
 # =========================
 def main():
     start_dt = datetime.now()
-    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S} | DAEMON MODE (PK=file_path)")
-    log(f"loop_interval={LOOP_INTERVAL_SEC}s | fetch_limit={FETCH_LIMIT}")
-    log(f"src={SRC_SCHEMA}.{SRC_TABLE} -> target schema={TARGET_SCHEMA}")
-    log(f"work_mem={WORK_MEM} | sqlalchemy pool_size=1 max_overflow=0 | db_retry={DB_RETRY_INTERVAL_SEC}s")
+    log_event("info", f"{start_dt:%Y-%m-%d %H:%M:%S} | daemon mode (pk=file_path)")
+    log_event("info", f"loop_interval={LOOP_INTERVAL_SEC}s | fetch_limit={FETCH_LIMIT}")
+    log_event("info", f"src={SRC_SCHEMA}.{SRC_TABLE} -> target schema={TARGET_SCHEMA}")
+    log_event("info", f"work_mem={WORK_MEM} | sqlalchemy pool_size=1 max_overflow=0 | db_retry={DB_RETRY_INTERVAL_SEC}s")
+
+    # 로그 테이블 먼저 준비
+    ensure_log_table_blocking()
+    log_event("info", f'log table ready: "{LOG_SCHEMA}".{LOG_TABLE}')
 
     ensure_tables_and_indexes()
 
@@ -894,23 +1003,20 @@ def main():
     cache_df: pd.DataFrame | None = None
     seen_file_paths: set[str] = set()
 
-    # ✅ 상시 연결 1개 고정(엔진) + 실패 시 무한 재시도
     eng = get_engine_blocking(DB_CONFIG)
 
     try:
         while True:
             loop_t0 = time.time()
 
-            # (1) 월 롤오버: 캐시/상태 리셋
             now = datetime.now()
             cur_month = current_yyyymm(now)
             if cur_month != run_month:
-                log(f"[MONTH ROLLOVER] {run_month} -> {cur_month} (cache reset)")
+                log_event("info", f"month rollover {run_month} -> {cur_month} (cache reset)")
                 run_month = cur_month
                 cache_df = None
                 seen_file_paths.clear()
 
-            # (2) 신규 로우 조회 (✅ 끊김이면 엔진 dispose/rebuild 후 무한 재시도)
             try:
                 df_new = fetch_new_rows_by_file_path(
                     eng,
@@ -919,13 +1025,12 @@ def main():
                     seen_file_paths=seen_file_paths,
                 )
             except Exception as e:
-                log(f"[DB][RETRY] fetch_new_rows failed: {type(e).__name__}: {repr(e)}")
+                log_event("down", f"fetch_new_rows failed: {type(e).__name__}: {repr(e)}")
                 if _is_connection_error(e):
                     _dispose_engine()
                 eng = get_engine_blocking(DB_CONFIG)
                 df_new = pd.DataFrame()
 
-            # (3) 캐시 누적 + 재계산/저장
             if df_new is not None and not df_new.empty:
                 new_paths = df_new["file_path"].astype(str).tolist()
                 seen_file_paths.update(new_paths)
@@ -936,17 +1041,22 @@ def main():
                     cache_df = pd.concat([cache_df, df_new], ignore_index=True)
                     cache_df = cache_df.drop_duplicates(subset=["file_path"], keep="last").reset_index(drop=True)
 
-                log(f"[NEW] rows={len(df_new)} | cache={len(cache_df)} | seen={len(seen_file_paths)} | month={run_month}")
-
-                # 저장/업데이트 (각 함수 내부에서 DB 끊김 포함 무한 재시도)
+                log_event("info", f"new rows={len(df_new)} | cache={len(cache_df)} | seen={len(seen_file_paths)} | month={run_month}")
                 recompute_and_upsert(cache_df)
+            else:
+                log_event("sleep", "no new rows")
 
-            # (4) 5초 간격 페이싱
             elapsed = time.time() - loop_t0
-            time.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
+            sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+            if sleep_sec > 0:
+                log_event("sleep", f"loop sleep {sleep_sec:.2f}s")
+                time.sleep(sleep_sec)
 
     except KeyboardInterrupt:
-        log("[STOP] KeyboardInterrupt received. exiting loop...")
+        log_event("info", "keyboardinterrupt received. exiting loop...")
+    except Exception as e:
+        log_event("error", f"unhandled exception: {type(e).__name__}: {repr(e)}")
+        raise
     finally:
         try:
             if _ENGINE is not None:
@@ -956,9 +1066,8 @@ def main():
 
         end_dt = datetime.now()
         elapsed = (end_dt - start_dt).total_seconds()
-        log(f"[END] {end_dt:%Y-%m-%d %H:%M:%S} | elapsed={elapsed:.1f}s")
+        log_event("info", f"{end_dt:%Y-%m-%d %H:%M:%S} | end | elapsed={elapsed:.1f}s")
 
-        # 콘솔 자동 종료 방지(대기)
         try:
             input("Press Enter to close this window...")
         except Exception:

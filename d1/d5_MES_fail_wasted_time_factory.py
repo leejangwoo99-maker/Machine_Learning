@@ -35,12 +35,16 @@ d5_MES_fail_wasted_time_factory.py
 6) INFO 로그
    - last_pk read / fetch / candidates / upsert 단계마다 출력
 
-환경변수
-- PG_WORK_MEM=4MB (기본)
-- WARM_BACKFILL_MIN=60 (기본 60분)  # 재실행 시 백필 범위
+7) [추가] 데몬 상태 로그 DB 저장
+   - 스키마: k_demon_heath_check (없으면 생성)
+   - 테이블: d5_log (없으면 생성)
+   - 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(lower), contents
+   - 로그는 DataFrame(end_day,end_time,info,contents) 형태로 insert
+   - DB down 시 메모리 큐에 보관 후 복구 시 flush
 """
 
 import os
+import sys
 import time as time_mod
 import urllib.parse
 from datetime import datetime, timedelta
@@ -102,17 +106,31 @@ OUT_TABLE = f'{SCHEMA}."mes_fail_wasted_time"'
 ID_SEQ_NAME = "mes_fail_wasted_time_id_seq"
 ID_SEQ_REGCLASS = f"{SCHEMA}.{ID_SEQ_NAME}"
 
+# 로그 저장용
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE_NAME = "d5_log"
+LOG_TABLE = f'{LOG_SCHEMA}."{LOG_TABLE_NAME}"'
+
 _ENGINE = None
 
+# 로그 큐(DB down 시 적재)
+_PENDING_LOG_ROWS: List[Dict[str, str]] = []
+_LOG_READY = False  # 로그 테이블 생성 완료 여부
+
 
 # =========================
-# 로깅
+# 공통 유틸
 # =========================
-def log_boot(msg: str): print(f"[BOOT] {msg}", flush=True)
-def log_info(msg: str): print(f"[INFO] {msg}", flush=True)
-def log_retry(msg: str): print(f"[RETRY] {msg}", flush=True)
-def log_warn(msg: str): print(f"[WARN] {msg}", flush=True)
-def log_error(msg: str): print(f"[ERROR] {msg}", flush=True)
+def now_kst() -> datetime:
+    return datetime.now(KST)
+
+
+def yyyymmdd(dt: datetime) -> str:
+    return dt.astimezone(KST).strftime("%Y%m%d")
+
+
+def hhmmss(dt: datetime) -> str:
+    return dt.astimezone(KST).strftime("%H:%M:%S")
 
 
 def _masked_db_info() -> str:
@@ -176,21 +194,140 @@ def _build_engine():
     )
 
 
+# =========================
+# 로그 DB 저장
+# =========================
+def _build_log_row(info: str, contents: str) -> Dict[str, str]:
+    dt = now_kst()
+    return {
+        "end_day": yyyymmdd(dt),      # yyyymmdd
+        "end_time": hhmmss(dt),       # hh:mi:ss
+        "info": (info or "").strip().lower(),   # 반드시 소문자
+        "contents": str(contents or "").strip(),
+    }
+
+
+def _enqueue_log(info: str, contents: str):
+    _PENDING_LOG_ROWS.append(_build_log_row(info, contents))
+
+
+def ensure_log_table_blocking(engine):
+    global _LOG_READY
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};
+
+    CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
+        id BIGSERIAL PRIMARY KEY,
+        end_day  TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        info     TEXT NOT NULL,
+        contents TEXT,
+        created_at TIMESTAMP DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_{LOG_TABLE_NAME}_day_time
+      ON {LOG_TABLE} (end_day, end_time);
+
+    CREATE INDEX IF NOT EXISTS ix_{LOG_TABLE_NAME}_info
+      ON {LOG_TABLE} (info);
+    """
+    while True:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text(ddl))
+            _LOG_READY = True
+            return
+        except Exception as e:
+            _LOG_READY = False
+            if _is_connection_error(e):
+                print(f"[RETRY] ensure_log_table conn error -> rebuild ({type(e).__name__}): {repr(e)}", flush=True)
+                _dispose_engine()
+                engine = get_engine_blocking()
+            else:
+                print(f"[RETRY] ensure_log_table failed ({type(e).__name__}): {repr(e)}", flush=True)
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def flush_pending_logs_once(engine) -> int:
+    """큐에 쌓인 로그를 한 번에 INSERT. 실패 시 큐 유지."""
+    if not _PENDING_LOG_ROWS or not _LOG_READY:
+        return 0
+
+    # 사양: end_day, end_time, info, contents 순서 DataFrame화
+    df = pd.DataFrame(_PENDING_LOG_ROWS, columns=["end_day", "end_time", "info", "contents"])
+    if df.empty:
+        return 0
+
+    sql = f"""
+    INSERT INTO {LOG_TABLE} (end_day, end_time, info, contents)
+    VALUES (:end_day, :end_time, :info, :contents)
+    """
+
+    payload = df.to_dict(orient="records")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+            conn.execute(text(sql), payload)
+        n = len(payload)
+        _PENDING_LOG_ROWS.clear()
+        return n
+    except Exception:
+        # flush 실패는 조용히 유지(무한 재귀 로그 방지)
+        return 0
+
+
+def log_event(level: str, msg: str):
+    """
+    콘솔 + DB(큐) 동시 처리.
+    level: boot/info/retry/warn/error/down/sleep 등 (DB에는 소문자 저장)
+    """
+    lv = (level or "info").strip().lower()
+    prefix = lv.upper() if lv else "INFO"
+    print(f"[{prefix}] {msg}", flush=True)
+
+    _enqueue_log(lv, msg)
+
+    # 가능하면 즉시 flush (실패해도 큐 유지)
+    global _ENGINE
+    if _ENGINE is not None and _LOG_READY:
+        flush_pending_logs_once(_ENGINE)
+
+
+# 기존 호출명 호환
+def log_boot(msg: str): log_event("boot", msg)
+def log_info(msg: str): log_event("info", msg)
+def log_retry(msg: str): log_event("retry", msg)
+def log_warn(msg: str): log_event("warn", msg)
+def log_error(msg: str): log_event("error", msg)
+def log_down(msg: str): log_event("down", msg)
+def log_sleep(msg: str): log_event("sleep", msg)
+
+
 def get_engine_blocking():
     global _ENGINE
     while True:
         try:
             if _ENGINE is None:
-                log_info(f"DB = {_masked_db_info()}")
+                # 초기 DB 정보 출력/기록
+                log_event("info", f"DB = {_masked_db_info()}")
                 _ENGINE = _build_engine()
 
             with _ENGINE.connect() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
+
+            # 로그 테이블 준비 + 큐 flush
+            if not _LOG_READY:
+                ensure_log_table_blocking(_ENGINE)
+            flush_pending_logs_once(_ENGINE)
+
             return _ENGINE
 
         except Exception as e:
-            log_retry(f"DB connect/ping failed ({type(e).__name__}): {repr(e)} -> retry in {DB_RETRY_INTERVAL_SEC}s")
+            # DB down 상태 기록 (콘솔 + 큐)
+            log_down(f"DB connect/ping failed ({type(e).__name__}): {repr(e)}")
+            log_retry(f"reconnect in {DB_RETRY_INTERVAL_SEC}s")
             _dispose_engine()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -198,14 +335,6 @@ def get_engine_blocking():
 # =========================
 # 시간 유틸
 # =========================
-def now_kst() -> datetime:
-    return datetime.now(KST)
-
-
-def yyyymmdd(dt: datetime) -> str:
-    return dt.astimezone(KST).strftime("%Y%m%d")
-
-
 def start_of_today_kst(dt: datetime) -> datetime:
     dt = dt.astimezone(KST)
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -222,8 +351,8 @@ def parse_end_dt(end_day: str, end_time_str: str) -> Optional[datetime]:
         d = datetime.strptime(end_day, "%Y%m%d").date()
 
         if "." in s:
-            hhmmss, frac = s.split(".", 1)
-            t = datetime.strptime(hhmmss, "%H:%M:%S").time()
+            hhmmss_, frac = s.split(".", 1)
+            t = datetime.strptime(hhmmss_, "%H:%M:%S").time()
             frac_digits = "".join(ch for ch in frac if ch.isdigit())
             frac_digits = (frac_digits + "000000")[:6] if frac_digits else "000000"
             us = int(frac_digits)
@@ -627,6 +756,10 @@ def warm_start_backfill_once(engine, station: str):
 def main_loop_single_process():
     engine = get_engine_blocking()
 
+    # 로그 테이블 우선 보장
+    ensure_log_table_blocking(engine)
+    flush_pending_logs_once(engine)
+
     ensure_src_pk_best_effort(engine)
     ensure_out_table_blocking(engine)
 
@@ -643,8 +776,9 @@ def main_loop_single_process():
         loop_t0 = time_mod.perf_counter()
         try:
             engine = get_engine_blocking()
-            now_dt = now_kst()
+            flush_pending_logs_once(engine)
 
+            now_dt = now_kst()
             total_upserts = 0
 
             for station in ("Vision1", "Vision2"):
@@ -692,7 +826,8 @@ def main_loop_single_process():
 
         except Exception as e:
             if _is_connection_error(e):
-                log_retry(f"loop-level conn error -> rebuild ({type(e).__name__}): {repr(e)}")
+                log_down(f"loop-level conn error ({type(e).__name__}): {repr(e)}")
+                log_retry("engine rebuild")
                 _dispose_engine()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             else:
@@ -700,7 +835,9 @@ def main_loop_single_process():
 
         # 5초 페이싱
         elapsed = time_mod.perf_counter() - loop_t0
-        time_mod.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
+        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+        log_sleep(f"loop sleep {sleep_sec:.2f}s")
+        time_mod.sleep(sleep_sec)
 
 
 def main():
@@ -709,4 +846,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # 최상위 예외도 남김
+        try:
+            log_error(f"fatal: {type(e).__name__}: {repr(e)}")
+            # stderr도 즉시 출력
+            print(f"[FATAL] {type(e).__name__}: {repr(e)}", file=sys.stderr, flush=True)
+        finally:
+            raise

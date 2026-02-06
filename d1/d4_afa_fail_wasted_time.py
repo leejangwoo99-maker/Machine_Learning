@@ -28,7 +28,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # 0. DB / 상수 설정
 # ============================================
 DB_CONFIG = {
-    "host": "192.168.108.162",
+    "host": "100.105.75.47",
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Vision RunTime CT (intensity8) 분석 파이프라인 - REALTIME(5s loop) + LATEST/HIST 저장
+Vision RunTime CT (intensity8) 분석 파이프라인 - REALTIME(5s loop) + LATEST/HIST 저장 + DB 로그 저장
 
 [Source]
 - a3_vision_table.vision_table
@@ -37,7 +37,7 @@ Vision RunTime CT (intensity8) 분석 파이프라인 - REALTIME(5s loop) + LATE
 [Runtime]
 - 무한 루프(5초)
 - 신규 데이터가 들어올 때만 요약/UPSERT 수행
-- 예외 발생 시 콘솔이 자동으로 닫히지 않도록 "hold_console_open" 적용
+- 예외 발생 시 콘솔이 자동으로 닫히지 않도록 hold_console_open 적용
 
 ✅ 이번 요청 반영
 - ✅ 멀티프로세스 = 1개 (MP 제거)
@@ -50,10 +50,15 @@ Vision RunTime CT (intensity8) 분석 파이프라인 - REALTIME(5s loop) + LATE
   * SQLAlchemy engine: pool_size=1, max_overflow=0
   * psycopg2: 1개 연결 재사용(죽으면 폐기 후 재연결)
 - ✅ work_mem 폭증 방지: 세션마다 SET work_mem 적용
+
+✅ 로그 DB 적재 반영
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: e2_2_log (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- log 호출 시 콘솔 + DB 동시 저장
 """
 
 import os
-import sys
 import urllib.parse
 from datetime import datetime, date
 import time as time_mod
@@ -61,7 +66,7 @@ import time as time_mod
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError, DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import OperationalError, DBAPIError
 
 import plotly.graph_objects as go
 import psycopg2
@@ -106,12 +111,31 @@ PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
 PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
+# ✅ 로그 저장 대상
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "e2_2_log"
+
+# 내부 플래그(로그 테이블 준비 여부)
+_LOG_TABLE_READY = False
+
 
 # =========================
 # 1) 유틸
 # =========================
-def log(msg: str):
+def _now_day_time():
+    now = datetime.now()
+    return now.strftime("%Y%m%d"), now.strftime("%H:%M:%S")
+
+
+def _safe_print(msg: str):
     print(msg, flush=True)
+
+
+def _normalize_info(info: str | None) -> str:
+    if info is None:
+        return "info"
+    v = str(info).strip().lower()
+    return v if v else "info"
 
 
 def today_yyyymmdd() -> str:
@@ -139,8 +163,8 @@ def hold_console_open(exit_code: int = 1):
     - stdin이 없으면 무한 sleep로 콘솔 유지
     """
     try:
-        log("\n[HOLD] 프로그램이 종료되지 않도록 대기합니다.")
-        log("[HOLD] Enter 입력 가능하면 Enter를 누르세요. 입력이 불가한 환경이면 계속 유지됩니다.")
+        log("hold", "프로그램이 종료되지 않도록 대기합니다.")
+        log("hold", "Enter 입력 가능하면 Enter를 누르세요. 입력이 불가한 환경이면 계속 유지됩니다.")
         try:
             input()
             raise SystemExit(exit_code)
@@ -157,7 +181,6 @@ def hold_console_open(exit_code: int = 1):
 def _is_conn_error(e: Exception) -> bool:
     """
     SQLAlchemy/psycopg2 모두에 대해 "연결 끊김/네트워크" 계열 오류를 최대한 넓게 감지.
-    (이 경우 engine/conn을 폐기하고 재연결 루프로 진입)
     """
     if isinstance(e, (OperationalError, DBAPIError)):
         return True
@@ -196,7 +219,6 @@ def _build_engine(cfg=DB_CONFIG):
         f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
         f"?connect_timeout={CONNECT_TIMEOUT_SEC}"
     )
-    # ✅ 풀 최소화: 상시 1개
     return create_engine(
         conn_str,
         pool_pre_ping=True,
@@ -227,11 +249,6 @@ def _dispose_engine():
 
 
 def get_engine_blocking():
-    """
-    ✅ engine이 없으면 생성
-    ✅ 있으면 ping(SELECT 1) + work_mem SET
-    ✅ 실패 시 dispose 후 무한 재시도
-    """
     global _ENGINE
     while True:
         try:
@@ -242,7 +259,7 @@ def get_engine_blocking():
                 conn.execute(text("SELECT 1"))
             return _ENGINE
         except Exception as e:
-            log(f"[DB][RETRY] engine connect failed: {type(e).__name__}: {repr(e)}")
+            _safe_print(f"[DB][RETRY] engine connect failed: {type(e).__name__}: {repr(e)}")
             _dispose_engine()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -261,11 +278,6 @@ def _pg_conn_is_alive(conn) -> bool:
 
 
 def get_conn_pg_blocking():
-    """
-    ✅ psycopg2 1개 재사용
-    ✅ 죽었으면(close/closed) 재연결
-    ✅ 실패 시 무한 재시도
-    """
     global _PG_CONN
     while True:
         try:
@@ -295,7 +307,7 @@ def get_conn_pg_blocking():
                 _PG_CONN.commit()
             return _PG_CONN
         except Exception as e:
-            log(f"[DB][RETRY] psycopg2 connect failed: {type(e).__name__}: {repr(e)}")
+            _safe_print(f"[DB][RETRY] psycopg2 connect failed: {type(e).__name__}: {repr(e)}")
             try:
                 if _PG_CONN is not None:
                     _PG_CONN.close()
@@ -321,16 +333,133 @@ def close_db():
 
 
 # =========================
+# 1-2) 로그 테이블 준비 + 로그 적재
+# =========================
+def ensure_log_table():
+    """
+    로그 스키마/테이블 생성:
+    k_demon_heath_check.e2_2_log
+    컬럼:
+      end_day  TEXT (yyyymmdd)
+      end_time TEXT (hh:mi:ss)
+      info     TEXT (소문자)
+      contents TEXT
+    """
+    global _LOG_TABLE_READY
+    while True:
+        conn = None
+        try:
+            conn = get_conn_pg_blocking()
+            with conn.cursor() as cur:
+                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{LOG_SCHEMA}";')
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS "{LOG_SCHEMA}".{LOG_TABLE} (
+                        end_day  TEXT NOT NULL,
+                        end_time TEXT NOT NULL,
+                        info     TEXT NOT NULL,
+                        contents TEXT
+                    );
+                """)
+            conn.commit()
+            _LOG_TABLE_READY = True
+            return
+        except Exception as e:
+            _safe_print(f"[DB][RETRY] ensure_log_table failed: {type(e).__name__}: {repr(e)}")
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            if _is_conn_error(e):
+                global _PG_CONN
+                try:
+                    if _PG_CONN is not None:
+                        _PG_CONN.close()
+                except Exception:
+                    pass
+                _PG_CONN = None
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def _insert_log_row_blocking(info: str, contents: str):
+    """
+    1행 DataFrame(end_day, end_time, info, contents) 생성 후 insert.
+    실패 시 메인 로직 영향 최소화를 위해 예외를 삼키고 콘솔에만 출력.
+    """
+    global _LOG_TABLE_READY
+    try:
+        if not _LOG_TABLE_READY:
+            ensure_log_table()
+
+        end_day, end_time = _now_day_time()
+        info_norm = _normalize_info(info)
+
+        # 요구사항: dataframe화 후 저장 + 컬럼 순서 고정
+        df = pd.DataFrame([{
+            "end_day": end_day,
+            "end_time": end_time,
+            "info": info_norm,
+            "contents": str(contents) if contents is not None else None,
+        }])[["end_day", "end_time", "info", "contents"]]
+
+        rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
+
+        sql = f"""
+            INSERT INTO "{LOG_SCHEMA}".{LOG_TABLE}
+            (end_day, end_time, info, contents)
+            VALUES %s
+        """
+        template = "(%s,%s,%s,%s)"
+
+        while True:
+            conn = None
+            try:
+                conn = get_conn_pg_blocking()
+                with conn.cursor() as cur:
+                    cur.execute("SET work_mem TO %s;", (WORK_MEM,))
+                    execute_values(cur, sql, rows, template=template, page_size=1000)
+                conn.commit()
+                return
+            except Exception as e:
+                try:
+                    if conn:
+                        conn.rollback()
+                except Exception:
+                    pass
+                if _is_conn_error(e):
+                    global _PG_CONN
+                    try:
+                        if _PG_CONN is not None:
+                            _PG_CONN.close()
+                    except Exception:
+                        pass
+                    _PG_CONN = None
+                # 로그 적재 오류는 메인 처리 방해하지 않도록 짧게 재시도 후 포기
+                _safe_print(f"[LOG][WARN] log insert retry: {type(e).__name__}: {repr(e)}")
+                time_mod.sleep(1)
+                # 과도한 블로킹 방지: 1회 재시도 후 탈출
+                break
+
+    except Exception as e:
+        _safe_print(f"[LOG][WARN] log insert failed: {type(e).__name__}: {repr(e)}")
+
+
+def log(msg: str, level: str = "info"):
+    """
+    사용 방식:
+      log("내용") -> level='info'
+      log("내용", "error")
+    """
+    lv = _normalize_info(level)
+    line = f"[{lv.upper()}] {msg}"
+    _safe_print(line)
+    _insert_log_row_blocking(lv, msg)
+
+
+# =========================
 # 2) 테이블/인덱스/ID 보정 (DB 실패 시 무한 재시도)
 # =========================
 def ensure_tables_and_indexes():
-    """
-    - 스키마 생성
-    - LATEST/HIST 테이블 생성(없으면)
-    - ✅ 이미 테이블이 있어도 컬럼 자동 동기화(ADD COLUMN IF NOT EXISTS)
-    - UNIQUE 인덱스 보장
-    - id 자동채번/NULL 보정
-    """
     while True:
         conn = None
         try:
@@ -338,7 +467,7 @@ def ensure_tables_and_indexes():
             with conn.cursor() as cur:
                 cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{TARGET_SCHEMA}";')
 
-                # --- LATEST: create minimal table if not exists
+                # --- LATEST
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_LATEST} (
                         id BIGINT,
@@ -348,7 +477,6 @@ def ensure_tables_and_indexes():
                     );
                 """)
 
-                # --- LATEST: column sync
                 cur.execute(f'ALTER TABLE "{TARGET_SCHEMA}".{TBL_LATEST} ADD COLUMN IF NOT EXISTS sample_amount INTEGER;')
                 cur.execute(f'ALTER TABLE "{TARGET_SCHEMA}".{TBL_LATEST} ADD COLUMN IF NOT EXISTS run_time_lower_outlier TEXT;')
                 cur.execute(f'ALTER TABLE "{TARGET_SCHEMA}".{TBL_LATEST} ADD COLUMN IF NOT EXISTS q1 DOUBLE PRECISION;')
@@ -373,7 +501,7 @@ def ensure_tables_and_indexes():
                     ON "{TARGET_SCHEMA}".{TBL_LATEST} (station, remark, month);
                 """)
 
-                # --- HIST: create minimal table if not exists
+                # --- HIST
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS "{TARGET_SCHEMA}".{TBL_HIST} (
                         id BIGINT,
@@ -384,7 +512,6 @@ def ensure_tables_and_indexes():
                     );
                 """)
 
-                # --- HIST: column sync
                 cur.execute(f'ALTER TABLE "{TARGET_SCHEMA}".{TBL_HIST} ADD COLUMN IF NOT EXISTS snapshot_ts TIMESTAMPTZ;')
                 cur.execute(f"""
                     ALTER TABLE "{TARGET_SCHEMA}".{TBL_HIST}
@@ -410,13 +537,12 @@ def ensure_tables_and_indexes():
             break
 
         except Exception as e:
-            log(f"[DB][RETRY] ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}")
+            log(f"ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}", "error")
             try:
                 if conn:
                     conn.rollback()
             except Exception:
                 pass
-            # 연결 끊김 계열이면 폐기 후 재연결
             if _is_conn_error(e):
                 global _PG_CONN
                 try:
@@ -429,17 +555,10 @@ def ensure_tables_and_indexes():
 
     fix_id_sequence(TARGET_SCHEMA, TBL_LATEST, "vision_run_time_ct_id_seq")
     fix_id_sequence(TARGET_SCHEMA, TBL_HIST, "vision_run_time_ct_hist_id_seq")
-    log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"')
+    log(f'target tables ensured in schema "{TARGET_SCHEMA}"', "ok")
 
 
 def fix_id_sequence(schema: str, table: str, seq_name: str):
-    """
-    - id 컬럼 없으면 추가
-    - 시퀀스 없으면 생성
-    - id default nextval 강제
-    - id NULL인 기존 행은 nextval로 채움
-    - 시퀀스 setval = max(id)+1 로 동기화
-    """
     do_sql = f"""
     DO $$
     DECLARE
@@ -493,7 +612,7 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
             conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] fix_id_sequence({schema}.{table}) failed: {type(e).__name__}: {repr(e)}")
+            log(f"fix_id_sequence({schema}.{table}) failed: {type(e).__name__}: {repr(e)}", "error")
             try:
                 if conn:
                     conn.rollback()
@@ -514,9 +633,6 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
 # 3) 월 전체 로드 + 요약
 # =========================
 def _read_sql_blocking(engine, sql: str, params: dict) -> pd.DataFrame:
-    """
-    ✅ 실행 중 연결 끊김 포함, 어떤 예외든 '연결 복구까지 무한 재시도'
-    """
     eng = engine
     while True:
         try:
@@ -524,7 +640,7 @@ def _read_sql_blocking(engine, sql: str, params: dict) -> pd.DataFrame:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 return pd.read_sql(text(sql), conn, params=params)
         except Exception as e:
-            log(f"[DB][RETRY] read_sql failed: {type(e).__name__}: {repr(e)}")
+            log(f"read_sql failed: {type(e).__name__}: {repr(e)}", "error")
             if _is_conn_error(e):
                 _dispose_engine()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
@@ -620,11 +736,11 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     groups = list(df.groupby(["station", "remark", "month"], sort=True))
     total = len(groups)
-    log(f"[INFO] 그룹 수 = {total}")
+    log(f"그룹 수 = {total}", "info")
 
     for i, ((st, rk, mo), g) in enumerate(groups, start=1):
         if i == 1 or i == total or i % 20 == 0:
-            log(f"[PROGRESS] group {i}/{total} ... ({st},{rk},{mo})")
+            log(f"group {i}/{total} ... ({st},{rk},{mo})", "progress")
         r = _summary_from_group(st, rk, mo, g["run_time"])
         if r is not None:
             rows.append(r)
@@ -636,15 +752,9 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 4) 저장: LATEST/HIST UPSERT (끊김 감지 + 무한 재시도)
+# 4) 저장: LATEST/HIST UPSERT
 # =========================
 def _execute_values_retry(sql_text: str, rows: list, template: str, page_size: int = 2000):
-    """
-    ✅ psycopg2 재사용 연결에서:
-    - 실행 중 끊김/오류 발생 시 rollback
-    - 연결이 죽었으면 재연결
-    - 성공할 때까지 무한 재시도
-    """
     while True:
         conn = None
         try:
@@ -656,7 +766,7 @@ def _execute_values_retry(sql_text: str, rows: list, template: str, page_size: i
             conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] execute_values failed: {type(e).__name__}: {repr(e)}")
+            log(f"execute_values failed: {type(e).__name__}: {repr(e)}", "error")
             try:
                 if conn:
                     conn.rollback()
@@ -765,17 +875,18 @@ def upsert_hist_daily(summary_df: pd.DataFrame, snapshot_day: str):
 
 
 # =========================
-# 5) main: REALTIME LOOP (MP=1)
+# 5) main: REALTIME LOOP
 # =========================
 def main():
     start_dt = datetime.now()
-    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
-    log("=== REALTIME MODE: current-month incremental + periodic UPSERT ===")
-    log(f"loop_interval={LOOP_INTERVAL_SEC}s | fetch_limit={FETCH_LIMIT} | work_mem={WORK_MEM}")
+    log(f"start {start_dt:%Y-%m-%d %H:%M:%S}", "start")
+    log("realtime mode: current-month incremental + periodic upsert", "info")
+    log(f"loop_interval={LOOP_INTERVAL_SEC}s | fetch_limit={FETCH_LIMIT} | work_mem={WORK_MEM}", "info")
 
-    # ✅ DB 연결/엔진 준비(블로킹) + 테이블 보정(블로킹)
+    # DB 연결/엔진 준비 + 테이블 보정 + 로그 테이블 준비
     engine = get_engine_blocking()
     get_conn_pg_blocking()
+    ensure_log_table()
     ensure_tables_and_indexes()
 
     run_month = current_yyyymm()
@@ -785,10 +896,6 @@ def main():
     last_ts: dict[tuple[str, str], pd.Timestamp] = {}
 
     def _fetch_new_rows(engine_local, stations: list[str], run_month_local: str) -> pd.DataFrame:
-        """
-        ✅ 실행 중 끊김 포함, fetch 단계에서 어떤 예외든 '연결 복구까지 무한 재시도'
-        - engine_local이 죽으면 dispose/rebuild
-        """
         while True:
             try:
                 min_last = min(last_ts.values()) if last_ts else None
@@ -801,7 +908,6 @@ def main():
                     "limit": FETCH_LIMIT,
                 }
                 if min_last is not None:
-                    # NOTE: 기존 로직 유지
                     extra_where = """
                       AND ( (regexp_replace(COALESCE(end_day::text,''), '\\D', '', 'g') || ' ' || COALESCE(end_time::text,''))::timestamp > :min_last )
                     """
@@ -853,9 +959,10 @@ def main():
                 return pd.concat(keep_parts, ignore_index=True)
 
             except Exception as e:
-                log(f"[DB][RETRY] fetch_new_rows failed: {type(e).__name__}: {repr(e)}")
+                log(f"fetch_new_rows failed: {type(e).__name__}: {repr(e)}", "error")
                 if _is_conn_error(e):
                     _dispose_engine()
+                    log("db connection down -> engine rebuild", "down")
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
                 engine_local = get_engine_blocking()
 
@@ -870,29 +977,29 @@ def main():
             # 월 롤오버
             cur_month = current_yyyymm(now)
             if cur_month != run_month:
-                log(f"[MONTH ROLLOVER] {run_month} -> {cur_month} (cache reset)")
+                log(f"month rollover {run_month} -> {cur_month} (cache reset)", "info")
                 run_month = cur_month
                 snapshot_day = today_yyyymmdd()
                 last_ts.clear()
 
-            # ✅ 신규분만 체크 (끊기면 무한 재시도)
+            # 신규분 체크
             df_new = _fetch_new_rows(engine, STATIONS_ALL, run_month)
 
             if df_new is not None and not df_new.empty:
                 _update_last_ts(df_new)
-                log(f"[NEW] rows={len(df_new)} | month={run_month}")
+                log(f"new rows={len(df_new)} month={run_month}", "info")
 
-                # ✅ 신규 발생 시에만 월 전체 로드/요약/저장
-                #    월 전체 로드도 read_sql_blocking으로 끊김 시 무한 재시도
                 df_month = load_source_month(engine, stations=STATIONS_ALL, run_month=run_month)
                 summary_all = build_summary(df_month) if df_month is not None and not df_month.empty else pd.DataFrame()
 
                 if summary_all is not None and not summary_all.empty:
                     upsert_latest(summary_all)
                     upsert_hist_daily(summary_all, snapshot_day=snapshot_day)
-                    log("[UPSERT] latest + hist OK")
+                    log("upsert latest + hist ok", "ok")
                 else:
-                    log("[SKIP] summary 없음 -> 저장 생략")
+                    log("summary 없음 -> 저장 생략", "skip")
+            else:
+                log("sleep 5s (no new rows)", "sleep")
 
             time_mod.sleep(LOOP_INTERVAL_SEC)
 
@@ -904,10 +1011,12 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("[INTERRUPT] 사용자 중단")
+        log("사용자 중단", "interrupt")
         hold_console_open(0)
     except Exception:
-        log("\n[ERROR] 예외 발생")
         import traceback
-        traceback.print_exc()
+        err_txt = traceback.format_exc()
+        log("예외 발생", "error")
+        _safe_print(err_txt)
+        _insert_log_row_blocking("error", err_txt)
         hold_console_open(1)

@@ -27,6 +27,12 @@ e1_1_FCT_op_ct_factory_schedule.py
 - ✅ SQLAlchemy engine 사용 구간: pool_pre_ping + 연결 오류 감지 시 dispose 후 재생성
 - ✅ psycopg2 직접 접속 구간: 연결 오류 시 무한 재접속/재시도 (이미 while True로 감싸져 있음)
 - ✅ keepalive(connect_args/환경변수) 옵션 추가(가능 범위 내)
+
+[추가: 데몬 헬스체크 로그 DB 저장]
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: e1_1_log (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- 로그는 end_day, end_time, info, contents 순서로 DataFrame화 후 저장
 """
 
 import time
@@ -83,7 +89,6 @@ RUN_TIME_2 = dtime(20, 22, 0)
 # 기존 상수는 유지하되 MP는 제거 (단일 프로세스에서 전체 station 처리)
 ALL_STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]
 
-
 # =========================
 # ✅ 안정화 파라미터
 # =========================
@@ -96,23 +101,21 @@ PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
 PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
+# =========================
+# ✅ 로그 DB(헬스체크) 설정
+# =========================
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "e1_1_log"
+
 _ENGINE = None
 
 
 # =========================
 # 1) 유틸
 # =========================
-def log(msg: str):
-    print(msg, flush=True)
-
-
-def today_yyyymmdd() -> str:
-    return date.today().strftime("%Y%m%d")
-
-
-def current_yyyymm(now: datetime | None = None) -> str:
-    now = now or datetime.now()
-    return now.strftime("%Y%m")
+def _normalize_info(info: str) -> str:
+    s = (info or "info").strip().lower()
+    return s if s else "info"
 
 
 def _masked_db_info() -> str:
@@ -157,7 +160,7 @@ def _build_engine(config=DB_CONFIG):
         f"postgresql+psycopg2://{config['user']}:{pw}"
         f"@{config['host']}:{config['port']}/{config['dbname']}?connect_timeout=5"
     )
-    log(f"[INFO] DB = {_masked_db_info()}")
+    print(f"[INFO] DB = {_masked_db_info()}", flush=True)
 
     # ✅ 풀 최소화(상시 연결 1개로 고정) + ✅ keepalive
     return create_engine(
@@ -195,7 +198,7 @@ def get_engine_blocking(config=DB_CONFIG):
                     conn.execute(text("SELECT 1"))
                 return _ENGINE
             except Exception as e:
-                log(f"[DB][RETRY] ping failed -> rebuild: {type(e).__name__}: {repr(e)}")
+                print(f"[DB][RETRY] ping failed -> rebuild: {type(e).__name__}: {repr(e)}", flush=True)
                 _dispose_engine()
                 time.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -205,15 +208,25 @@ def get_engine_blocking(config=DB_CONFIG):
             with _ENGINE.connect() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
-            log(
+            print(
                 f"[DB][OK] engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
-                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
+                flush=True
             )
             return _ENGINE
         except Exception as e:
-            log(f"[DB][RETRY] engine create/connect failed: {type(e).__name__}: {repr(e)}")
+            print(f"[DB][RETRY] engine create/connect failed: {type(e).__name__}: {repr(e)}", flush=True)
             _dispose_engine()
             time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def today_yyyymmdd() -> str:
+    return date.today().strftime("%Y%m%d")
+
+
+def current_yyyymm(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    return now.strftime("%Y%m")
 
 
 def _cast_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
@@ -228,6 +241,101 @@ def _cast_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# =========================
+# 1-1) 로그 테이블 보장 + 로그 저장
+# =========================
+def ensure_log_table():
+    """
+    로그 스키마/테이블 보장:
+      k_demon_heath_check.e1_1_log
+    """
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};
+
+    CREATE TABLE IF NOT EXISTS {LOG_SCHEMA}.{LOG_TABLE} (
+        id BIGSERIAL PRIMARY KEY,
+        end_day   TEXT NOT NULL,   -- yyyymmdd
+        end_time  TEXT NOT NULL,   -- hh:mi:ss
+        info      TEXT NOT NULL,   -- 소문자
+        contents  TEXT,
+        created_at TIMESTAMP DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_{LOG_TABLE}_day_time
+      ON {LOG_SCHEMA}.{LOG_TABLE}(end_day, end_time);
+
+    CREATE INDEX IF NOT EXISTS ix_{LOG_TABLE}_info
+      ON {LOG_SCHEMA}.{LOG_TABLE}(info);
+    """
+    while True:
+        try:
+            with psycopg2.connect(**DB_CONFIG) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(ddl)
+                conn.commit()
+            print(f"[OK] log table ensured: {LOG_SCHEMA}.{LOG_TABLE}", flush=True)
+            return
+        except Exception as e:
+            print(f"[DB][RETRY] ensure_log_table failed: {type(e).__name__}: {repr(e)}", flush=True)
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def _save_log_to_db(info: str, contents: str):
+    """
+    요구사항:
+    1) 로그 생성
+    2) end_day : yyyymmdd
+    3) end_time: hh:mi:ss
+    4) info: 소문자
+    5) contents: 나머지 내용
+    6) end_day, end_time, info, contents 순서 DataFrame화 후 저장
+    """
+    now = datetime.now()
+    row = {
+        "end_day": now.strftime("%Y%m%d"),
+        "end_time": now.strftime("%H:%M:%S"),
+        "info": _normalize_info(info),
+        "contents": str(contents),
+    }
+
+    # 컬럼 순서 고정 DataFrame
+    log_df = pd.DataFrame([[row["end_day"], row["end_time"], row["info"], row["contents"]]],
+                          columns=["end_day", "end_time", "info", "contents"])
+
+    insert_sql = sql.SQL("""
+        INSERT INTO {}.{} (end_day, end_time, info, contents)
+        VALUES (%(end_day)s, %(end_time)s, %(info)s, %(contents)s)
+    """).format(sql.Identifier(LOG_SCHEMA), sql.Identifier(LOG_TABLE))
+
+    # 로그 저장 자체도 연결 실패 시 재시도(무한)
+    while True:
+        try:
+            with psycopg2.connect(**DB_CONFIG) as conn:
+                with conn.cursor() as cur:
+                    cur.executemany(insert_sql.as_string(conn), log_df.to_dict(orient="records"))
+                conn.commit()
+            return
+        except Exception as e:
+            # 여기서는 재귀 로그 방지 위해 print만
+            print(f"[DB][RETRY] save_log failed: {type(e).__name__}: {repr(e)}", flush=True)
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def log(msg: str, info: str = "info", save_db: bool = True):
+    """
+    공통 로그 출력 + DB 저장
+    info는 반드시 소문자로 정규화
+    """
+    info_n = _normalize_info(info)
+    print(msg, flush=True)
+    if save_db:
+        try:
+            _save_log_to_db(info_n, msg)
+        except Exception as e:
+            # 여기서는 print만(무한 재귀 방지)
+            print(f"[WARN] log db write skipped: {type(e).__name__}: {repr(e)}", flush=True)
+
+
 def _sleep_until(target_dt: datetime):
     """
     target_dt까지 대기(초 단위 sleep). DB/파일 부하를 만들지 않도록 1~30초로 슬립.
@@ -237,7 +345,9 @@ def _sleep_until(target_dt: datetime):
         if now >= target_dt:
             return
         sec = (target_dt - now).total_seconds()
-        time.sleep(min(max(sec, 1.0), 30.0))
+        sleep_sec = min(max(sec, 1.0), 30.0)
+        log(f"[SLEEP] waiting {sleep_sec:.1f}s until {target_dt:%Y-%m-%d %H:%M:%S}", info="sleep")
+        time.sleep(sleep_sec)
 
 
 def _next_run_datetimes(now_dt: datetime) -> List[datetime]:
@@ -374,7 +484,7 @@ def ensure_tables_and_indexes():
             break
 
         except Exception as e:
-            log(f"[DB][RETRY] ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}")
+            log(f"[DB][RETRY] ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}", info="down")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
     # id 자동채번/NULL 보정 (4개 테이블 모두)
@@ -383,7 +493,7 @@ def ensure_tables_and_indexes():
     fix_id_sequence(TARGET_SCHEMA, TBL_OPCT_HIST,    "fct_op_ct_hist_id_seq")
     fix_id_sequence(TARGET_SCHEMA, TBL_WHOLE_HIST,   "fct_whole_op_ct_hist_id_seq")
 
-    log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"')
+    log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"', info="info")
 
 
 def fix_id_sequence(schema: str, table: str, seq_name: str):
@@ -438,7 +548,7 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
                 conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] fix_id_sequence({schema}.{table}) failed: {type(e).__name__}: {repr(e)}")
+            log(f"[DB][RETRY] fix_id_sequence({schema}.{table}) failed: {type(e).__name__}: {repr(e)}", info="down")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -475,10 +585,10 @@ def load_month_df(engine, stations: List[str], run_month: str) -> pd.DataFrame:
         except Exception as e:
             # ✅ 실행 중 끊김 복구
             if _is_connection_error(e):
-                log(f"[DB][RETRY] load_month_df conn error -> rebuild: {type(e).__name__}: {repr(e)}")
+                log(f"[DB][RETRY] load_month_df conn error -> rebuild: {type(e).__name__}: {repr(e)}", info="down")
                 _dispose_engine()
             else:
-                log(f"[DB][RETRY] load_month_df failed: {type(e).__name__}: {repr(e)}")
+                log(f"[DB][RETRY] load_month_df failed: {type(e).__name__}: {repr(e)}", info="error")
             time.sleep(DB_RETRY_INTERVAL_SEC)
             engine = get_engine_blocking(DB_CONFIG)
 
@@ -648,7 +758,7 @@ def build_final_df_86(summary_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 6) 저장 (LATEST UPSERT + HIST 하루롤링 UPSERT) - 기존 유지
+# 6) 저장 (LATEST UPSERT + HIST 하루롤링 UPSERT)
 # =========================
 def upsert_latest_opct(df: pd.DataFrame):
     if df is None or df.empty:
@@ -696,7 +806,7 @@ def upsert_latest_opct(df: pd.DataFrame):
                 conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] upsert_latest_opct failed: {type(e).__name__}: {repr(e)}")
+            log(f"[DB][RETRY] upsert_latest_opct failed: {type(e).__name__}: {repr(e)}", info="down")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -735,7 +845,7 @@ def upsert_latest_whole(df: pd.DataFrame):
                 conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] upsert_latest_whole failed: {type(e).__name__}: {repr(e)}")
+            log(f"[DB][RETRY] upsert_latest_whole failed: {type(e).__name__}: {repr(e)}", info="down")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -786,7 +896,7 @@ def upsert_hist_opct_daily(df: pd.DataFrame, snapshot_day: str):
                 conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] upsert_hist_opct_daily failed: {type(e).__name__}: {repr(e)}")
+            log(f"[DB][RETRY] upsert_hist_opct_daily failed: {type(e).__name__}: {repr(e)}", info="down")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -826,23 +936,23 @@ def upsert_hist_whole_daily(df: pd.DataFrame, snapshot_day: str):
                 conn.commit()
             return
         except Exception as e:
-            log(f"[DB][RETRY] upsert_hist_whole_daily failed: {type(e).__name__}: {repr(e)}")
+            log(f"[DB][RETRY] upsert_hist_whole_daily failed: {type(e).__name__}: {repr(e)}", info="down")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
 # =========================
-# 7) 작업 1회 실행(오늘 기준 월 전체) - ✅ 단일 프로세스
+# 7) 작업 1회 실행(오늘 기준 월 전체) - 단일 프로세스
 # =========================
 def run_pipeline_once(label: str, run_month: str):
     snapshot_day = today_yyyymmdd()
-    log(f"[RUN] {label} | snapshot_day={snapshot_day} | month={run_month} | START")
+    log(f"[RUN] {label} | snapshot_day={snapshot_day} | month={run_month} | START", info="info")
 
     # ✅ 루프 실행 직전에 엔진 상태 점검/복구
     eng = get_engine_blocking(DB_CONFIG)
 
     df_raw = load_month_df(eng, ALL_STATIONS, run_month)
     if df_raw is None or df_raw.empty:
-        log(f"[RUN] {label} | no source rows (month={run_month}) -> skip save")
+        log(f"[RUN] {label} | no source rows (month={run_month}) -> skip save", info="info")
         return
 
     summary_df = build_summary_df(df_raw)
@@ -853,37 +963,40 @@ def run_pipeline_once(label: str, run_month: str):
     upsert_hist_opct_daily(summary_df, snapshot_day=snapshot_day)
     upsert_hist_whole_daily(whole_df, snapshot_day=snapshot_day)
 
-    log(f"[RUN] {label} | DONE (latest+hist upsert) | summary={len(summary_df):,} whole={len(whole_df):,}")
+    log(f"[RUN] {label} | DONE (latest+hist upsert) | summary={len(summary_df):,} whole={len(whole_df):,}", info="info")
 
 
 # =========================
 # 8) main: 08:22 / 20:22에만 실행 후 종료
 # =========================
 def main():
-    start_dt = datetime.now()
-    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}")
-    log("=== SCHEDULE MODE: run at 08:22 and 20:22, then exit ===")
-    log(f"work_mem={WORK_MEM} | engine pool_size=1 max_overflow=0")
+    # 0) 로그 테이블 먼저 보장
+    ensure_log_table()
 
-    # 0) 대상 테이블/인덱스/시퀀스 보장 (DB 실패 시 무한 재시도)
+    start_dt = datetime.now()
+    log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}", info="start")
+    log("=== SCHEDULE MODE: run at 08:22 and 20:22, then exit ===", info="info")
+    log(f"work_mem={WORK_MEM} | engine pool_size=1 max_overflow=0", info="info")
+
+    # 1) 대상 테이블/인덱스/시퀀스 보장 (DB 실패 시 무한 재시도)
     ensure_tables_and_indexes()
 
-    # 1) 오늘 남은 실행 타임 계산
+    # 2) 오늘 남은 실행 타임 계산
     now = datetime.now()
     run_times = _next_run_datetimes(now)
     if not run_times:
-        log("[INFO] All scheduled runs for today already passed. Exit.")
+        log("[INFO] all scheduled runs for today already passed. exit.", info="info")
         return
 
     done = set()
     for target_dt in run_times:
         label = target_dt.strftime("%H:%M:%S")
-        log(f"[WAIT] next_run={target_dt:%Y-%m-%d %H:%M:%S}")
+        log(f"[WAIT] next_run={target_dt:%Y-%m-%d %H:%M:%S}", info="wait")
         _sleep_until(target_dt)
 
         run_month = current_yyyymm()
 
-        # ✅ 스케줄 1회는 "성공할 때까지" 재시도(요청 취지)
+        # ✅ 스케줄 1회는 "성공할 때까지" 재시도
         while True:
             try:
                 run_pipeline_once(label=label, run_month=run_month)
@@ -891,14 +1004,14 @@ def main():
                 break
             except Exception as e:
                 if _is_connection_error(e):
-                    log(f"[RUN][RETRY] {label} conn error -> rebuild engine: {type(e).__name__}: {repr(e)}")
+                    log(f"[RUN][RETRY] {label} conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", info="down")
                     _dispose_engine()
                     _ = get_engine_blocking(DB_CONFIG)
                 else:
-                    log(f"[RUN][RETRY] {label} failed: {type(e).__name__}: {repr(e)}")
+                    log(f"[RUN][RETRY] {label} failed: {type(e).__name__}: {repr(e)}", info="error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
 
-    log(f"[END] done={sorted(done)} | exit.")
+    log(f"[END] done={sorted(done)} | exit.", info="end")
 
 
 if __name__ == "__main__":

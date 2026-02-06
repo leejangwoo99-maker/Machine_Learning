@@ -31,7 +31,7 @@ def health() -> dict[str, bool]:
 
 
 # Router registration
-app.include_router(events_router)         # ✅ 추가
+app.include_router(events_router)
 app.include_router(worker_info_router)
 app.include_router(email_list_router)
 app.include_router(remark_info_router)

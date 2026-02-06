@@ -35,15 +35,20 @@ DB_CONFIG = {
 }
 
 # ==========================
-# 스키마/테이블
+# 메인 스키마/테이블
 # ==========================
 SCHEMA_NAME = "a3_vision_table"
-TABLE_NAME  = "vision_table"
+TABLE_NAME = "vision_table"
+
+# ==========================
+# 로그 스키마/테이블 (추가 요구사항)
+# ==========================
+LOG_SCHEMA_NAME = "k_demon_heath_check"
+LOG_TABLE_NAME = "a3_log"
 
 # ==========================
 # 추가 요구사항 설정
 # ==========================
-
 # ✅ 요구사항: 멀티프로세스 = 1개
 NUM_WORKERS = 1
 
@@ -75,6 +80,83 @@ _CONN = None
 
 
 # ==========================
+# 콘솔 + DB 로그 유틸
+# ==========================
+def _now_day_time():
+    now = datetime.now()
+    return now.strftime("%Y%m%d"), now.strftime("%H:%M:%S")
+
+
+def _print(msg: str):
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
+
+def _insert_log_rows(conn, rows):
+    """
+    rows: list[dict] with keys end_day, end_time, info, contents
+    """
+    if not rows:
+        return
+
+    # ✅ 요구사항: end_day, end_time, info, contents 순서대로 dataframe화
+    df = pd.DataFrame(rows, columns=["end_day", "end_time", "info", "contents"])
+
+    records = [tuple(x) for x in df[["end_day", "end_time", "info", "contents"]].to_numpy()]
+
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            f"""
+            INSERT INTO {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME}
+                (end_day, end_time, info, contents)
+            VALUES %s
+            """,
+            records,
+            page_size=1000,
+        )
+
+
+def log_event(info: str, contents: str, echo: bool = True):
+    """
+    - info는 반드시 소문자 저장
+    - 로깅 실패해도 메인 로직은 계속
+    """
+    info_val = (info or "info").strip().lower()
+    end_day, end_time = _now_day_time()
+    row = {
+        "end_day": end_day,
+        "end_time": end_time,
+        "info": info_val,
+        "contents": str(contents),
+    }
+
+    if echo:
+        _print(f"[{info_val}] {contents}")
+
+    # DB 로그는 "있으면 저장", 실패해도 메인 동작 지속
+    try:
+        conn = ensure_conn()
+        _insert_log_rows(conn, [row])
+        conn.commit()
+    except Exception as e:
+        # 로그 저장 실패는 콘솔만 남기고 무시
+        try:
+            _print(f"[warn] log insert failed: {type(e).__name__}: {repr(e)}")
+        except Exception:
+            pass
+        try:
+            if 'conn' in locals() and conn:
+                conn.rollback()
+        except Exception:
+            pass
+        if _is_connection_error(e):
+            _reset_conn("log insert connection error")
+
+
+# ==========================
 # DB 유틸
 # ==========================
 def _safe_close(conn):
@@ -87,11 +169,8 @@ def _safe_close(conn):
 def _reset_conn(reason: str = ""):
     """커넥션 강제 폐기 + 다음 ensure_conn에서 무한 재연결 유도"""
     global _CONN
-    try:
-        if reason:
-            print(f"[DB][RESET] {reason}", flush=True)
-    except Exception:
-        pass
+    if reason:
+        _print(f"[db][reset] {reason}")
     try:
         _safe_close(_CONN)
     except Exception:
@@ -148,8 +227,6 @@ def get_connection_blocking():
                 **DB_CONFIG,
                 connect_timeout=5,
                 application_name="a3_vision_table_realtime",
-
-                # keepalive 옵션 (libpq 지원)
                 keepalives=PG_KEEPALIVES,
                 keepalives_idle=PG_KEEPALIVES_IDLE,
                 keepalives_interval=PG_KEEPALIVES_INTERVAL,
@@ -157,14 +234,13 @@ def get_connection_blocking():
             )
             conn.autocommit = False
             _apply_session_safety(conn)
-            print(
-                f"[DB][OK] connected (work_mem={WORK_MEM}, "
-                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
-                flush=True
+            _print(
+                f"[db][ok] connected (work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})"
             )
             return conn
         except Exception as e:
-            print(f"[DB][RETRY] connect failed: {type(e).__name__}: {repr(e)}", flush=True)
+            _print(f"[db][retry] connect failed: {type(e).__name__}: {repr(e)}")
             try:
                 time.sleep(DB_RETRY_INTERVAL_SEC)
             except Exception:
@@ -173,10 +249,7 @@ def get_connection_blocking():
 
 def ensure_conn():
     """
-    ✅ 백엔드별 상시 연결 1개 고정(풀 최소화):
-    - 프로세스 전체에서 커넥션 1개만 유지/재사용
-    - 죽었으면 무한 재연결(블로킹)
-    - 실행 중 끊김도 ping에서 감지/복구
+    ✅ 백엔드별 상시 연결 1개 고정(풀 최소화)
     """
     global _CONN
 
@@ -194,7 +267,7 @@ def ensure_conn():
         return _CONN
     except Exception as e:
         if _is_connection_error(e):
-            print(f"[DB][WARN] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}", flush=True)
+            _print(f"[db][warn] connection unhealthy, will reconnect: {type(e).__name__}: {repr(e)}")
             _reset_conn("ping failed")
             _CONN = get_connection_blocking()
             return _CONN
@@ -203,12 +276,7 @@ def ensure_conn():
 
 def ensure_schema_and_table(conn):
     """
-    - 메인 테이블은 파일 1개당 여러 step row가 들어가는 구조
-      => UNIQUE(file_path) / ON CONFLICT(file_path) 불가능
-    - 따라서 중복 판정은:
-      ✅ SELECT DISTINCT file_path WHERE end_day=오늘
-    - 성능을 위해 file_path, end_day 인덱스 생성
-    - ✅ 실행 중 끊김 포함: 무한 재시도
+    메인 테이블 보장
     """
     while True:
         conn = ensure_conn()
@@ -237,7 +305,6 @@ def ensure_schema_and_table(conn):
                     """
                 )
 
-                # (안전) 이미 존재해도 OK
                 cur.execute(
                     f"""
                     ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME}
@@ -264,7 +331,7 @@ def ensure_schema_and_table(conn):
 
         except psycopg2.Error as e:
             if _is_connection_error(e):
-                print(f"[DB][RETRY] ensure_schema_and_table failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                _print(f"[db][retry] ensure_schema_and_table failed(conn): {type(e).__name__}: {repr(e)}")
                 try:
                     conn.rollback()
                 except Exception:
@@ -272,18 +339,61 @@ def ensure_schema_and_table(conn):
                 _reset_conn("ensure_schema_and_table connection error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
                 continue
-            print(f"[DB][FATAL] ensure_schema_and_table db error: {type(e).__name__}: {repr(e)}", flush=True)
+            _print(f"[db][fatal] ensure_schema_and_table db error: {type(e).__name__}: {repr(e)}")
             raise
 
-        except Exception:
+
+def ensure_log_schema_and_table(conn):
+    """
+    ✅ 로그 스키마/테이블 보장
+    - 스키마: k_demon_heath_check
+    - 테이블: a3_log
+    """
+    while True:
+        conn = ensure_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA_NAME};")
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (
+                        id BIGSERIAL PRIMARY KEY,
+                        end_day  TEXT NOT NULL,     -- yyyymmdd
+                        end_time TEXT NOT NULL,     -- hh:mi:ss
+                        info     TEXT NOT NULL,     -- 소문자
+                        contents TEXT
+                    );
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE_NAME}_day_time
+                    ON {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (end_day, end_time);
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE_NAME}_info
+                    ON {LOG_SCHEMA_NAME}.{LOG_TABLE_NAME} (info);
+                    """
+                )
+            conn.commit()
+            return
+        except psycopg2.Error as e:
+            if _is_connection_error(e):
+                _print(f"[db][retry] ensure_log_schema_and_table failed(conn): {type(e).__name__}: {repr(e)}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                _reset_conn("ensure_log_schema_and_table connection error")
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+                continue
+            _print(f"[db][fatal] ensure_log_schema_and_table db error: {type(e).__name__}: {repr(e)}")
             raise
 
 
 def get_processed_file_paths_today(conn, end_day: str) -> set:
-    """
-    ✅ SELECT DISTINCT file_path WHERE end_day=오늘 로 “이미 적재된 파일”을 판별
-    ✅ 실행 중 끊김 포함: 무한 재시도
-    """
     while True:
         conn = ensure_conn()
         try:
@@ -303,7 +413,7 @@ def get_processed_file_paths_today(conn, end_day: str) -> set:
 
         except psycopg2.Error as e:
             if _is_connection_error(e):
-                print(f"[DB][RETRY] get_processed_file_paths_today failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                _print(f"[db][retry] get_processed_file_paths_today failed(conn): {type(e).__name__}: {repr(e)}")
                 try:
                     conn.rollback()
                 except Exception:
@@ -311,18 +421,11 @@ def get_processed_file_paths_today(conn, end_day: str) -> set:
                 _reset_conn("get_processed_file_paths_today connection error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
                 continue
-            print(f"[DB][FATAL] get_processed_file_paths_today db error: {type(e).__name__}: {repr(e)}", flush=True)
-            raise
-
-        except Exception:
+            _print(f"[db][fatal] get_processed_file_paths_today db error: {type(e).__name__}: {repr(e)}")
             raise
 
 
 def insert_main_rows(conn, rows):
-    """
-    메인 테이블은 파일당 여러 step row 저장 구조이므로
-    file_path 기준 ON CONFLICT / UNIQUE 같은 건 사용하면 안 됨.
-    """
     if not rows:
         return
 
@@ -454,7 +557,6 @@ def _worker_process_file(file_str: str):
         with file_path.open("r", encoding="cp949", errors="ignore") as f:
             lines = f.readlines()
     except Exception:
-        print("[ERROR] 파일 읽기 오류:", file_str, flush=True)
         return []
 
     if len(lines) < 19:
@@ -463,9 +565,7 @@ def _worker_process_file(file_str: str):
     barcode = parse_barcode_line(lines[4]) if len(lines) > 4 else ""
     station = parse_program_line(lines[5]) if len(lines) > 5 else ""
     remark = classify_remark(barcode)
-
     run_time = parse_run_time_line(lines[13]) if len(lines) > 13 else None
-
     end_day = parse_end_day_from_path(file_path)
     end_time = parse_end_time_from_full_path(file_path)
 
@@ -500,21 +600,15 @@ def _worker_process_file(file_str: str):
 def run_once(conn, processed_set: set, today_str: str):
     vision_root = BASE_LOG_DIR / VISION_FOLDER_NAME
     if not vision_root.exists():
-        print(f"[ERROR] {VISION_FOLDER_NAME} 폴더가 없음: {vision_root}", flush=True)
+        log_event("error", f"{VISION_FOLDER_NAME} 폴더가 없음: {vision_root}")
         return
 
-    # cutoff_ts 결정
-    if USE_FIXED_CUTOFF_TS:
-        cutoff_ts = float(FIXED_CUTOFF_TS)
-    else:
-        cutoff_ts = time.time() - REALTIME_WINDOW_SEC
+    cutoff_ts = float(FIXED_CUTOFF_TS) if USE_FIXED_CUTOFF_TS else (time.time() - REALTIME_WINDOW_SEC)
 
-    # 1) 폴더 스캔 (오늘 폴더만 + 최근 120초 파일만)
     target_files = []
-
     today_dir = vision_root / today_str
     if not today_dir.exists():
-        print(f"[INFO] 오늘 폴더 없음: {today_dir} (today={today_str})", flush=True)
+        log_event("info", f"오늘 폴더 없음: {today_dir} (today={today_str})")
         return
 
     for sub_name in ["GoodFile", "BadFile"]:
@@ -525,27 +619,24 @@ def run_once(conn, processed_set: set, today_str: str):
         for fp in sub_dir.glob("*"):
             if not fp.is_file():
                 continue
-
             try:
                 mtime = fp.stat().st_mtime
             except Exception:
                 continue
-
             if mtime < cutoff_ts:
                 continue
-
             target_files.append(str(fp))
 
     total = len(target_files)
-    print(f"[INFO] 오늘({today_str}) & 최근{REALTIME_WINDOW_SEC}초 대상 파일 수: {total}개 (cutoff_ts={cutoff_ts})", flush=True)
+    log_event("info", f"오늘({today_str}) & 최근{REALTIME_WINDOW_SEC}초 대상 파일 수: {total}개 (cutoff_ts={cutoff_ts})")
+
     if total == 0:
-        print("[INFO] 대상 파일 없음.", flush=True)
+        log_event("sleep", "대상 파일 없음")
         return
 
-    # ✅ 이미 적재된 file_path(오늘 end_day)면 스킵
     files_to_process = [f for f in target_files if f not in processed_set]
 
-    # (추가) 이번 사이클 내 중복 file_path 제거
+    # 이번 사이클 내 중복 제거
     seen = set()
     uniq = []
     for f in files_to_process:
@@ -555,20 +646,17 @@ def run_once(conn, processed_set: set, today_str: str):
         uniq.append(f)
     files_to_process = uniq
 
-    print(f"[INFO] DB DISTINCT file_path(end_day=오늘) 중복 스킵: {total - len(files_to_process)}개", flush=True)
-    print(f"[INFO] 실제 처리 대상: {len(files_to_process)}개", flush=True)
+    log_event("info", f"db distinct file_path(end_day=오늘) 중복 스킵: {total - len(files_to_process)}개")
+    log_event("info", f"실제 처리 대상: {len(files_to_process)}개")
 
     if not files_to_process:
-        print("[INFO] 처리할 신규 파일 없음.", flush=True)
+        log_event("sleep", "처리할 신규 파일 없음")
         return
 
-    # 3) 파싱 (✅ 요구사항: 멀티프로세스 = 1개)
     max_workers = NUM_WORKERS
     chunksize = max(20, len(files_to_process) // (max_workers * 8) or 1)
 
     all_new_rows = []
-
-    # 기존 기능(프로세스 풀 기반 구조) 유지하되, worker=1로 실행
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         for idx, rows in enumerate(
             executor.map(_worker_process_file, files_to_process, chunksize=chunksize),
@@ -579,18 +667,18 @@ def run_once(conn, processed_set: set, today_str: str):
                 all_new_rows.extend(rows)
 
             if idx % 500 == 0 or idx == len(files_to_process):
-                print(
-                    f"[진행] {idx}/{len(files_to_process)} "
-                    f"(누적 신규 row: {len(all_new_rows)}) "
+                log_event(
+                    "info",
+                    f"진행 {idx}/{len(files_to_process)} (누적 신규 row: {len(all_new_rows)}) "
                     f"[workers={max_workers}, chunksize={chunksize}]",
-                    flush=True
+                    echo=False
                 )
 
     if not all_new_rows:
-        print("[INFO] 신규 파싱된 데이터가 없습니다.", flush=True)
+        log_event("info", "신규 파싱된 데이터가 없음")
         return
 
-    # 4) INSERT + COMMIT (✅ 실행 중 끊김 포함: 무한 재시도)
+    # INSERT + COMMIT (끊김 시 무한 재시도)
     while True:
         conn = ensure_conn()
         try:
@@ -599,7 +687,7 @@ def run_once(conn, processed_set: set, today_str: str):
             break
         except psycopg2.Error as e:
             if _is_connection_error(e):
-                print(f"[DB][RETRY] insert/commit failed(conn): {type(e).__name__}: {repr(e)}", flush=True)
+                log_event("down", f"insert/commit connection error, retry: {type(e).__name__}: {repr(e)}")
                 try:
                     conn.rollback()
                 except Exception:
@@ -607,40 +695,44 @@ def run_once(conn, processed_set: set, today_str: str):
                 _reset_conn("insert/commit connection error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
                 continue
-            print(f"[DB][FATAL] insert/commit db error: {type(e).__name__}: {repr(e)}", flush=True)
+            log_event("error", f"insert/commit db error: {type(e).__name__}: {repr(e)}")
             try:
                 conn.rollback()
             except Exception:
                 pass
             raise
-        except Exception:
+        except Exception as e:
+            log_event("error", f"insert/commit general error: {type(e).__name__}: {repr(e)}")
             try:
                 conn.rollback()
             except Exception:
                 pass
             raise
 
-    # ✅ 이번에 적재한 file_path는 processed_set에 즉시 반영
     new_file_paths = {r["file_path"] for r in all_new_rows}
     processed_set.update(new_file_paths)
 
-    print(f"[완료] 신규 파일 {len(new_file_paths)}개, 신규 row {len(all_new_rows)}개 PostgreSQL 파싱 완료.", flush=True)
+    log_event("info", f"완료: 신규 파일 {len(new_file_paths)}개, 신규 row {len(all_new_rows)}개 적재 완료")
 
 
 # ==========================
-# 무한 루프 (✅ 5초)
+# 무한 루프 (5초)
 # ==========================
 def main():
     mp.freeze_support()
 
-    # ✅ 상시 연결 1개 유지(접속 실패 시 여기서부터 무한 블로킹 재시도)
-    conn = ensure_conn()
+    _print("[boot] a3 vision realtime parser start")
 
+    conn = ensure_conn()
     ensure_schema_and_table(conn)
+    ensure_log_schema_and_table(conn)
+
+    log_event("boot", "daemon started")
+    log_event("info", f"work_mem={WORK_MEM}, loop_interval={LOOP_INTERVAL_SEC}s, realtime_window={REALTIME_WINDOW_SEC}s")
 
     current_day = datetime.now().strftime("%Y%m%d")
     processed_set = get_processed_file_paths_today(conn, current_day)
-    print(f"[DB] Loaded DISTINCT file_path WHERE end_day={current_day}: {len(processed_set)}", flush=True)
+    log_event("info", f"loaded distinct file_path where end_day={current_day}: {len(processed_set)}")
 
     loop_count = 0
 
@@ -649,32 +741,30 @@ def main():
         try:
             today_str = datetime.now().strftime("%Y%m%d")
 
-            # 자정 날짜 변경 감지: 오늘 processed_set 재로딩
             if today_str != current_day:
                 current_day = today_str
                 processed_set = get_processed_file_paths_today(conn, current_day)
-                print(f"[DAY-CHANGE] end_day={current_day} | reload db_paths={len(processed_set)}", flush=True)
+                log_event("info", f"day-change end_day={current_day} | reload db_paths={len(processed_set)}")
 
-            # 주기적 DB 재동기화(다른 프로세스 적재 반영)
             if (loop_count % DB_RELOAD_EVERY_LOOPS) == 0:
                 processed_set = get_processed_file_paths_today(conn, current_day)
-                print(f"[DB-RELOAD] end_day={current_day} | db_paths={len(processed_set)}", flush=True)
+                log_event("info", f"db-reload end_day={current_day} | db_paths={len(processed_set)}")
 
             run_once(conn, processed_set, current_day)
 
         except psycopg2.Error as e:
-            # ✅ 루프 바깥에서 터져도(드물지만) 연결 문제면 무한 재연결 유도
             if _is_connection_error(e):
-                print("[DB][RETRY] loop-level connection error:", repr(e), flush=True)
+                log_event("down", f"loop-level connection error: {repr(e)}")
                 _reset_conn("loop-level connection error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
                 continue
-            print("[DB][FATAL] loop-level db error:", repr(e), flush=True)
+            log_event("error", f"loop-level db error: {repr(e)}")
             raise
 
         except Exception as e:
-            print("[ERROR] run_once 중 예외 발생:", repr(e), flush=True)
+            log_event("error", f"run_once exception: {type(e).__name__}: {repr(e)}")
 
+        log_event("sleep", f"sleep {LOOP_INTERVAL_SEC}s", echo=False)
         time.sleep(LOOP_INTERVAL_SEC)
 
 

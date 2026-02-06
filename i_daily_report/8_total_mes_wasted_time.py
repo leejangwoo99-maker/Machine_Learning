@@ -23,6 +23,12 @@ backend8_total_mes_loss_time_daemon.py
 [반영된 수정]
 - fetch_increment_mes_fail(): (from,to]가 현재 윈도우(start~now)와 "겹치지 않으면" 완전 skip
   (중복방지 목적상 seen_pk에는 넣고, last_pk는 진행)
+
+[추가 사양 반영: 데몬 헬스 로그 DB 저장]
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: "8_log" (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- 저장 시 DataFrame 컬럼 순서: end_day, end_time, info, contents
 """
 
 from __future__ import annotations
@@ -68,18 +74,91 @@ SAVE_SCHEMA = "i_daily_report"
 T_DAY = "h_mes_wasted_time_day_daily"
 T_NIGHT = "h_mes_wasted_time_night_daily"
 
+# Health log target
+HEALTH_SCHEMA = "k_demon_heath_check"
+HEALTH_TABLE = "8_log"  # 숫자 시작 테이블명 -> 반드시 quote 필요
+
 
 # =========================
-# 1) LOG
+# 1) LOG (console + DB health table)
 # =========================
-def log_boot(msg: str) -> None:
-    print(f"{datetime.now(KST):%Y-%m-%d %H:%M:%S} [BOOT] {msg}", flush=True)
+def _now_kst() -> datetime:
+    return datetime.now(KST)
 
-def log_info(msg: str) -> None:
-    print(f"{datetime.now(KST):%Y-%m-%d %H:%M:%S} [INFO] {msg}", flush=True)
+def _fmt_day_time(dt: datetime) -> Tuple[str, str]:
+    return dt.strftime("%Y%m%d"), dt.strftime("%H:%M:%S")
 
-def log_retry(msg: str) -> None:
-    print(f"{datetime.now(KST):%Y-%m-%d %H:%M:%S} [RETRY] {msg}", flush=True)
+def _normalize_info(info: str) -> str:
+    return (info or "info").strip().lower()
+
+def _health_df(info: str, contents: str) -> pd.DataFrame:
+    now = _now_kst()
+    end_day, end_time = _fmt_day_time(now)
+    # 반드시 이 순서
+    return pd.DataFrame(
+        [[end_day, end_time, _normalize_info(info), str(contents)]],
+        columns=["end_day", "end_time", "info", "contents"],
+    )
+
+def ensure_health_table(engine: Engine) -> None:
+    ddl_schema = f'CREATE SCHEMA IF NOT EXISTS "{HEALTH_SCHEMA}";'
+    ddl_table = f"""
+    CREATE TABLE IF NOT EXISTS "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (
+        id bigserial PRIMARY KEY,
+        end_day text NOT NULL,
+        end_time text NOT NULL,
+        info text NOT NULL,
+        contents text,
+        created_at timestamptz NOT NULL DEFAULT now()
+    );
+    """
+    idx1 = f'CREATE INDEX IF NOT EXISTS "ix_{HEALTH_TABLE}_end_day_time" ON "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (end_day, end_time);'
+    idx2 = f'CREATE INDEX IF NOT EXISTS "ix_{HEALTH_TABLE}_info" ON "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (info);'
+
+    with engine.begin() as conn:
+        conn.execute(text(ddl_schema))
+        conn.execute(text(ddl_table))
+        conn.execute(text(idx1))
+        conn.execute(text(idx2))
+
+def write_health_log(engine: Optional[Engine], info: str, contents: str) -> None:
+    """
+    DataFrame(end_day, end_time, info, contents) 형태로 생성 후 DB 저장.
+    실패 시 콘솔로만 fallback (무한루프 방지 위해 여기서 재귀 로그 호출 금지).
+    """
+    if engine is None:
+        return
+
+    df = _health_df(info=info, contents=contents)
+
+    sql = text(f"""
+        INSERT INTO "{HEALTH_SCHEMA}"."{HEALTH_TABLE}" (end_day, end_time, info, contents)
+        VALUES (:end_day, :end_time, :info, :contents)
+    """)
+
+    try:
+        rec = df.iloc[0].to_dict()
+        with engine.begin() as conn:
+            conn.execute(sql, rec)
+    except Exception as e:
+        # DB 로그 저장 실패는 콘솔로만 남김(재귀 방지)
+        now = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{now} [RETRY] health-log write failed: {type(e).__name__}: {e}", flush=True)
+
+def _console(level: str, msg: str) -> None:
+    print(f"{_now_kst():%Y-%m-%d %H:%M:%S} [{level}] {msg}", flush=True)
+
+def log_boot(msg: str, engine: Optional[Engine] = None) -> None:
+    _console("BOOT", msg)
+    write_health_log(engine, "boot", msg)
+
+def log_info(msg: str, engine: Optional[Engine] = None) -> None:
+    _console("INFO", msg)
+    write_health_log(engine, "info", msg)
+
+def log_retry(msg: str, engine: Optional[Engine] = None) -> None:
+    _console("RETRY", msg)
+    write_health_log(engine, "down", msg)
 
 
 # =========================
@@ -99,7 +178,6 @@ def make_engine() -> Engine:
     )
 
 def configure_session(engine: Engine) -> None:
-    # work_mem 폭증 방지
     with engine.begin() as conn:
         conn.execute(text("SET work_mem = :wm"), {"wm": WORK_MEM})
 
@@ -108,9 +186,11 @@ def connect_with_retry() -> Engine:
         try:
             engine = make_engine()
             configure_session(engine)
+            ensure_health_table(engine)  # health table 선생성
+            write_health_log(engine, "info", f"db connected (work_mem={WORK_MEM})")
             return engine
         except Exception as e:
-            log_retry(f"DB connect failed: {type(e).__name__}: {e}")
+            _console("RETRY", f"DB connect failed: {type(e).__name__}: {e}")
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -119,25 +199,19 @@ def connect_with_retry() -> Engine:
 # =========================
 @dataclass(frozen=True)
 class Window:
-    prod_day: str          # YYYYMMDD (night는 시작일 기준)
-    shift_type: str        # 'day' or 'night'
-    start: datetime        # KST
-    end: datetime          # KST(now)
-    day_start: datetime    # prod_day day window start
+    prod_day: str
+    shift_type: str
+    start: datetime
+    end: datetime
+    day_start: datetime
     day_end: datetime
-    night_start: datetime  # prod_day night window start
-    night_end: datetime    # prod_day+1 08:29:59
+    night_start: datetime
+    night_end: datetime
 
 def yyyymmdd(d: date) -> str:
     return f"{d.year:04d}{d.month:02d}{d.day:02d}"
 
 def current_window(now: datetime) -> Window:
-    """
-    now 기준 현재 윈도우 산출
-    - day  : 08:30:00 ~ 20:29:59
-    - night: 20:30:00 ~ D+1 08:29:59
-    - 00:00~08:29:59는 전날 night로 본다
-    """
     assert now.tzinfo is not None
     today = now.date()
 
@@ -156,11 +230,10 @@ def current_window(now: datetime) -> Window:
 
         return Window(prod, "day", day_start, now, day_start, day_end, night_start, night_end)
 
-    # night
     if now >= night_cut:
         pd_day = today
     else:
-        pd_day = today - timedelta(days=1)  # 00:00~08:29:59는 전날 night
+        pd_day = today - timedelta(days=1)
 
     prod = yyyymmdd(pd_day)
 
@@ -187,10 +260,6 @@ def round_half_up_int(x: Any) -> int:
     return int(d.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 def parse_time_text_halfup(t: str) -> Tuple[int, int, int]:
-    """
-    'HH:MI:SS' 또는 'HH:MI:SS.xx' → half-up 반올림 후 (h,m,s)
-    carry 처리로 24:00:00 가능
-    """
     t = (t or "").strip()
     if not t:
         return (0, 0, 0)
@@ -214,10 +283,6 @@ def parse_time_text_halfup(t: str) -> Tuple[int, int, int]:
     return (hh, mm, ss)
 
 def dt_from_end_day_and_time(end_day: str, hh: int, mm: int, ss: int) -> datetime:
-    """
-    end_day(YYYYMMDD) + (hh,mm,ss) → timezone-aware KST datetime.
-    hh가 24 이상이면 날짜 carry.
-    """
     d = datetime.strptime(end_day, "%Y%m%d").date()
     add_days = hh // 24
     hh2 = hh % 24
@@ -238,10 +303,6 @@ def format_hms_korean(total_sec: int) -> str:
     return " ".join(parts)
 
 def count_end_seconds_in_window(from_int: int, to_int: int, win_a: int, win_b: int) -> int:
-    """
-    end-second counting: (from, to] => from+1 .. to 의 "끝 초"를 카운트
-    window [win_a, win_b] inclusive
-    """
     if to_int <= from_int:
         return 0
     lo = max(from_int + 1, win_a)
@@ -252,7 +313,7 @@ def count_end_seconds_in_window(from_int: int, to_int: int, win_a: int, win_b: i
 
 
 # =========================
-# 5) mes_fail_wasted_time split (day/night) for count assignment
+# 5) mes_fail_wasted_time split
 # =========================
 def split_row_day_night(
     end_day: str,
@@ -261,11 +322,6 @@ def split_row_day_night(
     wasted_time_db: Any,
     w: Window,
 ) -> Tuple[int, int, int, int]:
-    """
-    반환: (day_w_sec, night_w_sec, day_cnt_flag, night_cnt_flag)
-    - wasted_time은 DB값 신뢰(초) → day/night 비율 배분 + 합은 total_w 보장
-    - 단일 row가 20:30 또는 08:30 경계를 가로지르면 count는 더 큰 쪽 / tie는 day
-    """
     fh, fm, fs = parse_time_text_halfup(from_time_txt)
     th, tm, ts = parse_time_text_halfup(to_time_txt)
 
@@ -310,17 +366,12 @@ def split_row_day_night(
             return 0, night_w, 0, 1
         return 0, 0, 0, 0
 
-    # crossed: count는 더 큰 손실시간 / tie는 day
     if day_w >= night_w:
         return day_w, night_w, 1, 0
     else:
         return day_w, night_w, 0, 1
 
 def mes_fail_days_for_window(w: Window) -> List[str]:
-    """
-    - day: end_day는 prod_day만 보면 충분
-    - night: end_day는 prod_day 및 prod_day+1(00:00~08:29) 포함
-    """
     d = datetime.strptime(w.prod_day, "%Y%m%d").date()
     if w.shift_type == "day":
         return [w.prod_day]
@@ -328,10 +379,9 @@ def mes_fail_days_for_window(w: Window) -> List[str]:
 
 
 # =========================
-# 6) mes_fail2_wasted_time helpers
+# 6) mes_fail2 helpers
 # =========================
 def parse_end_ts(end_day: str, end_time_txt: str) -> datetime:
-    # end_time은 HH:MI:SS (정규화)
     hh, mm, ss = map(int, end_time_txt.split(":"))
     d = datetime.strptime(end_day, "%Y%m%d").date()
     return datetime(d.year, d.month, d.day, hh, mm, ss, tzinfo=KST)
@@ -412,7 +462,7 @@ def upsert_daily(engine: Engine, table: str, row: dict) -> None:
 
 
 # =========================
-# 8) vision_op_ct cache (month change only)
+# 8) vision_op_ct cache
 # =========================
 @dataclass
 class VisionCache:
@@ -425,7 +475,7 @@ def refresh_vision_cache_if_needed(engine: Engine, w: Window, cache: VisionCache
     if cache.cached_prev_month == prev_m:
         return
 
-    log_info(f"[VISION] refresh prev_month={prev_m}")
+    log_info(f"[VISION] refresh prev_month={prev_m}", engine)
     sql = text(f"""
         SELECT DISTINCT ON (station)
                station, del_out_op_ct_av, updated_at
@@ -455,20 +505,17 @@ def compute_rework_time_sec(cache: VisionCache, mes_fail_cnt: int) -> int:
 
 
 # =========================
-# 9) STATE (in-memory)
+# 9) STATE
 # =========================
 @dataclass
 class State:
-    window_key: Optional[Tuple[str, str]] = None  # (prod_day, shift_type)
-
-    # mes_fail_wasted_time
-    last_pk_fail: Optional[Tuple[str, str, str]] = None  # (end_day, station, from_time)
+    window_key: Optional[Tuple[str, str]] = None
+    last_pk_fail: Optional[Tuple[str, str, str]] = None
     seen_pk_fail: set = None
     fail_loss_sec: int = 0
     fail_cnt: int = 0
 
-    # mes_fail2_wasted_time
-    last_pk_fail2: Optional[Tuple[str, str, str, str]] = None  # (barcode_information, end_day, end_time, station)
+    last_pk_fail2: Optional[Tuple[str, str, str, str]] = None
     seen_pk_fail2: set = None
     fct_rework_sec: int = 0
 
@@ -480,7 +527,6 @@ class State:
 
 def reset_for_new_window(state: State, w: Window) -> None:
     state.window_key = (w.prod_day, w.shift_type)
-
     state.last_pk_fail = None
     state.seen_pk_fail = set()
     state.fail_loss_sec = 0
@@ -496,7 +542,7 @@ def reset_for_new_window(state: State, w: Window) -> None:
 # =========================
 def bootstrap_mes_fail(engine: Engine, w: Window, state: State) -> None:
     days = mes_fail_days_for_window(w)
-    log_info(f"[BOOTSTRAP] mes_fail_wasted_time days={days} range={w.start}~{w.end}")
+    log_info(f"[BOOTSTRAP] mes_fail_wasted_time days={days} range={w.start}~{w.end}", engine)
 
     sql = text(f"""
         SELECT end_day, station, from_time, to_time, wasted_time
@@ -541,15 +587,9 @@ def bootstrap_mes_fail(engine: Engine, w: Window, state: State) -> None:
     state.last_pk_fail = max_pk
     state.seen_pk_fail = seen
 
-    log_info(f"[BOOTSTRAP] mes_fail done rows={len(df)} last_pk={state.last_pk_fail} loss={loss} cnt={cnt}")
+    log_info(f"[BOOTSTRAP] mes_fail done rows={len(df)} last_pk={state.last_pk_fail} loss={loss} cnt={cnt}", engine)
 
 def fetch_increment_mes_fail(engine: Engine, w: Window, state: State) -> int:
-    """
-    [수정 반영]
-    - PK 이후 row를 가져오되,
-    - (from,to] 구간이 현재 윈도우(start~now)와 전혀 겹치지 않으면 집계 반영 없이 skip
-      (중복방지 목적상 seen_pk에는 넣고 last_pk는 진행)
-    """
     days = mes_fail_days_for_window(w)
 
     if state.last_pk_fail is None:
@@ -569,12 +609,10 @@ def fetch_increment_mes_fail(engine: Engine, w: Window, state: State) -> int:
     if df.empty:
         return 0
 
-    log_info(f"[FETCH] mes_fail new_rows={len(df)} from last_pk={state.last_pk_fail}")
+    log_info(f"[FETCH] mes_fail new_rows={len(df)} from last_pk={state.last_pk_fail}", engine)
 
     max_pk = state.last_pk_fail
     applied = 0
-
-    # 현재 "실행 윈도우(start~now)" int 경계
     win_a = int(w.start.timestamp())
     win_b = int(w.end.timestamp())
 
@@ -586,7 +624,6 @@ def fetch_increment_mes_fail(engine: Engine, w: Window, state: State) -> int:
                 max_pk = pk
             continue
 
-        # row 구간 계산
         fh, fm, fs = parse_time_text_halfup(str(r.from_time))
         th, tm, ts = parse_time_text_halfup(str(r.to_time))
         from_dt = dt_from_end_day_and_time(str(r.end_day), fh, fm, fs)
@@ -597,9 +634,6 @@ def fetch_increment_mes_fail(engine: Engine, w: Window, state: State) -> int:
         from_int = int(from_dt.timestamp())
         to_int = int(to_dt.timestamp())
 
-        # (from,to] end-second: from_int+1 .. to_int
-        # window: win_a .. win_b
-        # 겹치지 않으면 완전 skip
         if to_int < win_a or (from_int + 1) > win_b:
             state.seen_pk_fail.add(pk)
             if pk > max_pk:
@@ -628,12 +662,12 @@ def fetch_increment_mes_fail(engine: Engine, w: Window, state: State) -> int:
             max_pk = pk
 
     state.last_pk_fail = max_pk
-    log_info(f"[FETCH] mes_fail applied={applied} new_last_pk={state.last_pk_fail}")
+    log_info(f"[FETCH] mes_fail applied={applied} new_last_pk={state.last_pk_fail}", engine)
     return applied
 
 def bootstrap_mes_fail2(engine: Engine, w: Window, state: State) -> None:
     days = mes_fail2_days_for_window(w)
-    log_info(f"[BOOTSTRAP] mes_fail2_wasted_time days={days} range={w.start}~{w.end}")
+    log_info(f"[BOOTSTRAP] mes_fail2_wasted_time days={days} range={w.start}~{w.end}", engine)
 
     sql = text(f"""
         SELECT barcode_information, end_day, end_time, station, final_ct
@@ -667,7 +701,8 @@ def bootstrap_mes_fail2(engine: Engine, w: Window, state: State) -> None:
 
     log_info(
         f"[BOOTSTRAP] mes_fail2 done scanned={len(df)} in_window={len(seen)} "
-        f"last_pk={state.last_pk_fail2} fct_sum={state.fct_rework_sec}"
+        f"last_pk={state.last_pk_fail2} fct_sum={state.fct_rework_sec}",
+        engine
     )
 
 def fetch_increment_mes_fail2(engine: Engine, w: Window, state: State) -> int:
@@ -690,7 +725,7 @@ def fetch_increment_mes_fail2(engine: Engine, w: Window, state: State) -> int:
     if df.empty:
         return 0
 
-    log_info(f"[FETCH] mes_fail2 new_rows={len(df)} from last_pk2={state.last_pk_fail2}")
+    log_info(f"[FETCH] mes_fail2 new_rows={len(df)} from last_pk2={state.last_pk_fail2}", engine)
 
     max_pk = state.last_pk_fail2
     applied = 0
@@ -718,7 +753,8 @@ def fetch_increment_mes_fail2(engine: Engine, w: Window, state: State) -> int:
 
     state.last_pk_fail2 = max_pk
     log_info(
-        f"[FETCH] mes_fail2 applied={applied} add={round_half_up_int(add_total)} new_last_pk2={state.last_pk_fail2}"
+        f"[FETCH] mes_fail2 applied={applied} add={round_half_up_int(add_total)} new_last_pk2={state.last_pk_fail2}",
+        engine
     )
     return applied
 
@@ -756,14 +792,15 @@ def target_table(shift_type: str) -> str:
 # 12) MAIN LOOP
 # =========================
 def main():
-    log_boot("backend8 total MES loss-time daemon starting")
+    log_boot("backend8 total MES loss-time daemon starting", None)
 
     engine = connect_with_retry()
-    log_info(f"DB connected (work_mem={WORK_MEM})")
+    log_info(f"DB connected (work_mem={WORK_MEM})", engine)
 
     ensure_schema(engine)
     ensure_table(engine, T_DAY)
     ensure_table(engine, T_NIGHT)
+    ensure_health_table(engine)  # 안전하게 재확인
 
     state = State()
     vcache = VisionCache()
@@ -775,9 +812,8 @@ def main():
             w = current_window(now)
             key = (w.prod_day, w.shift_type)
 
-            # window 변경 → reset + bootstrap
             if state.window_key != key:
-                log_info(f"[WINDOW] changed => prod_day={w.prod_day} shift={w.shift_type} start={w.start} end=now")
+                log_info(f"[WINDOW] changed => prod_day={w.prod_day} shift={w.shift_type} start={w.start} end=now", engine)
                 reset_for_new_window(state, w)
 
                 refresh_vision_cache_if_needed(engine, w, vcache)
@@ -789,46 +825,48 @@ def main():
                 upsert_daily(engine, target_table(w.shift_type), row)
                 log_info(
                     f"[UPSERT] {SAVE_SCHEMA}.{target_table(w.shift_type)} prod_day={row['prod_day']} "
-                    f"shift={w.shift_type} total={row['Total MES 불량 손실 시간(초)']}"
+                    f"shift={w.shift_type} total={row['Total MES 불량 손실 시간(초)']}",
+                    engine
                 )
 
+                write_health_log(engine, "sleep", f"loop sleep {LOOP_INTERVAL_SEC}s")
                 time_mod.sleep(LOOP_INTERVAL_SEC)
                 continue
 
-            # 월 캐시 갱신(월 바뀐 경우만)
             refresh_vision_cache_if_needed(engine, w, vcache)
 
-            # 증분 fetch & 누적
-            log_info(f"[LAST_PK] fail={state.last_pk_fail} fail2={state.last_pk_fail2}")
+            log_info(f"[LAST_PK] fail={state.last_pk_fail} fail2={state.last_pk_fail2}", engine)
             n1 = fetch_increment_mes_fail(engine, w, state)
             n2 = fetch_increment_mes_fail2(engine, w, state)
 
-            # 운영 편의상 항상 upsert (원하면 n1/n2>0일 때만으로 변경 가능)
             row = build_row_for_upsert(w, state, vcache)
             upsert_daily(engine, target_table(w.shift_type), row)
             log_info(
                 f"[UPSERT] {SAVE_SCHEMA}.{target_table(w.shift_type)} prod_day={row['prod_day']} "
-                f"shift={w.shift_type} new_fail={n1} new_fail2={n2} total={row['Total MES 불량 손실 시간(초)']}"
+                f"shift={w.shift_type} new_fail={n1} new_fail2={n2} total={row['Total MES 불량 손실 시간(초)']}",
+                engine
             )
 
+            write_health_log(engine, "sleep", f"loop sleep {LOOP_INTERVAL_SEC}s")
             time_mod.sleep(LOOP_INTERVAL_SEC)
 
         except (OperationalError, DBAPIError) as e:
-            log_retry(f"DB error: {type(e).__name__}: {e}")
+            log_retry(f"DB error: {type(e).__name__}: {e}", engine)
+            write_health_log(engine, "down", f"db error -> reconnect start: {type(e).__name__}: {e}")
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
             engine = connect_with_retry()
-            log_info("DB reconnected")
+            log_info("DB reconnected", engine)
 
             try:
                 configure_session(engine)
             except Exception as ee:
-                log_retry(f"SET work_mem failed after reconnect: {type(ee).__name__}: {ee}")
+                log_retry(f"SET work_mem failed after reconnect: {type(ee).__name__}: {ee}", engine)
 
-            # 재연결 직후 bootstrap+upsert(요구사항 13)
             try:
                 now2 = datetime.now(KST)
                 w2 = current_window(now2)
-                log_info(f"[RECOVER] bootstrap after reconnect prod_day={w2.prod_day} shift={w2.shift_type}")
+                log_info(f"[RECOVER] bootstrap after reconnect prod_day={w2.prod_day} shift={w2.shift_type}", engine)
 
                 reset_for_new_window(state, w2)
                 refresh_vision_cache_if_needed(engine, w2, vcache)
@@ -839,13 +877,16 @@ def main():
                 upsert_daily(engine, target_table(w2.shift_type), row)
                 log_info(
                     f"[UPSERT] recover {SAVE_SCHEMA}.{target_table(w2.shift_type)} prod_day={row['prod_day']} "
-                    f"shift={w2.shift_type} total={row['Total MES 불량 손실 시간(초)']}"
+                    f"shift={w2.shift_type} total={row['Total MES 불량 손실 시간(초)']}",
+                    engine
                 )
             except Exception as ee:
-                log_retry(f"recover failed: {type(ee).__name__}: {ee}")
+                log_retry(f"recover failed: {type(ee).__name__}: {ee}", engine)
+                write_health_log(engine, "error", f"recover failed: {type(ee).__name__}: {ee}")
 
         except Exception as e:
-            log_retry(f"Unhandled error: {type(e).__name__}: {e}")
+            log_retry(f"Unhandled error: {type(e).__name__}: {e}", engine)
+            write_health_log(engine, "error", f"unhandled: {type(e).__name__}: {e}")
             time_mod.sleep(LOOP_INTERVAL_SEC)
 
 

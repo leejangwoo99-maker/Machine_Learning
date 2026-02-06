@@ -8,6 +8,12 @@ FCT SWAP time monthly criteria daemon
 - In-memory accumulate swap_sec per (month, table)
 - UPSERT to g_production_film.fct_op_criteria ONLY when new data exists
 - Persist state locally to resume from cursor after restart (no full rescan)
+
++ Added DB health log persistence
+  - schema: k_demon_heath_check (auto create)
+  - table : gc_log (auto create)
+  - columns: end_day(yyyymmdd), end_time(hh:mi:ss), info(lowercase), contents
+  - saved in DataFrame column order: end_day, end_time, info, contents
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -34,12 +40,80 @@ from sqlalchemy.exc import SQLAlchemyError
 # =========================
 KST = ZoneInfo("Asia/Seoul")
 
+
 def now_kst() -> datetime:
     return datetime.now(tz=KST)
 
-def log(level: str, msg: str) -> None:
+
+# -------------------------
+# DB Log target
+# -------------------------
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "gc_log"
+
+
+def _format_log_row(level: str, msg: str) -> dict:
+    n = now_kst()
+    info = str(level).strip().lower()  # 반드시 소문자
+    return {
+        "end_day": n.strftime("%Y%m%d"),
+        "end_time": n.strftime("%H:%M:%S"),
+        "info": info,
+        "contents": str(msg),
+    }
+
+
+def print_log(level: str, msg: str) -> None:
     ts = now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [{level}] {msg}", flush=True)
+    print(f"{ts} [{str(level).upper()}] {msg}", flush=True)
+
+
+def ensure_log_table(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LOG_SCHEMA}";'))
+        conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS "{LOG_SCHEMA}"."{LOG_TABLE}" (
+            id bigserial PRIMARY KEY,
+            end_day text NOT NULL,
+            end_time text NOT NULL,
+            info text NOT NULL,
+            contents text,
+            created_at timestamptz NOT NULL DEFAULT now()
+        );
+        """))
+
+
+def save_log_to_db(engine: Optional[Engine], level: str, msg: str) -> None:
+    """
+    요구사항:
+    1) 로그 생성
+    2) end_day: yyyymmdd
+    3) end_time: hh:mi:ss
+    4) info: 소문자
+    5) contents: 나머지 내용
+    6) end_day, end_time, info, contents 순서로 dataframe화 저장
+    7) schema/table 생성 후 저장
+    """
+    if engine is None:
+        return
+
+    try:
+        row = _format_log_row(level, msg)
+        df = pd.DataFrame([row], columns=["end_day", "end_time", "info", "contents"])
+        sql = text(f"""
+        INSERT INTO "{LOG_SCHEMA}"."{LOG_TABLE}" (end_day, end_time, info, contents)
+        VALUES (:end_day, :end_time, :info, :contents)
+        """)
+        with engine.begin() as conn:
+            conn.execute(sql, df.to_dict(orient="records"))
+    except Exception as e:
+        # DB 로그 저장 실패는 콘솔만 남기고 메인 로직 영향 없게 처리
+        print_log("retry", f"log db insert failed: {type(e).__name__}: {e}")
+
+
+def log(level: str, msg: str, engine: Optional[Engine] = None) -> None:
+    print_log(level, msg)
+    save_log_to_db(engine, level, msg)
 
 
 # =========================
@@ -57,9 +131,9 @@ SRC_SCHEMA = "d1_machine_log"
 TABLES_FCT = ["FCT1_machine_log", "FCT2_machine_log", "FCT3_machine_log", "FCT4_machine_log"]
 
 RELEASE = "제품 지그 해제 완료"
-ON      = "제품 안착 완료 ON"
+ON = "제품 안착 완료 ON"
 
-MAX_SEC = 500.0  # delta > 500 제외 (요구)
+MAX_SEC = 500.0  # delta > 500 제외
 SLEEP_SEC = 5
 
 # work_mem: 환경변수 있으면 사용, 없으면 4MB 고정
@@ -67,10 +141,10 @@ WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
 # 저장 대상
 SAVE_SCHEMA = "g_production_film"
-SAVE_TABLE  = "fct_op_criteria"
+SAVE_TABLE = "fct_op_criteria"
 
-# 상태파일 저장 경로(원하면 바꿔)
-STATE_DIR = os.getenv("FCT_OP_STATE_DIR", ".")  # 기본: 현재 폴더
+# 상태파일 저장 경로
+STATE_DIR = os.getenv("FCT_OP_STATE_DIR", ".")
 
 
 # =========================
@@ -89,7 +163,6 @@ def make_engine(cfg: dict) -> Engine:
         pool_recycle=1800,
     )
 
-    # 연결될 때마다 work_mem 세팅 (폭증 방지)
     @event.listens_for(engine, "connect")
     def _on_connect(dbapi_conn, _connection_record):
         cur = dbapi_conn.cursor()
@@ -102,17 +175,18 @@ def make_engine(cfg: dict) -> Engine:
 
 
 def connect_with_retry() -> Engine:
-    log("BOOT", "backend fct_op_criteria daemon starting")
+    print_log("boot", "backend fct_op_criteria daemon starting")
     while True:
         try:
             engine = make_engine(DB_CONFIG)
             with engine.begin() as conn:
-                # connect test + work_mem 확인(옵션)
                 conn.execute(text("SELECT 1;"))
-            log("INFO", f"DB connected (work_mem={WORK_MEM})")
+            # 로그 테이블 보장 후부터 DB 로그도 적재
+            ensure_log_table(engine)
+            log("info", f"DB connected (work_mem={WORK_MEM})", engine)
             return engine
         except Exception as e:
-            log("RETRY", f"DB connect failed: {type(e).__name__}: {e} (retry in {SLEEP_SEC}s)")
+            print_log("retry", f"DB connect failed: {type(e).__name__}: {e} (retry in {SLEEP_SEC}s)")
             time.sleep(SLEEP_SEC)
 
 
@@ -138,9 +212,9 @@ def tukey_five_number(values: List[float]) -> Dict[str, Optional[float]]:
     arr = np.asarray(values, dtype=float)
     arr.sort()
 
-    q1  = float(np.quantile(arr, 0.25, method="linear"))
+    q1 = float(np.quantile(arr, 0.25, method="linear"))
     med = float(np.quantile(arr, 0.50, method="linear"))
-    q3  = float(np.quantile(arr, 0.75, method="linear"))
+    q3 = float(np.quantile(arr, 0.75, method="linear"))
     iqr = q3 - q1
 
     lower_fence = q1 - 1.5 * iqr
@@ -158,9 +232,9 @@ def tukey_five_number(values: List[float]) -> Dict[str, Optional[float]]:
     upper_outlier_max = float(upper_outliers.max()) if upper_outliers.size > 0 else None
 
     lower_w_r = round_half_up(lower_w, 2)
-    q1_r      = round_half_up(q1, 2)
-    med_r     = round_half_up(med, 2)
-    q3_r      = round_half_up(q3, 2)
+    q1_r = round_half_up(q1, 2)
+    med_r = round_half_up(med, 2)
+    q3_r = round_half_up(q3, 2)
     upper_w_r = round_half_up(upper_w, 2)
 
     if upper_outlier_max is not None:
@@ -179,7 +253,7 @@ def tukey_five_number(values: List[float]) -> Dict[str, Optional[float]]:
         "upper_outlier_max": upper_outlier_max_r,
         "upper_outlier_range": upper_range,
     }
-1
+
 
 # =========================
 # 4) STATE (cursor + values) persist locally
@@ -187,13 +261,15 @@ def tukey_five_number(values: List[float]) -> Dict[str, Optional[float]]:
 @dataclass
 class State:
     month: str
-    cursor_ts_iso_by_table: Dict[str, str]            # table -> ISO timestamp (no tz)
-    pending_release_iso_by_table: Dict[str, Optional[str]]  # table -> ISO or None
-    per_table_values: Dict[str, List[float]]          # table -> swap_sec list
-    seen_pk: set[Tuple[str, str, str]]                # (end_day, station, end_time)
+    cursor_ts_iso_by_table: Dict[str, str]                   # table -> ISO timestamp (no tz)
+    pending_release_iso_by_table: Dict[str, Optional[str]]   # table -> ISO or None
+    per_table_values: Dict[str, List[float]]                 # table -> swap_sec list
+    seen_pk: Set[Tuple[str, str, str]]                       # (end_day, station, end_time)
+
 
 def state_path(month: str) -> str:
     return os.path.join(STATE_DIR, f"state_fct_op_criteria_{month}.pkl.gz")
+
 
 def save_state(st: State) -> None:
     p = state_path(st.month)
@@ -203,13 +279,14 @@ def save_state(st: State) -> None:
         "cursor": st.cursor_ts_iso_by_table,
         "pending": st.pending_release_iso_by_table,
         "values": st.per_table_values,
-        "seen_pk": st.seen_pk,  # 재시작 후 중복방지 강화(원하면 끌 수도 있음)
+        "seen_pk": st.seen_pk,
     }
     with gzip.open(tmp, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, p)
 
-def load_state(month: str) -> Optional[State]:
+
+def load_state(month: str, engine: Optional[Engine] = None) -> Optional[State]:
     p = state_path(month)
     if not os.path.exists(p):
         return None
@@ -224,23 +301,20 @@ def load_state(month: str) -> Optional[State]:
             seen_pk=payload.get("seen_pk", set()),
         )
     except Exception as e:
-        log("INFO", f"state load failed (ignore & rebuild): {type(e).__name__}: {e}")
+        log("info", f"state load failed (ignore & rebuild): {type(e).__name__}: {e}", engine)
         return None
 
 
 def month_start_iso(month: str) -> str:
-    # month: YYYYMM -> "YYYY-MM-01 00:00:00"
     y = int(month[:4]); m = int(month[4:6])
     return f"{y:04d}-{m:02d}-01 00:00:00"
 
 
 def iso_to_dt_naive(iso: str) -> datetime:
-    # stored as "YYYY-MM-DD HH:MM:SS" or with microseconds
-    # treat as naive
     return datetime.fromisoformat(iso)
 
+
 def dt_naive_to_iso(dt: datetime) -> str:
-    # store as ISO string without tz
     return dt.isoformat(sep=" ", timespec="seconds")
 
 
@@ -317,10 +391,6 @@ def fetch_new_events(
     month: str,
     last_ts_iso: str
 ) -> pd.DataFrame:
-    """
-    Fetch rows in current month with computed end_ts, filtered by end_ts > last_ts.
-    end_time is HH:MI:SS.xx (2 decimals). We pad to 3ms for to_timestamp safely.
-    """
     fqn = f'"{schema}"."{table}"'
     like = f"{month}%"
 
@@ -368,29 +438,21 @@ def fetch_new_events(
 
 
 # =========================
-# 7) PROCESS (pending_release per table, PK dedup, values accumulate)
+# 7) PROCESS
 # =========================
 def process_table_incremental(
     st: State,
     engine: Engine,
     table: str,
 ) -> Tuple[int, int, str]:
-    """
-    Return: (fetched_rows, added_pairs, new_cursor_iso)
-    - cursor advances to max(end_ts) seen (after dedup filter)
-    """
-    # current cursor
     last_ts_iso = st.cursor_ts_iso_by_table.get(table) or month_start_iso(st.month)
-
-    log("INFO", f"[LAST_PK] month={st.month} table={table} last_ts={last_ts_iso}")
+    log("info", f"[last_pk] month={st.month} table={table} last_ts={last_ts_iso}", engine)
 
     df = fetch_new_events(engine, SRC_SCHEMA, table, st.month, last_ts_iso)
     fetched = int(len(df))
     if fetched == 0:
         return 0, 0, last_ts_iso
 
-    # dedup by PK tuple (end_day, station, end_time)
-    # keep only unseen
     keep_rows = []
     for _, r in df.iterrows():
         pk = (str(r["end_day"]), str(r["station"]), str(r["end_time"]))
@@ -400,17 +462,14 @@ def process_table_incremental(
         keep_rows.append(r)
 
     if not keep_rows:
-        # still advance cursor to avoid refetch storm
         new_cursor = df["end_ts"].max()
         new_cursor_iso = dt_naive_to_iso(pd.to_datetime(new_cursor).to_pydatetime())
         return fetched, 0, new_cursor_iso
 
     df2 = pd.DataFrame(keep_rows)
-    # advance cursor based on kept rows
     new_cursor = df2["end_ts"].max()
     new_cursor_iso = dt_naive_to_iso(pd.to_datetime(new_cursor).to_pydatetime())
 
-    # pending_release per table (keep as ISO string)
     pending_iso = st.pending_release_iso_by_table.get(table)
     pending_dt = iso_to_dt_naive(pending_iso) if pending_iso else None
 
@@ -419,12 +478,10 @@ def process_table_incremental(
 
     for _, r in df2.iterrows():
         c = str(r["contents"])
-        end_ts_dt = pd.to_datetime(r["end_ts"]).to_pydatetime()  # naive
+        end_ts_dt = pd.to_datetime(r["end_ts"]).to_pydatetime()
 
         if c == RELEASE:
-            # 정책: 마지막 release로 덮어씀
             pending_dt = end_ts_dt
-
         elif c == ON:
             if pending_dt is None:
                 continue
@@ -445,18 +502,16 @@ def process_table_incremental(
 
 
 # =========================
-# 8) BUILD SUMMARY DF (current month only)
+# 8) BUILD SUMMARY DF
 # =========================
 def build_df_summary_for_month(st: State) -> pd.DataFrame:
     rows = []
 
-    # per table
     for t in TABLES_FCT:
         vals = st.per_table_values.get(t, [])
         s = tukey_five_number(vals)
         rows.append({"month": st.month, "table": t, "n": len(vals), **s})
 
-    # ALL_FCT
     all_vals: List[float] = []
     for t in TABLES_FCT:
         all_vals.extend(st.per_table_values.get(t, []))
@@ -469,8 +524,7 @@ def build_df_summary_for_month(st: State) -> pd.DataFrame:
         "lower_outlier", "q1", "median", "q3", "upper_outlier",
         "upper_outlier_max", "upper_outlier_range"
     ]
-    df_summary = df_summary[[c for c in cols if c in df_summary.columns]]
-    return df_summary
+    return df_summary[[c for c in cols if c in df_summary.columns]]
 
 
 # =========================
@@ -479,10 +533,11 @@ def build_df_summary_for_month(st: State) -> pd.DataFrame:
 def run() -> None:
     engine = connect_with_retry()
     ensure_schema_table(engine)
+    ensure_log_table(engine)
 
-    # initial month
     month = now_kst().strftime("%Y%m")
-    st0 = load_state(month)
+    st0 = load_state(month, engine)
+
     if st0 is None:
         st = State(
             month=month,
@@ -492,22 +547,20 @@ def run() -> None:
             seen_pk=set(),
         )
         save_state(st)
-        log("INFO", f"[STATE] new state initialized for month={month}")
+        log("info", f"[state] new state initialized for month={month}", engine)
     else:
         st = st0
-        # ensure keys exist
         for t in TABLES_FCT:
             st.pending_release_iso_by_table.setdefault(t, None)
             st.per_table_values.setdefault(t, [])
-        log("INFO", f"[STATE] loaded state for month={month} (seen_pk={len(st.seen_pk)})")
+        log("info", f"[state] loaded state for month={month} (seen_pk={len(st.seen_pk)})", engine)
 
     while True:
         try:
-            # month rollover
             cur_month = now_kst().strftime("%Y%m")
             if cur_month != st.month:
-                log("INFO", f"[WINDOW] month changed {st.month} -> {cur_month} (reset state)")
-                st2 = load_state(cur_month)
+                log("info", f"[window] month changed {st.month} -> {cur_month} (reset state)", engine)
+                st2 = load_state(cur_month, engine)
                 if st2 is None:
                     st = State(
                         month=cur_month,
@@ -517,42 +570,39 @@ def run() -> None:
                         seen_pk=set(),
                     )
                     save_state(st)
-                    log("INFO", f"[STATE] new state initialized for month={cur_month}")
+                    log("info", f"[state] new state initialized for month={cur_month}", engine)
                 else:
                     st = st2
                     for t in TABLES_FCT:
                         st.pending_release_iso_by_table.setdefault(t, None)
                         st.per_table_values.setdefault(t, [])
-                    log("INFO", f"[STATE] loaded state for month={cur_month} (seen_pk={len(st.seen_pk)})")
+                    log("info", f"[state] loaded state for month={cur_month} (seen_pk={len(st.seen_pk)})", engine)
 
-            total_fetch = 0
             total_added_pairs = 0
 
             for t in TABLES_FCT:
                 fetched, added, new_cursor_iso = process_table_incremental(st, engine, t)
-                total_fetch += fetched
                 total_added_pairs += added
-                # advance cursor
                 st.cursor_ts_iso_by_table[t] = new_cursor_iso
                 if fetched > 0:
-                    log("INFO", f"[FETCH] month={st.month} table={t} fetched={fetched} added_pairs={added} cursor={new_cursor_iso}")
+                    log("info", f"[fetch] month={st.month} table={t} fetched={fetched} added_pairs={added} cursor={new_cursor_iso}", engine)
 
-            # 신규 pair가 하나라도 있으면 summary 계산 + upsert + state 저장
             if total_added_pairs > 0:
-                log("INFO", f"[AGG] month={st.month} new_pairs={total_added_pairs} -> build summary & upsert")
+                log("info", f"[agg] month={st.month} new_pairs={total_added_pairs} -> build summary & upsert", engine)
                 df_summary = build_df_summary_for_month(st)
                 upsert_df_summary(engine, df_summary)
                 save_state(st)
-                log("INFO", f"[UPSERT] {SAVE_SCHEMA}.{SAVE_TABLE} updated (month={st.month})")
+                log("info", f"[upsert] {SAVE_SCHEMA}.{SAVE_TABLE} updated (month={st.month})", engine)
             else:
-                # 신규가 없으면 state 저장은 생략(디스크 IO 줄임)
-                pass
+                # 요청 예시에 sleep 로그 포함
+                log("sleep", f"no new pairs. sleep {SLEEP_SEC}s", engine)
 
             time.sleep(SLEEP_SEC)
 
         except SQLAlchemyError as e:
-            # DB 에러: 엔진 재생성 & 재시도
-            log("RETRY", f"DB error: {type(e).__name__}: {e} (reconnect in {SLEEP_SEC}s)")
+            # DB 에러: 콘솔은 즉시 남기고 재접속 후 DB로그 재개
+            print_log("error", f"DB error: {type(e).__name__}: {e}")
+            print_log("down", f"reconnect in {SLEEP_SEC}s")
             time.sleep(SLEEP_SEC)
             try:
                 engine.dispose()
@@ -560,10 +610,12 @@ def run() -> None:
                 pass
             engine = connect_with_retry()
             ensure_schema_table(engine)
+            ensure_log_table(engine)
+            log("info", "db reconnect complete", engine)
 
         except Exception as e:
-            # 기타 에러: 로그 후 계속
-            log("RETRY", f"Unhandled error: {type(e).__name__}: {e} (sleep {SLEEP_SEC}s)")
+            log("error", f"Unhandled error: {type(e).__name__}: {e}", engine)
+            log("sleep", f"sleep {SLEEP_SEC}s after unhandled error", engine)
             time.sleep(SLEEP_SEC)
 
 

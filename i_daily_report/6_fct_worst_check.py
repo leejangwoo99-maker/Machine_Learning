@@ -2,20 +2,35 @@
 """
 backend6_worst_case_daemon.py
 
-[추가 실행 조건 반영]
+[추가 실행 조건 반영 + 안정화 + DB 로그 적재]
 - DB 연결된 상태로 프로그램 상시 대기
 - 매일 08:20:00~08:30:00 실행
 - 매일 20:20:00~20:30:00 실행
-- 그 외 시간은 sleep (다음 실행 구간 시작까지)
+- 그 외 시간은 sleep (다음 실행 구간 시작까지, 5초 heartbeat)
+- 로그: 콘솔 + 파일 동시 기록
+  고정 경로: C:\\AptivAgent\\_logs\\backend6_worst_case_daemon_YYYYMMDD.log
+
+[DB 로그 사양]
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: "6_log" (없으면 생성)
+- 컬럼:
+  1) end_day  : yyyymmdd
+  2) end_time : hh:mi:ss
+  3) info     : 예) error, down, sleep (소문자)
+  4) contents : 로그 본문
+- 저장 컬럼 순서: end_day, end_time, info, contents
 """
 
 from __future__ import annotations
 
 import os
 import time as time_mod
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, date, time, timedelta
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Set
+from collections import deque
 
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -73,13 +88,74 @@ SAVE_COLS = [
 
 UNIQUE_COLS = ["end_day", "end_time", "barcode_information", "test_contents"]
 
+# =========================
+# DB Log table config
+# =========================
+LOG_DB_SCHEMA = "k_demon_heath_check"
+LOG_DB_TABLE = "6_log"  # 반드시 쿼리에서 "6_log"로 quote 처리
+
+LOG_DB_COLS = ["end_day", "end_time", "info", "contents"]  # 순서 고정
+LOG_BUFFER_MAX = 10000  # 메모리 큐 상한
 
 # =========================
-# Logging
+# Fixed log path
 # =========================
-def log(level: str, msg: str) -> None:
-    ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [{level}] {msg}", flush=True)
+LOG_DIR = Path(r"C:\AptivAgent\_logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================
+# In-memory DB log buffer
+# =========================
+DB_LOG_BUFFER = deque(maxlen=LOG_BUFFER_MAX)
+
+
+def _mk_db_log_row(now_kst: datetime, level: str, msg: str) -> Dict[str, str]:
+    return {
+        "end_day": now_kst.strftime("%Y%m%d"),
+        "end_time": now_kst.strftime("%H:%M:%S"),
+        "info": str(level).lower(),
+        "contents": str(msg),
+    }
+
+
+def _enqueue_db_log(level: str, msg: str) -> None:
+    now_kst = datetime.now(KST)
+    row = _mk_db_log_row(now_kst, level, msg)
+    DB_LOG_BUFFER.append(row)
+
+
+# =========================
+# Logging (console + file + queue for DB)
+# =========================
+def _log_file_path(now_kst: datetime) -> Path:
+    return LOG_DIR / f"backend6_worst_case_daemon_{now_kst.strftime('%Y%m%d')}.log"
+
+
+def log(level: str, msg: str, exc: Optional[BaseException] = None) -> None:
+    now_kst = datetime.now(KST)
+    ts = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+    level_lc = str(level).lower()
+    line = f"{ts} [{level_lc}] {msg}"
+
+    # console
+    print(line, flush=True)
+
+    # file
+    try:
+        fp = _log_file_path(now_kst)
+        with fp.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            if exc is not None:
+                f.write(traceback.format_exc() + "\n")
+    except Exception:
+        # 파일 기록 실패해도 메인 루프는 유지
+        pass
+
+    # DB queue
+    _enqueue_db_log(level_lc, msg)
+    if exc is not None:
+        _enqueue_db_log("error", traceback.format_exc())
 
 
 # =========================
@@ -104,17 +180,19 @@ def _next_run_start(now_kst: datetime) -> datetime:
     for st in starts:
         if st > now_kst:
             return st
-    # tomorrow
     d1 = d0 + timedelta(days=1)
     return datetime.combine(d1, RUN_WINDOWS[0][0], tzinfo=KST)
 
 
-def _sleep_until_next_run(now_kst: datetime) -> None:
-    nxt = _next_run_start(now_kst)
-    sec = (nxt - now_kst).total_seconds()
-    sec = max(1.0, sec)
-    log("INFO", f"[SLEEP] outside run window. next_start={nxt} (sleep {int(sec)}s)")
-    time_mod.sleep(sec)
+def _sleep_until_next_run_with_heartbeat() -> None:
+    while True:
+        now_kst = datetime.now(KST)
+        if _in_run_window(now_kst):
+            return
+        nxt = _next_run_start(now_kst)
+        sec = max(1, int((nxt - now_kst).total_seconds()))
+        log("sleep", f"[SLEEP] outside run window. next_start={nxt} remain={sec}s")
+        time_mod.sleep(min(5, sec))
 
 
 # =========================
@@ -188,16 +266,18 @@ def configure_session(conn: Connection) -> None:
 
 
 def connect_with_retry() -> Engine:
-    log("BOOT", "backend6 worst-case daemon starting")
+    log("boot", "backend6 worst-case daemon starting")
     while True:
         try:
             eng = make_engine()
             with eng.connect() as conn:
                 configure_session(conn)
-            log("INFO", f"DB connected (work_mem={WORK_MEM})")
+                ensure_log_table(conn)     # DB 로그 테이블 먼저 보장
+                flush_db_logs(conn)        # 접속 복구 시 버퍼 플러시
+            log("info", f"DB connected (work_mem={WORK_MEM})")
             return eng
         except Exception as e:
-            log("RETRY", f"DB connect failed: {type(e).__name__}: {e}")
+            log("down", f"DB connect failed: {type(e).__name__}: {e}", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -224,9 +304,47 @@ def ensure_save_objects(conn: Connection, schema: str, table: str) -> None:
     conn.execute(text(ddl))
 
 
+def ensure_log_table(conn: Connection) -> None:
+    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {LOG_DB_SCHEMA};"))
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {LOG_DB_SCHEMA}."{LOG_DB_TABLE}" (
+      end_day  text,
+      end_time text,
+      info     text,
+      contents text
+    );
+    """
+    conn.execute(text(ddl))
+
+
+def flush_db_logs(conn: Connection) -> int:
+    if not DB_LOG_BUFFER:
+        return 0
+
+    # 버퍼 스냅샷
+    rows = list(DB_LOG_BUFFER)
+
+    # 사양: end_day, end_time, info, contents 순서 dataframe화
+    df = pd.DataFrame(rows, columns=LOG_DB_COLS)
+    if df.empty:
+        return 0
+
+    sql = text(f"""
+        INSERT INTO {LOG_DB_SCHEMA}."{LOG_DB_TABLE}" (end_day, end_time, info, contents)
+        VALUES (:end_day, :end_time, :info, :contents)
+    """)
+
+    payload = df.to_dict(orient="records")
+    conn.execute(sql, payload)
+
+    # 성공 시 버퍼 비우기
+    DB_LOG_BUFFER.clear()
+    return len(payload)
+
+
 @dataclass
 class LastPK:
-    end_ts: datetime
+    end_ts: datetime           # naive datetime (KST 기준)
     barcode: str
     test_contents: str
     end_day: str
@@ -347,8 +465,7 @@ def fetch_rows_incremental(
     last_pk: Optional[LastPK],
     lookback_sec: int,
 ) -> List[Dict]:
-    now_kst = datetime.now(KST)
-    updated_at = now_kst  # timestamptz (KST aware)
+    updated_at = datetime.now(KST)  # timestamptz (aware)
 
     window_end_naive = ctx.end_dt.replace(tzinfo=None)
 
@@ -418,9 +535,13 @@ def upsert_rows(conn: Connection, ctx: WindowCtx, rows: List[Dict]) -> int:
         if c == "updated_at":
             set_parts.append(f'"{c}" = EXCLUDED."{c}"')
         elif c in ("pn", "remark"):
-            set_parts.append(f'"{c}" = COALESCE({SAVE_SCHEMA}.{ctx.dest_table}."{c}", EXCLUDED."{c}")')
+            set_parts.append(
+                f'"{c}" = COALESCE({SAVE_SCHEMA}.{ctx.dest_table}."{c}", EXCLUDED."{c}")'
+            )
         else:
-            set_parts.append(f'"{c}" = COALESCE(EXCLUDED."{c}", {SAVE_SCHEMA}.{ctx.dest_table}."{c}")')
+            set_parts.append(
+                f'"{c}" = COALESCE(EXCLUDED."{c}", {SAVE_SCHEMA}.{ctx.dest_table}."{c}")'
+            )
 
     set_sql = ",\n  ".join(set_parts)
 
@@ -447,18 +568,31 @@ def make_seen_key(r: Dict) -> Tuple[str, str, str, str]:
     return (end_day, end_time_norm, barcode, testc)
 
 
+def _parse_end_day_to_ymd(end_day_val: str) -> Tuple[int, int, int]:
+    s = str(end_day_val).strip()
+    # YYYY-MM-DD
+    if "-" in s:
+        y, m, d = map(int, s.split("-"))
+        return y, m, d
+    # YYYYMMDD
+    if len(s) == 8 and s.isdigit():
+        return int(s[0:4]), int(s[4:6]), int(s[6:8])
+    raise ValueError(f"Unsupported end_day format: {s}")
+
+
 def update_last_pk_from_rows(rows: List[Dict]) -> Optional[LastPK]:
     if not rows:
         return None
+
     last = rows[-1]
-    end_day_str = str(last["end_day"])
-    end_time_norm = str(last["end_time"])
+    end_day_str = str(last["end_day"]).strip()
+    end_time_norm = str(last["end_time"]).strip()
     barcode = str(last["barcode_information"])
     testc = str(last["test_contents"])
 
-    y, m, d = map(int, end_day_str.split("-"))
+    y, m, d = _parse_end_day_to_ymd(end_day_str)
     hh, mm, ss = map(int, end_time_norm.split(":"))
-    end_ts = datetime(y, m, d, hh, mm, ss)
+    end_ts = datetime(y, m, d, hh, mm, ss)  # naive
 
     return LastPK(
         end_ts=end_ts,
@@ -481,18 +615,20 @@ def run() -> None:
     seen_pk: Set[Tuple[str, str, str, str]] = set()
     last_pk: Optional[LastPK] = None
 
+    log("info", f"[CFG] RUN_WINDOWS={RUN_WINDOWS}, LOOP={LOOP_INTERVAL_SEC}s, LOOKBACK={LOOKBACK_SEC}s")
+    log("info", f"[CFG] SRC={SRC_SCHEMA}.{T_PD}/{T_NPD}, MAP={MAP_SCHEMA}.{MAP_TABLE}, DST={SAVE_SCHEMA}.{T_SAVE_DAY}/{T_SAVE_NIGHT}")
+    log("info", f"[CFG] LOG_DIR={LOG_DIR}")
+    log("info", f"[CFG] DB_LOG_TABLE={LOG_DB_SCHEMA}.\"{LOG_DB_TABLE}\"")
+
     while True:
         now_kst = datetime.now(KST)
 
-        # ====== 스케줄: 실행 구간이 아니면 다음 시작까지 sleep ======
+        # ====== 스케줄: 실행 구간이 아니면 다음 시작까지 대기 ======
         if not _in_run_window(now_kst):
-            _sleep_until_next_run(now_kst)
-            # sleep에서 깨어나면 즉시 다음 loop로 (바로 처리 시작)
+            _sleep_until_next_run_with_heartbeat()
             continue
 
         loop_t0 = time_mod.time()
-
-        # 실행 구간 안에서는 "현재 시각이 속한 window" 1개만 처리
         cur_ctx = current_window_ctx(now_kst)
 
         # initialize active on first run-in-window
@@ -501,34 +637,41 @@ def run() -> None:
             pending_ctx = None
             seen_pk.clear()
             last_pk = None
-            log("INFO", f"[WINDOW] init => {active_ctx.prod_day}:{active_ctx.shift_type}")
+            log("info", f"[WINDOW] init => {active_ctx.prod_day}:{active_ctx.shift_type}")
 
-        # window change detection (within run windows too)
+        # window change detection
         if (cur_ctx.prod_day != active_ctx.prod_day) or (cur_ctx.shift_type != active_ctx.shift_type):
             if pending_ctx is None:
                 pending_ctx = cur_ctx
-                log("INFO", f"[WINDOW] change detected => pending {pending_ctx.prod_day}:{pending_ctx.shift_type} "
-                            f"(active={active_ctx.prod_day}:{active_ctx.shift_type})")
+                log("info",
+                    f"[WINDOW] change detected => pending {pending_ctx.prod_day}:{pending_ctx.shift_type} "
+                    f"(active={active_ctx.prod_day}:{active_ctx.shift_type})")
 
         try:
             with engine.begin() as conn:
                 configure_session(conn)
+                ensure_log_table(conn)
+                flush_db_logs(conn)  # 주기적으로 flush
+
                 ensure_save_objects(conn, SAVE_SCHEMA, active_ctx.dest_table)
 
                 # warm-start last_pk per active window
                 if last_pk is None:
-                    log("INFO", f"[LAST_PK] reading dest ({SAVE_SCHEMA}.{active_ctx.dest_table}) "
-                                f"prod_day={active_ctx.prod_day} shift={active_ctx.shift_type}")
+                    log("info",
+                        f"[LAST_PK] read dest={SAVE_SCHEMA}.{active_ctx.dest_table} "
+                        f"prod_day={active_ctx.prod_day} shift={active_ctx.shift_type}")
                     last_pk = read_last_pk(conn, active_ctx)
                     if last_pk:
-                        log("INFO", f"[LAST_PK] found end_ts={last_pk.end_ts} barcode={last_pk.barcode} "
-                                    f"test_contents={last_pk.test_contents}")
+                        log("info",
+                            f"[LAST_PK] found end_ts={last_pk.end_ts} "
+                            f"barcode={last_pk.barcode} test_contents={last_pk.test_contents}")
                     else:
-                        log("INFO", "[LAST_PK] none")
+                        log("info", "[LAST_PK] none")
 
                 # fetch incremental
-                log("INFO", f"[FETCH] prod_day={active_ctx.prod_day} shift={active_ctx.shift_type} "
-                            f"window={active_ctx.start_dt}~{active_ctx.end_dt} lookback={LOOKBACK_SEC}s")
+                log("info",
+                    f"[FETCH] prod_day={active_ctx.prod_day} shift={active_ctx.shift_type} "
+                    f"window={active_ctx.start_dt}~{active_ctx.end_dt} lookback={LOOKBACK_SEC}s")
                 rows = fetch_rows_incremental(conn, active_ctx, last_pk, LOOKBACK_SEC)
 
                 # seen_pk filter
@@ -543,40 +686,44 @@ def run() -> None:
                             r[c] = None
                     new_rows.append({c: r[c] for c in SAVE_COLS})
 
-                log("INFO", f"[FETCH] got={len(rows)} new_after_seen={len(new_rows)}")
+                log("info", f"[FETCH] got={len(rows)} new_after_seen={len(new_rows)}")
 
                 # upsert
                 if new_rows:
                     n = upsert_rows(conn, active_ctx, new_rows)
-                    log("INFO", f"[UPSERT] table={SAVE_SCHEMA}.{active_ctx.dest_table} rows={n}")
+                    log("info", f"[UPSERT] table={SAVE_SCHEMA}.{active_ctx.dest_table} rows={n}")
 
                     new_last = update_last_pk_from_rows(new_rows)
                     if new_last:
                         last_pk = new_last
-                        log("INFO", f"[LAST_PK] advanced => end_ts={last_pk.end_ts} "
-                                    f"barcode={last_pk.barcode} test_contents={last_pk.test_contents}")
+                        log("info",
+                            f"[LAST_PK] advanced end_ts={last_pk.end_ts} "
+                            f"barcode={last_pk.barcode} test_contents={last_pk.test_contents}")
 
                 # switch finalize: "이전 shift 미처리분 마저 처리 후 전환"
                 if pending_ctx is not None:
                     grace_end = active_ctx.end_dt + timedelta(seconds=SWITCH_GRACE_SEC)
-                    # now는 active window end + lookback 이후이고, 더 이상 new가 없으면 스위치
                     if now_kst > grace_end and len(new_rows) == 0:
-                        log("INFO", f"[WINDOW] switching => {pending_ctx.prod_day}:{pending_ctx.shift_type}")
+                        log("info", f"[WINDOW] switching => {pending_ctx.prod_day}:{pending_ctx.shift_type}")
                         active_ctx = pending_ctx
                         pending_ctx = None
                         seen_pk.clear()
                         last_pk = None
 
+                # 루프 말미 한 번 더 flush (현재 루프 로그 반영)
+                flush_db_logs(conn)
+
         except (OperationalError, DBAPIError) as e:
-            log("RETRY", f"DB error: {type(e).__name__}: {e} (reconnect)")
+            log("down", f"DB error: {type(e).__name__}: {e} (reconnect)", e)
             try:
                 engine.dispose()
             except Exception:
                 pass
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = connect_with_retry()
+
         except Exception as e:
-            log("RETRY", f"Unhandled error: {type(e).__name__}: {e}")
+            log("error", f"Unhandled error: {type(e).__name__}: {e}", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
         # loop pacing (run window 안에서만 5초)

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.engine import Engine
 
 from app.core.db import make_engine
+from app.core.event_bus import event_bus
 from app.services import report_svc
 
 router = APIRouter(prefix="/report", tags=["11.reports_i_daily_report"])
+KST = timezone(timedelta(hours=9))
 
 
 def get_engine() -> Engine:
@@ -57,8 +61,6 @@ def b_station_percentage(prod_day: str, shift_type: str, engine: Engine = Depend
         day_table="b_station_day_daily_percentage",
         night_table="b_station_night_daily_percentage",
         prod_day_col="prod_day",
-        # 필요 시 updated_at 제외하려면 아래 주석 해제
-        # exclude_cols=["updated_at"],
     )
 
 
@@ -212,7 +214,7 @@ def e_mastersample_test(prod_day: str, shift_type: str, engine: Engine = Depends
     )
 
 
-# ✅ [추가] 총 계획 정지 시간
+# 총 계획 정지 시간
 @router.get("/i_planned_stop_time/{prod_day}", response_model=list[dict])
 def i_planned_stop_time(prod_day: str, shift_type: str, engine: Engine = Depends(get_engine)):
     return report_svc.fetch_report_rows_by_shift(
@@ -220,14 +222,14 @@ def i_planned_stop_time(prod_day: str, shift_type: str, engine: Engine = Depends
         day_table="i_planned_stop_time_day_daily",
         night_table="i_planned_stop_time_night_daily",
         prod_day_col="prod_day",
-        exclude_cols=["updated_at", "total_planned_time"],  # total_planned_time 컬럼 제외
+        exclude_cols=["updated_at", "total_planned_time"],
     )
 
 
-# ✅ [추가] 총 비가동 시간
+# 총 비가동 시간
 @router.get("/i_non_time/{prod_day}", response_model=list[dict])
-def i_non_time(prod_day: str, shift_type: str, engine: Engine = Depends(get_engine)):
-    return report_svc.fetch_report_rows_by_shift(
+async def i_non_time(prod_day: str, shift_type: str, engine: Engine = Depends(get_engine)):
+    rows = report_svc.fetch_report_rows_by_shift(
         engine, prod_day, shift_type,
         day_table="i_non_time_day_daily",
         night_table="i_non_time_night_daily",
@@ -240,4 +242,15 @@ def i_non_time(prod_day: str, shift_type: str, engine: Engine = Depends(get_engi
         ],
     )
 
+    # 대시보드 실시간 반영용 이벤트
+    await event_bus.publish(
+        "report_i_non_time_event",
+        {
+            "prod_day": prod_day,
+            "shift_type": shift_type,
+            "rows": len(rows),
+            "ts_kst": datetime.now(KST).isoformat(),
+        },
+    )
 
+    return rows

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-d4_afa_fail_wasted_time_factory.py  (Warm-start Backfill 포함)
+d4_afa_fail_wasted_time_factory.py  (Warm-start Backfill 포함 + DB Health Log)
 
 AFA FAIL wasted time (NG -> ON) 실시간 계산/저장
 - MP=1, 5초 루프
@@ -13,14 +13,18 @@ AFA FAIL wasted time (NG -> ON) 실시간 계산/저장
   night : [D] 20:30:00 ~ [D+1] 08:29:59
 - save PK/UNIQUE: (end_day, station, from_time, to_time)
 - 증분 fetch는 cursor(end_ts) 기반
-- ✅ Warm-start Backfill:
+- Warm-start Backfill:
   - 프로그램 시작 직후, 그리고 shift/window가 바뀔 때마다
     현재 window(ws ~ now) 구간을 station별로 한번 "전체 스캔"하여 누락분을 채움
   - 이후 루프에서는 기존처럼 last_pk 기반 증분 처리
 
 로그:
-- 실행 즉시 [BOOT]
-- 단계별 INFO: LAST_PK / BACKFILL / FETCH / PAIR / INS
+- 콘솔 + 파일 동시 기록
+- 파일 경로: C:\\AptivAgent\\d4_afa_fail_wasted_time_factory.log
+- 추가 DB 로그 저장:
+  schema: k_demon_heath_check (없으면 생성)
+  table : d4_log (없으면 생성)
+  columns: end_day, end_time, info, contents
 """
 
 from __future__ import annotations
@@ -32,12 +36,11 @@ import unicodedata
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
-
 from zoneinfo import ZoneInfo
 
 # =========================
@@ -67,11 +70,19 @@ SRC_TABLES = [
 
 SAVE_TABLE = "afa_fail_wasted_time"
 
-# 타겟 문구(이거만 NG 인정)
-NG_PHRASE = "제품 감지 NG"
-OFF_PHRASE = "제품 검사 투입요구 ON"
-MANUAL_PHRASE = "Manual mode 전환"
-AUTO_PHRASE = "Auto mode 전환"
+# 데몬 헬스 로그 테이블
+HEALTH_SCHEMA = "k_demon_heath_check"
+HEALTH_TABLE = "d4_log"
+
+# 타겟 문구(소문자 기준 비교)
+NG_PHRASE = "제품 감지 ng"
+OFF_PHRASE = "제품 검사 투입요구 on"
+MANUAL_PHRASE = "manual mode 전환"
+AUTO_PHRASE = "auto mode 전환"
+
+# DB 저장용 표기(원문 형식)
+NG_PHRASE_RAW = "제품 감지 NG"
+OFF_PHRASE_RAW = "제품 검사 투입요구 ON"
 
 # Loop / Retry
 LOOP_INTERVAL_SEC = 5
@@ -89,29 +100,109 @@ PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
 PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
+# 로그 파일
+LOG_DIR = r"C:\AptivAgent"
+LOG_FILE = os.path.join(LOG_DIR, "d4_afa_fail_wasted_time_factory.log")
+
 _ENGINE = None
 
 
 # =========================
-# 1) 로깅
+# 1) 로깅 (콘솔 + 파일 + DB)
 # =========================
+def _ensure_log_dir() -> None:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _to_health_row(level: str, msg: str, now_kst: datetime) -> Dict[str, str]:
+    """
+    level -> info(소문자) 매핑
+    예: ERROR/RETRY/INFO/BOOT -> error/retry/info/boot
+    """
+    info = (level or "").strip().lower()
+    if not info:
+        info = "info"
+    return {
+        "end_day": now_kst.strftime("%Y%m%d"),      # yyyymmdd
+        "end_time": now_kst.strftime("%H:%M:%S"),   # hh:mi:ss
+        "info": info,                               # 반드시 소문자
+        "contents": str(msg),
+    }
+
+
+def _db_log_try(rows: List[Dict[str, str]]) -> None:
+    """
+    DB 로그는 best-effort로만 저장.
+    - 절대 블로킹 재시도하지 않음
+    - DB 불가 시 조용히 스킵 (파일/콘솔 로그는 계속)
+    """
+    global _ENGINE
+    if _ENGINE is None or not rows:
+        return
+
+    ins = text(f"""
+        INSERT INTO {HEALTH_SCHEMA}.{HEALTH_TABLE}
+        (end_day, end_time, info, contents)
+        VALUES (:end_day, :end_time, :info, :contents)
+    """)
+    try:
+        with _ENGINE.begin() as conn:
+            conn.execute(ins, rows)
+    except Exception:
+        # health log insert 실패는 무시 (무한루프 방지)
+        pass
+
+
+def _write_log(level: str, msg: str) -> None:
+    now_kst = datetime.now(tz=KST)
+    ts = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [{level}] {msg}"
+
+    # console
+    print(line, flush=True)
+
+    # file
+    try:
+        _ensure_log_dir()
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+    # db (best-effort)
+    row = _to_health_row(level, msg, now_kst)
+    # 요구사항 6: end_day, end_time, info, contents 순서로 dataframe화 후 저장
+    try:
+        df = pd.DataFrame([row], columns=["end_day", "end_time", "info", "contents"])
+        _db_log_try(df.to_dict("records"))
+    except Exception:
+        pass
+
+
 def log_boot(msg: str) -> None:
-    print(f"[BOOT] {msg}", flush=True)
+    _write_log("BOOT", msg)
+
 
 def log_info(msg: str) -> None:
-    print(f"[INFO] {msg}", flush=True)
+    _write_log("INFO", msg)
+
 
 def log_retry(msg: str) -> None:
-    print(f"[RETRY] {msg}", flush=True)
+    _write_log("RETRY", msg)
+
 
 def log_error(msg: str) -> None:
-    print(f"[ERROR] {msg}", flush=True)
+    _write_log("ERROR", msg)
 
 
 # =========================
 # 2) 텍스트 정규화/매칭
 # =========================
-_ZWSP_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")  # zero-width chars
+_ZWSP_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+
 
 def norm_text(s: object) -> str:
     if s is None:
@@ -121,16 +212,20 @@ def norm_text(s: object) -> str:
     t = _ZWSP_RE.sub("", t)
     t = t.replace("\r", " ").replace("\n", " ").replace("\t", " ")
     t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return t.lower()
+
 
 def is_ng(c: str) -> bool:
     return NG_PHRASE in c  # 오로지 이 문구 포함만 NG
 
+
 def is_off(c: str) -> bool:
     return OFF_PHRASE in c
 
+
 def is_manual(c: str) -> bool:
     return MANUAL_PHRASE in c
+
 
 def is_auto(c: str) -> bool:
     return AUTO_PHRASE in c
@@ -174,6 +269,7 @@ def _masked_db() -> str:
     c = DB_CONFIG
     return f"postgresql://{c['user']}:***@{c['host']}:{c['port']}/{c['dbname']}"
 
+
 def _is_connection_error(e: Exception) -> bool:
     if isinstance(e, OperationalError):
         return True
@@ -196,6 +292,7 @@ def _is_connection_error(e: Exception) -> bool:
     ]
     return any(k in msg for k in keys)
 
+
 def _dispose_engine():
     global _ENGINE
     try:
@@ -204,6 +301,7 @@ def _dispose_engine():
     except Exception:
         pass
     _ENGINE = None
+
 
 def _build_engine():
     user = DB_CONFIG["user"]
@@ -231,6 +329,7 @@ def _build_engine():
         },
     )
 
+
 def get_engine_blocking():
     global _ENGINE
 
@@ -242,7 +341,7 @@ def get_engine_blocking():
                     conn.execute(text("SELECT 1"))
                 return _ENGINE
             except Exception as e:
-                log_retry(f"DB ping failed -> rebuild | {type(e).__name__}: {repr(e)}")
+                log_retry(f"db ping failed -> rebuild | {type(e).__name__}: {repr(e)}")
                 _dispose_engine()
                 time.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -252,16 +351,16 @@ def get_engine_blocking():
             with _ENGINE.connect() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
-            log_info(f"DB connected | {_masked_db()} | pool_size=1 max_overflow=0 work_mem={WORK_MEM}")
+            log_info(f"db connected | {_masked_db()} | pool_size=1 max_overflow=0 work_mem={WORK_MEM}")
             return _ENGINE
         except Exception as e:
-            log_retry(f"DB connect failed | {type(e).__name__}: {repr(e)}")
+            log_retry(f"db connect failed | {type(e).__name__}: {repr(e)}")
             _dispose_engine()
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
 # =========================
-# 5) 결과 테이블/UNIQUE 보장 (PK: 4컬럼)
+# 5) 결과 테이블/UNIQUE 보장
 # =========================
 def init_save_table_blocking(engine):
     ddl_create = text(f"""
@@ -289,7 +388,7 @@ def init_save_table_blocking(engine):
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(ddl_create)
                 conn.execute(ddl_unique)
-            log_info("bootstrap OK: save table + UNIQUE INDEX(end_day,station,from_time,to_time) ensured")
+            log_info("bootstrap ok: save table + unique index(end_day,station,from_time,to_time) ensured")
             return
         except Exception as e:
             if _is_connection_error(e):
@@ -298,6 +397,41 @@ def init_save_table_blocking(engine):
                 engine = get_engine_blocking()
             else:
                 log_retry(f"init_save_table failed | {type(e).__name__}: {repr(e)}")
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def init_health_log_table_blocking(engine):
+    """
+    요구사항:
+    - schema: k_demon_heath_check (없으면 생성)
+    - table : d4_log (없으면 생성)
+    - columns: end_day, end_time, info, contents
+    """
+    ddl = text(f"""
+    CREATE SCHEMA IF NOT EXISTS {HEALTH_SCHEMA};
+
+    CREATE TABLE IF NOT EXISTS {HEALTH_SCHEMA}.{HEALTH_TABLE} (
+        end_day   TEXT,
+        end_time  TEXT,
+        info      TEXT,
+        contents  TEXT,
+        created_at TIMESTAMP DEFAULT now()
+    );
+    """)
+    while True:
+        try:
+            with engine.begin() as conn:
+                conn.execute(ddl)
+            # 여기서는 _write_log를 부르지 않음(초기화 중 재귀 방지)
+            print(f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [INFO] health log table ensured: {HEALTH_SCHEMA}.{HEALTH_TABLE}", flush=True)
+            return
+        except Exception as e:
+            if _is_connection_error(e):
+                print(f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log conn error -> rebuild | {type(e).__name__}: {repr(e)}", flush=True)
+                _dispose_engine()
+                engine = get_engine_blocking()
+            else:
+                print(f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log failed | {type(e).__name__}: {repr(e)}", flush=True)
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -344,9 +478,6 @@ def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
 
 # =========================
 # 7) 로그 fetch
-#     - 시간 범위(ws~we) + cursor 이후
-#     - 이벤트 후보만 가져옴(ILike)
-#     - source PK(end_day,end_time,contents) dedup
 # =========================
 def fetch_src_logs(engine, table: str, station: str, ws: datetime, we: datetime, cursor_ts: datetime,
                    overlap_sec: int = CURSOR_OVERLAP_SEC) -> pd.DataFrame:
@@ -423,6 +554,7 @@ class StationState:
     in_manual: bool = False
     pending_ng_ts: Optional[datetime] = None
 
+
 def pair_events(df: pd.DataFrame, state: StationState) -> Tuple[pd.DataFrame, StationState]:
     rows = []
 
@@ -430,16 +562,22 @@ def pair_events(df: pd.DataFrame, state: StationState) -> Tuple[pd.DataFrame, St
         c = r["contents_norm"]
         ts: datetime = r["end_ts"]
 
+        log_info(f"[evt ] {r['station']} {ts.astimezone(KST):%Y-%m-%d %H:%M:%S} | {r['contents']}")
+
         if is_manual(c):
             state.in_manual = True
+            log_info(f"[stat] {r['station']} -> in_manual=y")
             continue
+
         if is_auto(c):
             state.in_manual = False
+            log_info(f"[stat] {r['station']} -> in_manual=n")
             continue
 
         if is_ng(c):
             if (not state.in_manual) and (state.pending_ng_ts is None):
                 state.pending_ng_ts = ts
+                log_info(f"[stat] {r['station']} pending_ng_ts={ts.astimezone(KST):%H:%M:%S}")
             continue
 
         if is_off(c):
@@ -451,12 +589,17 @@ def pair_events(df: pd.DataFrame, state: StationState) -> Tuple[pd.DataFrame, St
                 rows.append({
                     "end_day": end_day,
                     "station": r["station"],
-                    "from_contents": NG_PHRASE,
+                    "from_contents": NG_PHRASE_RAW,
                     "from_time": from_ts.astimezone(KST).strftime("%H:%M:%S.%f")[:-4],
-                    "to_contents": OFF_PHRASE,
+                    "to_contents": OFF_PHRASE_RAW,
                     "to_time": to_ts.astimezone(KST).strftime("%H:%M:%S.%f")[:-4],
                     "wasted_time": round(abs((to_ts - from_ts).total_seconds()), 2),
                 })
+
+                log_info(
+                    f"[pair] {r['station']} {from_ts.astimezone(KST):%H:%M:%S} -> "
+                    f"{to_ts.astimezone(KST):%H:%M:%S} = {round(abs((to_ts - from_ts).total_seconds()), 2)}s"
+                )
                 state.pending_ng_ts = None
 
     out = pd.DataFrame(rows, columns=[
@@ -466,7 +609,7 @@ def pair_events(df: pd.DataFrame, state: StationState) -> Tuple[pd.DataFrame, St
 
 
 # =========================
-# 9) INSERT (PK/UNIQUE: 4컬럼)
+# 9) INSERT
 # =========================
 def insert_rows(engine, df_pairs: pd.DataFrame) -> int:
     if df_pairs.empty:
@@ -504,13 +647,7 @@ def insert_rows(engine, df_pairs: pd.DataFrame) -> int:
 # 10) Warm-start Backfill
 # =========================
 def run_backfill_for_window(engine, ws: datetime, we: datetime, states: Dict[str, StationState]) -> None:
-    """
-    현재 window(ws~we) 구간을 station별로 한번 전체 스캔(backfill)
-    - cursor를 ws로 강제
-    - overlap=0(전체스캔은 굳이 overlap 필요 없음)
-    - dedup은 DB PK/UNIQUE로 처리(ON CONFLICT DO NOTHING)
-    """
-    log_info(f"[BACKFILL] start window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S}")
+    log_info(f"[backfill] start window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S}")
 
     total_fetched = 0
     total_pairs = 0
@@ -520,7 +657,7 @@ def run_backfill_for_window(engine, ws: datetime, we: datetime, states: Dict[str
         df = fetch_src_logs(engine, table, station, ws, we, cursor_ts=ws, overlap_sec=0)
         fetched = len(df)
         total_fetched += fetched
-        log_info(f"[BACKFILL][FETCH] {station} cursor=ws -> rows={fetched}")
+        log_info(f"[backfill][fetch] {station} cursor=ws -> rows={fetched}")
 
         if fetched == 0:
             continue
@@ -528,27 +665,37 @@ def run_backfill_for_window(engine, ws: datetime, we: datetime, states: Dict[str
         pairs, states[station] = pair_events(df, states[station])
         pcount = len(pairs)
         total_pairs += pcount
-        log_info(f"[BACKFILL][PAIR ] {station} pairs={pcount} (pending_ng={'Y' if states[station].pending_ng_ts else 'N'}, in_manual={'Y' if states[station].in_manual else 'N'})")
+        log_info(f"[backfill][pair ] {station} pairs={pcount} (pending_ng={'y' if states[station].pending_ng_ts else 'n'}, in_manual={'y' if states[station].in_manual else 'n'})")
 
         ins = insert_rows(engine, pairs) if pcount > 0 else 0
         total_ins += ins
-        log_info(f"[BACKFILL][INS  ] {station} attempted_insert={ins} (dedup by PK/UNIQUE)")
+        log_info(f"[backfill][ins  ] {station} attempted_insert={ins} (dedup by pk/unique)")
 
-    log_info(f"[BACKFILL] done | fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_ins}")
+    log_info(f"[backfill] done | fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_ins}")
 
 
 # =========================
 # 11) main
 # =========================
 def main():
-    log_boot("backend afa_fail_wasted_time realtime starting (MP=1, loop=5s, warm-start backfill=ON)")
-    log_info(f"DB = {_masked_db()}")
+    _ensure_log_dir()
+
+    # 부팅 초기 로그 (DB 없어도 남겨야 하므로 먼저 파일/콘솔)
+    log_boot("backend afa_fail_wasted_time realtime starting (mp=1, loop=5s, warm-start backfill=on)")
+    log_info(f"log_file = {LOG_FILE}")
+    log_info(f"db = {_masked_db()}")
     log_info(f"work_mem cap = {WORK_MEM}")
-    log_info(f"SRC = {SCHEMA}.FCT1~4_machine_log | PK(end_day,end_time,contents) assumed")
-    log_info(f"SAVE = {SCHEMA}.{SAVE_TABLE} | PK/UNIQUE(end_day,station,from_time,to_time)")
-    log_info(f"CURSOR_OVERLAP_SEC = {CURSOR_OVERLAP_SEC}")
+    log_info(f"src = {SCHEMA}.FCT1~4_machine_log | pk(end_day,end_time,contents) assumed")
+    log_info(f"save = {SCHEMA}.{SAVE_TABLE} | pk/unique(end_day,station,from_time,to_time)")
+    log_info(f"cursor_overlap_sec = {CURSOR_OVERLAP_SEC}")
 
     engine = get_engine_blocking()
+
+    # health log 테이블 먼저 보장 (이후부터 로그들이 db 적재됨)
+    init_health_log_table_blocking(engine)
+    log_info(f"health log target = {HEALTH_SCHEMA}.{HEALTH_TABLE} (end_day,end_time,info,contents)")
+
+    # 결과 저장 테이블 보장
     init_save_table_blocking(engine)
 
     states: Dict[str, StationState] = {st: StationState() for _, st in SRC_TABLES}
@@ -564,18 +711,22 @@ def main():
         try:
             engine = get_engine_blocking()
 
-            # ✅ (A) Warm-start Backfill: 시작/shift 변경 시 ws~now 범위 전체 스캔
+            # 시작/shift 변경 시 ws~now 범위 전체 스캔
             backfill_key = (shift, ws)
             if last_backfill_key != backfill_key:
-                # shift/window 전환 시 state도 "현재 window에 맞게" 리셋(이전 window pending 영향 제거)
                 states = {st: StationState() for _, st in SRC_TABLES}
                 run_backfill_for_window(engine, ws, we, states)
                 last_backfill_key = backfill_key
 
             # 1) 마지막 PK 읽기
             last_to_ts = read_last_pk_per_station(engine)
-            last_pk_str = ", ".join([f"{k}={(v.strftime('%Y-%m-%d %H:%M:%S') if v else 'None')}" for k, v in last_to_ts.items()])
-            log_info(f"[LAST_PK] shift={shift} prod_day={prod_day} window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S} | {last_pk_str}")
+            last_pk_str = ", ".join(
+                [f"{k}={(v.strftime('%Y-%m-%d %H:%M:%S') if v else 'None')}" for k, v in last_to_ts.items()]
+            )
+            log_info(
+                f"[last_pk] shift={shift} prod_day={prod_day} "
+                f"window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S} | {last_pk_str}"
+            )
 
             total_fetched = 0
             total_pairs = 0
@@ -590,7 +741,7 @@ def main():
                 df = fetch_src_logs(engine, table, station, ws, we, cursor_base, overlap_sec=CURSOR_OVERLAP_SEC)
                 fetched = len(df)
                 total_fetched += fetched
-                log_info(f"[FETCH] {station} cursor={cursor_base:%Y-%m-%d %H:%M:%S} -> rows={fetched}")
+                log_info(f"[fetch] {station} cursor={cursor_base:%Y-%m-%d %H:%M:%S} -> rows={fetched}")
 
                 if fetched == 0:
                     continue
@@ -598,16 +749,23 @@ def main():
                 pairs, states[station] = pair_events(df, states[station])
                 pcount = len(pairs)
                 total_pairs += pcount
-                log_info(f"[PAIR ] {station} pairs={pcount} (pending_ng={'Y' if states[station].pending_ng_ts else 'N'}, in_manual={'Y' if states[station].in_manual else 'N'})")
+                log_info(
+                    f"[pair ] {station} pairs={pcount} "
+                    f"(pending_ng={'y' if states[station].pending_ng_ts else 'n'}, "
+                    f"in_manual={'y' if states[station].in_manual else 'n'})"
+                )
 
                 attempted = insert_rows(engine, pairs) if pcount > 0 else 0
                 total_attempted += attempted
-                log_info(f"[INS  ] {station} attempted_insert={attempted} (dedup by PK/UNIQUE)")
+                log_info(f"[ins  ] {station} attempted_insert={attempted} (dedup by pk/unique)")
 
-            log_info(f"[LOOP ] shift={shift} prod_day={prod_day} | fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_attempted}")
+            log_info(
+                f"[loop ] shift={shift} prod_day={prod_day} "
+                f"| fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_attempted}"
+            )
 
         except KeyboardInterrupt:
-            log_info("KeyboardInterrupt -> exit")
+            log_info("keyboardinterrupt -> exit")
             break
         except Exception as e:
             if _is_connection_error(e):
@@ -621,6 +779,7 @@ def main():
         elapsed = time.perf_counter() - loop_t0
         sleep_sec = LOOP_INTERVAL_SEC - elapsed
         if sleep_sec > 0:
+            log_info(f"sleep {sleep_sec:.3f}s")
             time.sleep(sleep_sec)
 
 

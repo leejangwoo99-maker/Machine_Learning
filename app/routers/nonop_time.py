@@ -47,7 +47,7 @@ async def post_nonop(body: NonOpUpsertIn, engine: Engine = Depends(get_engine)):
     try:
         out, key = nonop_time_svc.upsert_nonop(engine, body)
 
-        # 즉시 앱 내부 이벤트 발행 (트리거 대기 없음)
+        # 즉시 앱 내부 이벤트 발행
         await event_bus.publish(
             "non_operation_time_event",
             {
@@ -55,6 +55,8 @@ async def post_nonop(body: NonOpUpsertIn, engine: Engine = Depends(get_engine)):
                 "station": key.station,
                 "from_time": key.from_time,
                 "to_time": key.to_time,
+                "reason": body.reason,
+                "sparepart": body.sparepart,
                 "ts_kst": datetime.now(KST).isoformat(),
             },
         )

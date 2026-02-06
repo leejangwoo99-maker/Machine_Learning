@@ -27,7 +27,7 @@ async def stream_events(request: Request):
     async def gen():
         q = await event_bus.subscribe()
         try:
-            # connected 이벤트
+            # 연결 확인 이벤트
             connected_payload = {"ok": True, "ts_kst": datetime.now(KST).isoformat()}
             yield f"event: connected\ndata: {json.dumps(connected_payload, ensure_ascii=False)}\n\n"
 
@@ -41,9 +41,17 @@ async def stream_events(request: Request):
                     data = item["data"]
                     yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    # keepalive
+                    # keepalive comment
                     yield ": keepalive\n\n"
         finally:
             await event_bus.unsubscribe(q)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

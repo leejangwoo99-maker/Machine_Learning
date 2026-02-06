@@ -28,6 +28,13 @@ FCT FAIL Step 반복(1회/2회 반복/3회 이상 반복) 집계 데몬
 추가 반영(사용자 확정):
 - ✅ 중복 방지 캐시 seen_pk(set) 추가
 - ✅ DB 컬럼 타입은 TEXT 유지(updated_at만 timestamptz)
+
+추가 반영(이번 요청):
+- ✅ 데몬 동작 로그를 DB에 저장
+- ✅ 스키마: k_demon_heath_check (없으면 생성)
+- ✅ 테이블: "3_log" (없으면 생성)
+- ✅ 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- ✅ 저장 순서: end_day, end_time, info, contents
 """
 
 from __future__ import annotations
@@ -90,19 +97,112 @@ COL_2 = "2회 반복_FAIL_step_description"
 COL_3 = "3회 이상 반복_FAIL_step_description"
 
 # =========================
-# Logging
+# Health-Log Table (NEW)
 # =========================
+HEALTH_SCHEMA = "k_demon_heath_check"
+HEALTH_TABLE = "3_log"  # 숫자 시작 테이블명 -> 반드시 쌍따옴표 사용
+
+# 현재 연결된 엔진(로그 DB 저장용)
+_ACTIVE_ENGINE: Optional[Engine] = None
+
+
+# =========================
+# Logging (console + DB)
+# =========================
+def _ts_kst() -> datetime:
+    return datetime.now(KST)
+
+
+def _fmt_now() -> str:
+    return _ts_kst().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_health_log_table(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {HEALTH_SCHEMA};"))
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {HEALTH_SCHEMA}."{HEALTH_TABLE}" (
+                    end_day  text,
+                    end_time text,
+                    info     text,
+                    contents text
+                );
+                """
+            )
+        )
+
+
+def _insert_health_log(engine: Engine, info: str, contents: str) -> None:
+    """
+    end_day, end_time, info, contents 순서로 DataFrame화하여 저장
+    """
+    now = _ts_kst()
+    row = {
+        "end_day": now.strftime("%Y%m%d"),
+        "end_time": now.strftime("%H:%M:%S"),
+        "info": (info or "").lower(),
+        "contents": str(contents),
+    }
+    df = pd.DataFrame([row], columns=["end_day", "end_time", "info", "contents"])
+
+    sql = text(
+        f"""
+        INSERT INTO {HEALTH_SCHEMA}."{HEALTH_TABLE}"
+        (end_day, end_time, info, contents)
+        VALUES (:end_day, :end_time, :info, :contents)
+        """
+    )
+
+    with engine.begin() as conn:
+        conn.execute(sql, df.to_dict(orient="records"))
+
+
+def _emit(level_tag: str, info: str, msg: str, persist: bool = True) -> None:
+    """
+    level_tag: 콘솔 표기용 [BOOT]/[INFO]/[RETRY]/[WARN]
+    info     : DB 저장용 소문자 코드 (error/down/sleep/info/warn/...).
+    """
+    print(f"{_fmt_now()} [{level_tag}] {msg}", flush=True)
+
+    if not persist:
+        return
+
+    global _ACTIVE_ENGINE
+    if _ACTIVE_ENGINE is None:
+        return
+
+    try:
+        _insert_health_log(_ACTIVE_ENGINE, info=info.lower(), contents=msg)
+    except Exception as e:
+        # 로그 저장 실패로 본 데몬 로직 영향 주지 않음(재귀 방지)
+        print(f"{_fmt_now()} [WARN] health-log insert failed: {type(e).__name__}: {e}", flush=True)
+
+
 def log_boot(msg: str) -> None:
-    print(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} [BOOT] {msg}", flush=True)
+    _emit("BOOT", "boot", msg, persist=True)
+
 
 def log_info(msg: str) -> None:
-    print(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} [INFO] {msg}", flush=True)
+    _emit("INFO", "info", msg, persist=True)
+
 
 def log_retry(msg: str) -> None:
-    print(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} [RETRY] {msg}", flush=True)
+    _emit("RETRY", "down", msg, persist=True)
+
 
 def log_warn(msg: str) -> None:
-    print(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} [WARN] {msg}", flush=True)
+    _emit("WARN", "warn", msg, persist=True)
+
+
+def log_sleep(msg: str) -> None:
+    _emit("INFO", "sleep", msg, persist=True)
+
+
+def log_error(msg: str) -> None:
+    _emit("WARN", "error", msg, persist=True)
+
 
 # =========================
 # Engine / Session
@@ -122,9 +222,11 @@ def make_engine() -> Engine:
         pool_recycle=1800,
     )
 
+
 def ensure_db_ready(engine: Engine) -> None:
     with engine.begin() as conn:
         conn.execute(text(f"SET work_mem = '{WORK_MEM}'"))
+
 
 # =========================
 # Window 계산
@@ -136,14 +238,18 @@ class Window:
     start_dt: datetime
     now_dt: datetime   # 현재 시각(윈도우 end = now)
 
+
 def yyyymmdd(d: date) -> str:
     return d.strftime("%Y%m%d")
+
 
 def parse_yyyymmdd(s: str) -> date:
     return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
 
+
 def now_kst() -> datetime:
     return datetime.now(KST)
+
 
 def get_window(now: datetime) -> Window:
     """
@@ -155,7 +261,7 @@ def get_window(now: datetime) -> Window:
     tn = dtime(t.hour, t.minute, t.second)
 
     day_start = dtime(8, 30, 0)
-    day_end   = dtime(20, 29, 59)
+    day_end = dtime(20, 29, 59)
     night_start = dtime(20, 30, 0)
 
     if day_start <= tn <= day_end:
@@ -172,8 +278,10 @@ def get_window(now: datetime) -> Window:
         start_dt = datetime(prod_date.year, prod_date.month, prod_date.day, 20, 30, 0, tzinfo=KST)
         return Window(prod_day=prod, shift="night", start_dt=start_dt, now_dt=now)
 
+
 def time_norm(dt: datetime) -> str:
     return dt.strftime("%H%M%S")
+
 
 def build_segments(w: Window) -> List[Tuple[str, str, str]]:
     """
@@ -198,6 +306,7 @@ def build_segments(w: Window) -> List[Tuple[str, str, str]]:
                 (next_day, "000000", time_norm(seg_end)),
             ]
 
+
 # =========================
 # SQL (FAIL row fetch)
 # =========================
@@ -210,6 +319,7 @@ def build_where_segments(segments: List[Tuple[str, str, str]]) -> Tuple[str, Dic
         params[f"s{i}"] = s
         params[f"e{i}"] = e
     return " OR ".join(parts), params
+
 
 def fetch_fail_rows(
     engine: Engine,
@@ -224,9 +334,8 @@ def fetch_fail_rows(
     segments = build_segments(w)
     seg_sql, seg_params = build_where_segments(segments)
 
-    # ✅ 증분 조건은 (end_day, end_time, barcode_information) 기준으로 적용
-    # 다만 "동일 triple" 내에 추가 row(step이 다르거나 late-arrival)가 있을 수 있으므로
-    # >= 로 가져오고, 실제 반영은 seen_pk로 중복 제거한다.
+    # ✅ 증분 조건: (end_day, end_time, barcode_information)
+    # 동일 triple 내 late-arrival 고려하여 >= fetch 후 seen_pk dedup
     inc_sql = ""
     inc_params: Dict[str, str] = {}
     if last_pk is not None:
@@ -265,11 +374,13 @@ def fetch_fail_rows(
 
     return df
 
+
 # =========================
 # In-memory aggregation (+ seen_pk dedup)
 # =========================
-PairKey = Tuple[str, str, str]  # (pn, barcode_information, step_description)
-SeenKey = Tuple[str, str, str, str]  # (end_day, end_time_norm, barcode_information, step_description)
+PairKey = Tuple[str, str, str]      # (pn, barcode_information, step_description)
+SeenKey = Tuple[str, str, str, str] # (end_day, end_time_norm, barcode_information, step_description)
+
 
 def apply_new_rows(pair_counts: Dict[PairKey, int], seen_pk: Set[SeenKey], df_new: pd.DataFrame) -> int:
     """
@@ -297,13 +408,14 @@ def apply_new_rows(pair_counts: Dict[PairKey, int], seen_pk: Set[SeenKey], df_ne
 
     return applied
 
+
 def summarize_bucket_dfs(prod_day: str, shift: str, pair_counts: Dict[PairKey, int]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     bucket별 DF 생성:
-    - count = (barcode, step) 조합 개수 (사용자 요구)
+    - count = (barcode, step) 조합 개수
     - group by: (prod_day, shift_type, pn, step_description)
     """
-    b1: Dict[Tuple[str, str], int] = {}  # (pn, step) -> count(조합개수)
+    b1: Dict[Tuple[str, str], int] = {}  # (pn, step) -> count
     b2: Dict[Tuple[str, str], int] = {}
     b3: Dict[Tuple[str, str], int] = {}
 
@@ -337,12 +449,14 @@ def summarize_bucket_dfs(prod_day: str, shift: str, pair_counts: Dict[PairKey, i
 
     return (to_df(b1, COL_1), to_df(b2, COL_2), to_df(b3, COL_3))
 
+
 # =========================
 # Save (schema/table/upsert)  [TEXT 유지]
 # =========================
 def ensure_schema(engine: Engine, schema: str) -> None:
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema};"))
+
 
 def ensure_table(engine: Engine, schema: str, table: str, columns: List[str], key_cols: List[str]) -> None:
     ddl_cols = []
@@ -363,6 +477,7 @@ def ensure_table(engine: Engine, schema: str, table: str, columns: List[str], ke
     with engine.begin() as conn:
         conn.execute(text(create_sql))
 
+
 def normalize_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return df
@@ -374,12 +489,14 @@ def normalize_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
     out = out.where(pd.notnull(out), None)
     return out
 
+
 def key_cols_for(df: pd.DataFrame) -> List[str]:
     step_cols = [c for c in df.columns if str(c).endswith("step_description")]
     if not step_cols:
         raise RuntimeError(f"step_description 컬럼을 찾을 수 없음: {list(df.columns)}")
     step_col = step_cols[0]
     return ["prod_day", "shift_type", "pn", step_col]
+
 
 def upsert_df(engine: Engine, schema: str, table: str, df: pd.DataFrame, key_cols: List[str]) -> None:
     if df is None or df.empty:
@@ -408,14 +525,13 @@ def upsert_df(engine: Engine, schema: str, table: str, df: pd.DataFrame, key_col
     """
 
     recs_raw = df.to_dict(orient="records")
-    records = []
-    for r in recs_raw:
-        records.append({k: r[c] for c, k in zip(cols, pkeys)})
+    records = [{k: r[c] for c, k in zip(cols, pkeys)} for r in recs_raw]
 
     with engine.begin() as conn:
         conn.execute(text(sql), records)
 
     log_info(f"[UPSERT] {len(df)} rows -> {schema}.{table}")
+
 
 def save_bucket_tables(engine: Engine, w: Window, df1: pd.DataFrame, df2: pd.DataFrame, df3: pd.DataFrame) -> None:
     ensure_schema(engine, SAVE_SCHEMA)
@@ -432,6 +548,7 @@ def save_bucket_tables(engine: Engine, w: Window, df1: pd.DataFrame, df2: pd.Dat
         keys = key_cols_for(df)
         ensure_table(engine, SAVE_SCHEMA, table, list(df.columns), keys)
         upsert_df(engine, SAVE_SCHEMA, table, df, keys)
+
 
 # =========================
 # Bootstrap / Loop
@@ -463,7 +580,10 @@ def bootstrap(engine: Engine, w: Window) -> Tuple[Dict[PairKey, int], Set[SeenKe
 
     return pair_counts, seen_pk, last_pk
 
+
 def main() -> None:
+    global _ACTIVE_ENGINE
+
     log_boot("backend3 fail-step repeat daemon starting")
 
     engine = make_engine()
@@ -472,10 +592,21 @@ def main() -> None:
     while True:
         try:
             ensure_db_ready(engine)
+
+            # health-log 테이블 보장
+            ensure_health_log_table(engine)
+
+            # 연결 성공 후부터 DB 로그 저장 활성화
+            _ACTIVE_ENGINE = engine
+
             log_info(f"DB connected (work_mem={WORK_MEM})")
+            log_info(f'health log ready -> {HEALTH_SCHEMA}."{HEALTH_TABLE}"')
             break
         except Exception as e:
+            # 연결 전이므로 콘솔은 반드시 출력, DB 저장은 불가
+            _ACTIVE_ENGINE = None
             log_retry(f"DB connect failed: {type(e).__name__}: {e}")
+            log_sleep(f"sleep {DB_RETRY_INTERVAL_SEC}s before reconnect")
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
     current_window: Optional[Window] = None
@@ -490,11 +621,14 @@ def main() -> None:
             pair_counts, seen_pk, last_pk = bootstrap(engine, current_window)
             break
         except (OperationalError, DBAPIError) as e:
+            _ACTIVE_ENGINE = None
             log_retry(f"bootstrap DB error: {type(e).__name__}: {e}")
+            log_sleep(f"sleep {DB_RETRY_INTERVAL_SEC}s before reconnect")
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
             engine = make_engine()
         except Exception as e:
-            log_retry(f"bootstrap unhandled: {type(e).__name__}: {e}")
+            log_error(f"bootstrap unhandled: {type(e).__name__}: {e}")
+            log_sleep(f"sleep {DB_RETRY_INTERVAL_SEC}s and retry bootstrap")
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
     # main loop
@@ -518,7 +652,7 @@ def main() -> None:
                     applied = apply_new_rows(pair_counts, seen_pk, df_new)
                     log_info(f"[FETCH] applied_rows(after_dedup)={applied}")
 
-                    # last_pk 갱신은 "가져온 DF 기준"으로 한다 (>= fetch이므로 안전)
+                    # last_pk 갱신은 "가져온 DF 기준"
                     tail = df_new.iloc[-1]
                     last_pk = (str(tail["end_day"]), str(tail["end_time_norm"]), str(tail["barcode_information"]))
                     log_info(f"[LAST_PK] updated last_pk={last_pk}")
@@ -533,27 +667,40 @@ def main() -> None:
                     log_info("[AGG] no new rows -> skip upsert")
 
         except (OperationalError, DBAPIError) as e:
+            _ACTIVE_ENGINE = None
             log_retry(f"DB error: {type(e).__name__}: {e}")
+
             # 재연결 무한 재시도 + bootstrap으로 정상화
             while True:
                 try:
+                    log_sleep(f"sleep {DB_RETRY_INTERVAL_SEC}s before reconnect")
                     time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
                     engine = make_engine()
                     ensure_db_ready(engine)
+                    ensure_health_log_table(engine)
+
+                    _ACTIVE_ENGINE = engine
                     log_info("DB reconnected")
+
                     current_window = get_window(now_kst())
                     pair_counts, seen_pk, last_pk = bootstrap(engine, current_window)
                     break
                 except Exception as e2:
+                    _ACTIVE_ENGINE = None
                     log_retry(f"reconnect failed: {type(e2).__name__}: {e2}")
                     continue
 
         except Exception as e:
-            log_warn(f"Unhandled error: {type(e).__name__}: {e}")
+            log_error(f"Unhandled error: {type(e).__name__}: {e}")
 
         # loop pacing
         elapsed = time_mod.time() - loop_start
-        time_mod.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
+        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+        if sleep_sec > 0:
+            log_sleep(f"loop sleep {sleep_sec:.2f}s")
+            time_mod.sleep(sleep_sec)
+
 
 if __name__ == "__main__":
     main()

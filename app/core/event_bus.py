@@ -20,6 +20,7 @@ class EventBus:
             self._subs.discard(q)
 
     async def publish(self, event_name: str, data: dict[str, Any]) -> None:
+        # lock 구간 최소화
         async with self._lock:
             subs = list(self._subs)
 
@@ -27,8 +28,15 @@ class EventBus:
             try:
                 q.put_nowait({"event": event_name, "data": data})
             except asyncio.QueueFull:
-                # 느린 구독자는 드랍
-                pass
+                # 느린 구독자는 오래된 1개 버리고 최신 이벤트 넣기 시도
+                try:
+                    _ = q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    q.put_nowait({"event": event_name, "data": data})
+                except Exception:
+                    pass
 
 
 event_bus = EventBus()

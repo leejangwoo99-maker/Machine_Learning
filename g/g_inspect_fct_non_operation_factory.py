@@ -29,12 +29,16 @@ Factory Realtime - FCT Non Operation Time Inspector (cursor incremental)
 - work_mem 폭증 방지: 세션 단위 SET work_mem 적용 (+옵션 statement_timeout)
 - 콘솔: 매 루프 시작/종료 시간 출력, EXE 실행 시 콘솔 자동 종료 방지
 
-주의
-- end_time 포맷은 "%H:%M:%S" 또는 "%H:%M:%S.%f" 를 모두 허용
+추가(로그 DB 저장)
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: gf_log (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- 저장 시 컬럼 순서: end_day, end_time, info, contents
 """
 
 import os
 import sys
+import re
 import time as time_mod
 import socket
 import traceback
@@ -94,12 +98,44 @@ STATEMENT_TIMEOUT_MS = None  # 예: 60000 (1분). 미사용이면 None
 # ✅ 임계값 기준 시간대: KST
 KST = ZoneInfo("Asia/Seoul")
 
+# =========================
+# 0-1) 로그 DB 설정
+# =========================
+LOG_DB_SCHEMA = "k_demon_heath_check"
+LOG_DB_TABLE = "gf_log"
+DB_LOG_ENGINE = None
+_DB_LOG_GUARD = False  # 재귀 방지
 
-# =========================
-# 0-1) DIAG + FILE LOG (EXE 꺼짐 방지용)
-# =========================
-def _now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+INFO_ALLOW = {"info", "error", "down", "sleep", "warn", "boot", "run", "done", "load", "save", "skip", "evt", "cursor", "recover", "retry", "exit", "fatal", "diag", "socket", "ping", "db"}
+
+def _infer_info(msg: str) -> str:
+    """
+    msg prefix에서 info 추론. 반드시 소문자 반환.
+    예) [ERROR] -> error, [RETRY] -> retry
+    """
+    if not msg:
+        return "info"
+    m = re.match(r"^\[([A-Za-z0-9_ -]+)\]", str(msg).strip())
+    if m:
+        tag = m.group(1).strip().lower().replace(" ", "_")
+        # 대표 매핑
+        if tag in ("err", "error", "fatal"):
+            return "error" if tag != "fatal" else "fatal"
+        if tag in ("warning",):
+            return "warn"
+        if tag in INFO_ALLOW:
+            return tag
+        # 허용 외 태그는 info로 표준화
+        return "info"
+    # 키워드 기반 보정
+    low = str(msg).lower()
+    if "sleep" in low:
+        return "sleep"
+    if "down" in low:
+        return "down"
+    if "error" in low or "exception" in low:
+        return "error"
+    return "info"
 
 def _default_log_path():
     try:
@@ -110,7 +146,73 @@ def _default_log_path():
 
 LOG_PATH = _default_log_path()
 
-def log(msg: str):
+
+def _ensure_log_table(engine):
+    ddl = text(f"""
+    CREATE SCHEMA IF NOT EXISTS {LOG_DB_SCHEMA};
+    CREATE TABLE IF NOT EXISTS {LOG_DB_SCHEMA}.{LOG_DB_TABLE} (
+        end_day   TEXT NOT NULL,
+        end_time  TEXT NOT NULL,
+        info      TEXT NOT NULL,
+        contents  TEXT NOT NULL
+    );
+    """)
+    with engine.begin() as conn:
+        _session_guard(conn)
+        conn.execute(ddl)
+
+
+def _save_log_to_db(msg: str, info: str = None):
+    """
+    6) end_day, end_time, info, contents 순서 dataframe화 후 저장
+    """
+    global _DB_LOG_GUARD, DB_LOG_ENGINE
+
+    if DB_LOG_ENGINE is None:
+        return
+    if _DB_LOG_GUARD:
+        return
+
+    try:
+        _DB_LOG_GUARD = True
+        dt = datetime.now()
+        info_val = (info or _infer_info(msg) or "info").strip().lower()
+        if not info_val:
+            info_val = "info"
+
+        df = pd.DataFrame(
+            [{
+                "end_day": dt.strftime("%Y%m%d"),
+                "end_time": dt.strftime("%H:%M:%S"),
+                "info": info_val,
+                "contents": str(msg),
+            }],
+            columns=["end_day", "end_time", "info", "contents"]  # ✅ 컬럼 순서 고정
+        )
+
+        ins = text(f"""
+            INSERT INTO {LOG_DB_SCHEMA}.{LOG_DB_TABLE}
+            (end_day, end_time, info, contents)
+            VALUES (:end_day, :end_time, :info, :contents)
+        """)
+
+        rows = df.to_dict(orient="records")
+        with DB_LOG_ENGINE.begin() as conn:
+            _session_guard(conn)
+            conn.execute(ins, rows)
+
+    except Exception:
+        # DB 로그 실패는 콘솔/파일만 유지 (재귀 방지)
+        pass
+    finally:
+        _DB_LOG_GUARD = False
+
+
+def _now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg: str, info: str = None):
     s = "[{0}] {1}".format(_now_str(), msg)
     print(s, flush=True)
     try:
@@ -119,12 +221,17 @@ def log(msg: str):
     except Exception:
         pass
 
+    # DB 저장 (요청 반영)
+    _save_log_to_db(msg=msg, info=info)
+
+
 def hold_console(exit_code: int = 0):
-    log("[HOLD] press Enter to exit (exit_code={0})".format(exit_code))
+    log("[HOLD] press Enter to exit (exit_code={0})".format(exit_code), info="info")
     try:
         input()
     except Exception:
         time_mod.sleep(999999)
+
 
 def run_cmd(cmd):
     try:
@@ -133,26 +240,29 @@ def run_cmd(cmd):
     except Exception as e:
         return -1, "", "{0}: {1}".format(type(e).__name__, e)
 
+
 def safe_ping(host: str):
     rc, out, err = run_cmd(["ping", "-n", "1", "-w", "1000", host])
-    log("[PING] host={0} rc={1}".format(host, rc))
+    log("[PING] host={0} rc={1}".format(host, rc), info="ping")
     if out:
-        log("[PING-OUT] {0}".format(out[:500]))
+        log("[PING-OUT] {0}".format(out[:500]), info="ping")
     if err:
-        log("[PING-ERR] {0}".format(err[:500]))
+        log("[PING-ERR] {0}".format(err[:500]), info="ping")
     return rc == 0
+
 
 def socket_port_check(host: str, port: int, timeout_sec: float = 3.0):
     t0 = time_mod.time()
     try:
         with socket.create_connection((host, port), timeout=timeout_sec):
             dt = time_mod.time() - t0
-            log("[SOCKET] {0}:{1} OK ({2:.2f}s)".format(host, port, dt))
+            log("[SOCKET] {0}:{1} OK ({2:.2f}s)".format(host, port, dt), info="socket")
             return True
     except Exception as e:
         dt = time_mod.time() - t0
-        log("[SOCKET] {0}:{1} FAIL ({2:.2f}s) err={3}: {4}".format(host, port, dt, type(e).__name__, e))
+        log("[SOCKET] {0}:{1} FAIL ({2:.2f}s) err={3}: {4}".format(host, port, dt, type(e).__name__, e), info="down")
         return False
+
 
 def psycopg2_quick_test(host, port, dbname, user, password, timeout_sec=5):
     try:
@@ -167,11 +277,12 @@ def psycopg2_quick_test(host, port, dbname, user, password, timeout_sec=5):
         cur.execute("SELECT 1;")
         r = cur.fetchone()
         conn.close()
-        log("[PSYCOPG2] OK result={0} ({1:.2f}s)".format(r, time_mod.time() - t0))
+        log("[PSYCOPG2] OK result={0} ({1:.2f}s)".format(r, time_mod.time() - t0), info="diag")
         return True
     except Exception as e:
-        log("[PSYCOPG2] FAIL err={0}: {1}".format(type(e).__name__, e))
+        log("[PSYCOPG2] FAIL err={0}: {1}".format(type(e).__name__, e), info="error")
         return False
+
 
 def sqlalchemy_quick_test(db_url: str, timeout_sec=5):
     try:
@@ -192,11 +303,12 @@ def sqlalchemy_quick_test(db_url: str, timeout_sec=5):
         )
         with eng.connect() as conn:
             r = conn.execute(_text("SELECT 1")).scalar()
-        log("[SQLA] OK result={0} ({1:.2f}s)".format(r, time_mod.time() - t0))
+        log("[SQLA] OK result={0} ({1:.2f}s)".format(r, time_mod.time() - t0), info="diag")
         return True
     except Exception as e:
-        log("[SQLA] FAIL err={0}: {1}".format(type(e).__name__, e))
+        log("[SQLA] FAIL err={0}: {1}".format(type(e).__name__, e), info="error")
         return False
+
 
 def build_db_url(cfg):
     pw = urllib.parse.quote_plus(cfg["password"])
@@ -204,26 +316,28 @@ def build_db_url(cfg):
         u=cfg["user"], p=pw, h=cfg["host"], pt=cfg["port"], d=cfg["dbname"]
     )
 
+
 def print_env_header():
-    log("=" * 110)
-    log("[START] DIAG HEADER")
-    log("frozen={0} | exe={1}".format(getattr(sys, "frozen", False), sys.executable))
-    log("cwd={0}".format(os.getcwd()))
+    log("=" * 110, info="boot")
+    log("[START] DIAG HEADER", info="boot")
+    log("frozen={0} | exe={1}".format(getattr(sys, "frozen", False), sys.executable), info="boot")
+    log("cwd={0}".format(os.getcwd()), info="boot")
     try:
-        log("hostname={0}".format(socket.gethostname()))
+        log("hostname={0}".format(socket.gethostname()), info="boot")
     except Exception:
         pass
     try:
         rc, out, err = run_cmd(["whoami"])
-        log("whoami rc={0} out={1} err={2}".format(rc, out, err))
+        log("whoami rc={0} out={1} err={2}".format(rc, out, err), info="boot")
     except Exception:
         pass
-    log("log_file={0}".format(LOG_PATH))
+    log("log_file={0}".format(LOG_PATH), info="boot")
     safe_url = build_db_url(DB_CONFIG).replace(urllib.parse.quote_plus(DB_CONFIG["password"]), "***")
-    log("[DB] host={0} port={1} db={2} user={3}".format(DB_CONFIG["host"], DB_CONFIG["port"], DB_CONFIG["dbname"], DB_CONFIG["user"]))
-    log("[DB_URL] {0}".format(safe_url))
-    log("work_mem={0} statement_timeout_ms={1}".format(WORK_MEM, STATEMENT_TIMEOUT_MS))
-    log("=" * 110)
+    log("[DB] host={0} port={1} db={2} user={3}".format(DB_CONFIG["host"], DB_CONFIG["port"], DB_CONFIG["dbname"], DB_CONFIG["user"]), info="db")
+    log("[DB_URL] {0}".format(safe_url), info="db")
+    log("work_mem={0} statement_timeout_ms={1}".format(WORK_MEM, STATEMENT_TIMEOUT_MS), info="db")
+    log("=" * 110, info="boot")
+
 
 def run_diagnostics():
     print_env_header()
@@ -241,23 +355,24 @@ def run_diagnostics():
 def today_yyyymmdd() -> str:
     return datetime.now().strftime("%Y%m%d")
 
+
 def now_ts() -> datetime:
     return datetime.now()
 
+
 def _print_run_banner(tag: str, start_dt: datetime):
-    log("=" * 110)
-    log("[{0}] {1}".format(tag, start_dt.strftime("%Y-%m-%d %H:%M:%S")))
-    log("=" * 110)
+    log("=" * 110, info="run")
+    log("[{0}] {1}".format(tag, start_dt.strftime("%Y-%m-%d %H:%M:%S")), info="run")
+    log("=" * 110, info="run")
+
 
 def _print_end_banner(tag: str, start_dt: datetime, end_dt: datetime):
-    log("-" * 110)
-    log("[{0}] {1} | elapsed={2}".format(tag, end_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt - start_dt))
-    log("-" * 110)
+    log("-" * 110, info="done")
+    log("[{0}] {1} | elapsed={2}".format(tag, end_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt - start_dt), info="done")
+    log("-" * 110, info="done")
+
 
 def parse_ts(end_day: str, end_time: str) -> pd.Timestamp:
-    """
-    end_day(YYYYMMDD) + end_time(HH:MM:SS[.fff]) -> Timestamp
-    """
     d = str(end_day).strip()
     t = str(end_time).strip()
     ts = pd.to_datetime("{0} {1}".format(d, t), format="%Y%m%d %H:%M:%S.%f", errors="coerce")
@@ -270,12 +385,6 @@ def parse_ts(end_day: str, end_time: str) -> pd.Timestamp:
 # 1-1) 엔진/연결: 상시 1개 고정 + 무한 재시도(블로킹)
 # =========================
 def is_db_disconnect_error(e: Exception) -> bool:
-    """
-    ✅ 실행 중간 연결 끊김/네트워크 단절/서버 재시작 등을 최대한 넓게 감지.
-    - OperationalError
-    - DBAPIError(connection_invalidated)
-    - 메시지 기반(일부 환경)
-    """
     if isinstance(e, OperationalError):
         return True
     if isinstance(e, DBAPIError) and getattr(e, "connection_invalidated", False):
@@ -295,11 +404,8 @@ def is_db_disconnect_error(e: Exception) -> bool:
     ]
     return any(h in msg for h in hints)
 
+
 def _make_engine_one_pool():
-    """
-    pool_size=1, max_overflow=0 로 상시 연결 1개 수준으로 제한.
-    work_mem 옵션은 connect_args(options)로 세션 기본값을 낮춤.
-    """
     db_url = build_db_url(DB_CONFIG)
 
     opt = "-c work_mem={0}".format(WORK_MEM)
@@ -314,7 +420,7 @@ def _make_engine_one_pool():
 
     eng = create_engine(
         db_url,
-        pool_pre_ping=True,   # 끊긴 커넥션이면 자동 감지
+        pool_pre_ping=True,
         pool_recycle=300,
         pool_size=1,
         max_overflow=0,
@@ -323,10 +429,8 @@ def _make_engine_one_pool():
     )
     return eng
 
+
 def _session_guard(conn):
-    """
-    work_mem/timeout을 세션에서 한번 더 고정(옵션 무시되는 환경 대비).
-    """
     try:
         conn.execute(text("SET work_mem TO '{0}';".format(WORK_MEM)))
         if STATEMENT_TIMEOUT_MS is not None:
@@ -334,11 +438,8 @@ def _session_guard(conn):
     except Exception:
         pass
 
+
 def init_engine_blocking():
-    """
-    ✅ DB 서버 접속 실패 시 무한 재시도(연결 성공할 때까지 블로킹)
-    - 엔진 생성 후 SELECT 1 및 세션 가드 적용
-    """
     while True:
         eng = None
         try:
@@ -346,60 +447,61 @@ def init_engine_blocking():
             with eng.connect() as conn:
                 _session_guard(conn)
                 conn.execute(text("SELECT 1"))
-            log("[OK] engine connect test passed (single-pool fixed)")
+            log("[OK] engine connect test passed (single-pool fixed)", info="db")
             return eng
         except Exception as e:
-            log("[ERROR] DB connect failed: {0}: {1}".format(type(e).__name__, e))
-            log(traceback.format_exc())
+            log("[ERROR] DB connect failed: {0}: {1}".format(type(e).__name__, e), info="error")
+            log(traceback.format_exc(), info="error")
             try:
                 if eng is not None:
                     eng.dispose()
             except Exception:
                 pass
-            log("[RETRY] sleep {0}s then retry DB connect".format(RETRY_SLEEP_SEC))
+            log("[RETRY] sleep {0}s then retry DB connect".format(RETRY_SLEEP_SEC), info="retry")
             time_mod.sleep(RETRY_SLEEP_SEC)
 
+
 def engine_health_check_blocking(engine):
-    """
-    ✅ 루프 중간/업무 중간에 연결이 끊긴 경우를 빠르게 감지하고,
-    끊겼으면 '연결 성공할 때까지' 블로킹 재접속하도록 유도.
-    """
-    try:
-        with engine.connect() as conn:
-            _session_guard(conn)
-            conn.execute(text("SELECT 1"))
-        return True
-    except Exception as e:
-        if is_db_disconnect_error(e):
-            raise
-        raise
+    with engine.connect() as conn:
+        _session_guard(conn)
+        conn.execute(text("SELECT 1"))
+    return True
+
 
 def recover_engine_and_thresholds_blocking():
-    """
-    ✅ '연결 성공할 때까지' 엔진 재생성 + thresholds 로드도 성공할 때까지 반복.
-    """
+    global DB_LOG_ENGINE
+
     while True:
         engine = init_engine_blocking()
+
+        # 로그 테이블 준비 + DB_LOG_ENGINE 바인딩
+        try:
+            _ensure_log_table(engine)
+            DB_LOG_ENGINE = engine
+            log("[OK] db log table ensured: {0}.{1}".format(LOG_DB_SCHEMA, LOG_DB_TABLE), info="boot")
+        except Exception as e:
+            log("[WARN] log table ensure failed (will retry later): {0}: {1}".format(type(e).__name__, e), info="warn")
+
         th_map = None
         while th_map is None:
             try:
                 th_map = load_thresholds(engine)
-                # 보기 좋게 로그(운영 확인용)
                 log("[OK] thresholds loaded: value={0} sec | month={1} | fallback={2}".format(
                     th_map.get("ALL"), th_map.get("month"), th_map.get("fallback")
-                ))
+                ), info="load")
             except Exception as e:
                 if is_db_disconnect_error(e):
-                    log("[WARN] thresholds load hit DB disconnect -> re-init engine (blocking)")
+                    log("[WARN] thresholds load hit DB disconnect -> re-init engine (blocking)", info="down")
                     try:
                         engine.dispose()
                     except Exception:
                         pass
                     engine = None
+                    DB_LOG_ENGINE = None
                     break
-                log("[ERROR] load_thresholds failed: {0}: {1}".format(type(e).__name__, e))
-                log(traceback.format_exc())
-                log("[RETRY] sleep {0}s then retry thresholds".format(RETRY_SLEEP_SEC))
+                log("[ERROR] load_thresholds failed: {0}: {1}".format(type(e).__name__, e), info="error")
+                log(traceback.format_exc(), info="error")
+                log("[RETRY] sleep {0}s then retry thresholds".format(RETRY_SLEEP_SEC), info="retry")
                 time_mod.sleep(RETRY_SLEEP_SEC)
 
         if engine is not None and th_map is not None:
@@ -424,10 +526,8 @@ def ensure_cursor_table(engine):
         _session_guard(conn)
         conn.execute(ddl)
 
+
 def load_cursors(engine, end_day: str) -> dict:
-    """
-    return: {station: last_end_ts or None} for the given end_day
-    """
     ensure_cursor_table(engine)
     q = text("""
         SELECT station, last_end_ts
@@ -441,6 +541,7 @@ def load_cursors(engine, end_day: str) -> dict:
         st = str(r["station"])
         cur[st] = r["last_end_ts"]
     return cur
+
 
 def upsert_cursor(engine, end_day: str, station: str, last_end_ts: datetime):
     ensure_cursor_table(engine)
@@ -460,10 +561,6 @@ def upsert_cursor(engine, end_day: str, station: str, last_end_ts: datetime):
 # 3) 임계값 로드 (NEW: fct_op_criteria)
 # =========================
 def prev_month_yyyymm_kst(now: datetime | None = None) -> str:
-    """
-    KST 기준 전월 YYYYMM 계산
-    예) 2026-02-01 -> 202601
-    """
     if now is None:
         now = datetime.now(tz=KST)
     else:
@@ -481,15 +578,8 @@ def prev_month_yyyymm_kst(now: datetime | None = None) -> str:
         m -= 1
     return f"{y:04d}{m:02d}"
 
+
 def load_thresholds(engine):
-    """
-    NEW SPEC (확정):
-    - g_production_film.fct_op_criteria
-    - month(TEXT, 'YYYYMM') = KST 기준 전월
-    - 해당 month에서 MAX(upper_outlier)를 threshold로 사용
-    - (C) 전월 month가 없으면 테이블의 최신 month(MAX(month))로 fallback
-    return: {"ALL": float_threshold, "month": used_month, "fallback": bool}
-    """
     target_month = prev_month_yyyymm_kst()
 
     q_max = text("""
@@ -498,7 +588,6 @@ def load_thresholds(engine):
         WHERE month = :month
     """)
 
-    # 1) 전월 우선
     df = pd.read_sql(q_max, engine, params={"month": target_month})
     mx = None
     if not df.empty:
@@ -507,7 +596,6 @@ def load_thresholds(engine):
     if mx is not None and pd.notna(mx):
         return {"ALL": float(mx), "month": str(target_month), "fallback": False}
 
-    # 2) (C) fallback: 최신 month 사용
     q_latest_month = text("""
         SELECT MAX(month) AS latest_month
         FROM g_production_film.fct_op_criteria
@@ -534,8 +622,8 @@ def load_thresholds(engine):
 
     return {"ALL": float(mx2), "month": latest_month, "fallback": True}
 
+
 def threshold_for_station(th_map: dict, station: str) -> float:
-    # station 컬럼이 없으므로 모든 FCT에 동일 임계값 적용
     return float(th_map["ALL"])
 
 
@@ -543,10 +631,6 @@ def threshold_for_station(th_map: dict, station: str) -> float:
 # 4) 소스 로딩(증분)
 # =========================
 def load_fct_incremental(engine, end_day: str, station: str, last_end_ts):
-    """
-    해당 station(FCT1~4)의 테이블에서 오늘(end_day) 데이터만,
-    last_end_ts 이후(>) 데이터만 로드.
-    """
     tbl = FCT_TABLES[station]
     q = text("""
         SELECT end_day, :station AS station, contents, end_time
@@ -565,11 +649,9 @@ def load_fct_incremental(engine, end_day: str, station: str, last_end_ts):
     df["_ts"] = ts_list
     df = df[df["_ts"].notna()].copy()
 
-    # 안정화 버퍼(선택): now-2초 이전만
     stable_cut = pd.Timestamp(now_ts() - pd.Timedelta(seconds=STABLE_DATA_SEC))
     df = df[df["_ts"] <= stable_cut].copy()
 
-    # cursor filter
     if last_end_ts is not None and pd.notna(last_end_ts):
         df = df[df["_ts"] > pd.Timestamp(last_end_ts)].copy()
 
@@ -577,18 +659,14 @@ def load_fct_incremental(engine, end_day: str, station: str, last_end_ts):
 
 
 # =========================
-# 5) 이벤트 계산(Station 1개 처리) - 단일 프로세스/순차
+# 5) 이벤트 계산(Station 1개 처리)
 # =========================
 RESULT_PREFIXES = ("TEST RESULT :: OK", "TEST RESULT :: NG")
 AUTO_START_PREFIX = "TEST AUTO MODE START"
 VALID_PREFIXES = RESULT_PREFIXES + (AUTO_START_PREFIX,)
 
+
 def compute_events_for_station(station: str, df_station: pd.DataFrame, th_map: dict):
-    """
-    return:
-      station, max_ts_in_input(or None), events_df
-      events_df columns: end_day, station, from_time, to_time, no_operation_time
-    """
     if df_station is None or df_station.empty:
         return station, None, pd.DataFrame(columns=["end_day", "station", "from_time", "to_time", "no_operation_time"])
 
@@ -666,6 +744,7 @@ def ensure_target_table(engine):
         _session_guard(conn)
         conn.execute(ddl)
 
+
 def upsert_events(engine, df_events: pd.DataFrame) -> int:
     if df_events is None or df_events.empty:
         return 0
@@ -704,9 +783,9 @@ def main_once(engine, th_map):
         station_dfs[st] = df_st
         total_loaded += len(df_st)
         if len(df_st) > 0:
-            log("[LOAD] {0} {1}: rows={2} (cursor={3})".format(end_day, st, len(df_st), last_ts))
+            log("[LOAD] {0} {1}: rows={2} (cursor={3})".format(end_day, st, len(df_st), last_ts), info="load")
         else:
-            log("[SKIP] {0} {1}: 신규 없음 (cursor={2})".format(end_day, st, last_ts))
+            log("[SKIP] {0} {1}: 신규 없음 (cursor={2})".format(end_day, st, last_ts), info="skip")
 
     if total_loaded == 0:
         run_end = now_ts()
@@ -716,29 +795,27 @@ def main_once(engine, th_map):
     all_events = []
     cursor_updates = []
 
-    # ✅ 멀티프로세스 제거: 순차 처리
     for st in station_dfs.keys():
         st_df = station_dfs.get(st)
         st_name, max_ts, ev = compute_events_for_station(st, st_df, th_map)
         if ev is not None and not ev.empty:
             all_events.append(ev)
-            log("[EVT] {0}: events={1}".format(st_name, len(ev)))
+            log("[EVT] {0}: events={1}".format(st_name, len(ev)), info="evt")
         else:
-            log("[EVT] {0}: events=0".format(st_name))
+            log("[EVT] {0}: events=0".format(st_name), info="evt")
         if max_ts is not None:
             cursor_updates.append((st_name, max_ts))
 
-    inserted = 0
     if len(all_events) > 0:
         df_save = pd.concat(all_events, ignore_index=True)
         inserted = upsert_events(engine, df_save)
-        log("[SAVE] {0}.{1}: upsert rows={2}".format(SAVE_SCHEMA, SAVE_TABLE, inserted))
+        log("[SAVE] {0}.{1}: upsert rows={2}".format(SAVE_SCHEMA, SAVE_TABLE, inserted), info="save")
     else:
-        log("[SAVE] {0}.{1}: no events -> skip".format(SAVE_SCHEMA, SAVE_TABLE))
+        log("[SAVE] {0}.{1}: no events -> skip".format(SAVE_SCHEMA, SAVE_TABLE), info="skip")
 
     for st, max_ts in cursor_updates:
         upsert_cursor(engine, end_day=end_day, station=st, last_end_ts=max_ts)
-        log("[CURSOR] {0} {1} -> {2}".format(end_day, st, max_ts))
+        log("[CURSOR] {0} {1} -> {2}".format(end_day, st, max_ts), info="cursor")
 
     run_end = now_ts()
     _print_end_banner("DONE", run_start, run_end)
@@ -748,43 +825,41 @@ def main_once(engine, th_map):
 # 8) Realtime loop
 # =========================
 def realtime_loop():
-    log("[BOOT] realtime_loop start")
+    log("[BOOT] realtime_loop start", info="boot")
     run_diagnostics()
 
-    # ✅ 최초 엔진/threshold: “연결 성공할 때까지” 블로킹
     engine, th_map = recover_engine_and_thresholds_blocking()
 
     while True:
         loop_t0 = now_ts()
 
         try:
-            # ✅ 루프 시작 시점 헬스체크: 중간에 끊겨도 즉시 감지 -> 블로킹 복구
             engine_health_check_blocking(engine)
-
-            # 1) 본 실행
             main_once(engine, th_map)
 
         except Exception as e:
-            log("[ERROR] loop failed: {0}: {1}".format(type(e).__name__, e))
-            log(traceback.format_exc())
+            log("[ERROR] loop failed: {0}: {1}".format(type(e).__name__, e), info="error")
+            log(traceback.format_exc(), info="error")
 
-            # ✅ 실행 중간 끊김 포함 모든 DB 계열 문제는 여기서 "연결 성공할 때까지" 복구
             try:
                 if engine is not None:
                     engine.dispose()
             except Exception:
                 pass
 
-            log("[RECOVER] server disconnect or db error suspected -> blocking reconnect ...")
+            # DB 로그 엔진도 끊김으로 간주
+            global DB_LOG_ENGINE
+            DB_LOG_ENGINE = None
+
+            log("[RECOVER] server disconnect or db error suspected -> blocking reconnect ...", info="recover")
             engine, th_map = recover_engine_and_thresholds_blocking()
 
-        # 2) 루프 주기 맞추기 (5초)
         loop_t1 = now_ts()
         elapsed = (loop_t1 - loop_t0).total_seconds()
         sleep_sec = LOOP_INTERVAL_SEC - elapsed
         if sleep_sec < 0.0:
             sleep_sec = 0.0
-        log("[LOOP] end | elapsed={0:.3f}s | sleep={1:.3f}s".format(elapsed, sleep_sec))
+        log("[LOOP] end | elapsed={0:.3f}s | sleep={1:.3f}s".format(elapsed, sleep_sec), info="sleep")
         if sleep_sec > 0:
             time_mod.sleep(sleep_sec)
 
@@ -796,15 +871,15 @@ def main():
     try:
         realtime_loop()
     except KeyboardInterrupt:
-        log("[EXIT] KeyboardInterrupt")
+        log("[EXIT] KeyboardInterrupt", info="exit")
         hold_console(exit_code=0)
     except Exception as e:
-        log("[FATAL] {0}: {1}".format(type(e).__name__, e))
-        log(traceback.format_exc())
+        log("[FATAL] {0}: {1}".format(type(e).__name__, e), info="fatal")
+        log(traceback.format_exc(), info="fatal")
         hold_console(exit_code=1)
 
+
 if __name__ == "__main__":
-    # Windows EXE + multiprocessing 안정화 (요청은 1개지만, EXE에서 안전하게 유지)
     try:
         mp.freeze_support()
         mp.set_start_method("spawn", force=True)

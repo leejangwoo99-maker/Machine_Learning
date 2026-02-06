@@ -3,11 +3,17 @@
 pd_worst_service.py
 
 요청 반영(핵심):
-- ✅ 실행 중간에 DB 서버가 끊겨도, 모든 DB I/O 구간(SELECT/DDL/UPSERT 포함)에서
+- ✅ 실행 중간에 DB 서버가 끊겨도, 모든 DB I/O 구간(SELECT/DDL/UPSERT/LOG INSERT 포함)에서
   "무한 재접속(블로킹) + 재시도" 하도록 통합 적용
 - ✅ 엔진 풀 최소화(상시 1개): pool_size=1, max_overflow=0
 - ✅ 세션마다 work_mem 설정
 - ✅ 스케줄러: 하루 2번 윈도우에서 1초 간격 반복 실행
+
+추가(로그 모니터링):
+- ✅ 스키마: k_demon_heath_check (없으면 생성)
+- ✅ 테이블: e7_log (없으면 생성)
+- ✅ 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- ✅ end_day, end_time, info, contents 순서로 DataFrame화하여 저장
 
 Nuitka 안정화:
 - list/dict/set comprehension 신규 추가 금지(가능한 범위 내)
@@ -45,6 +51,10 @@ TEST_CONTENTS_KEY = "1.36_dark_curr_check"  # pd_cal_test_ct_summary에서 upper
 # 저장 테이블
 TARGET_SCHEMA = "e4_predictive_maintenance"
 TARGET_TABLE = "pd_worst"
+
+# 로그 저장 테이블
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "e7_log"
 
 # ============================
 # 스케줄 윈도우(매일)
@@ -204,6 +214,87 @@ def execute_retry(box: EngineBox, sql, params=None):
 
 
 # =========================
+# 1-1) 로그 유틸
+# =========================
+def _now_day_time_text():
+    now_dt = datetime.now()
+    return now_dt.strftime("%Y%m%d"), now_dt.strftime("%H:%M:%S")
+
+
+def ensure_log_table_retry(box: EngineBox):
+    ddl = text("""
+    CREATE SCHEMA IF NOT EXISTS k_demon_heath_check;
+
+    CREATE TABLE IF NOT EXISTS k_demon_heath_check.e7_log (
+        id          bigserial PRIMARY KEY,
+        end_day     text NOT NULL,
+        end_time    text NOT NULL,
+        info        text NOT NULL,
+        contents    text,
+        created_at  timestamp without time zone DEFAULT now()
+    );
+    """)
+    execute_retry(box, ddl, None)
+
+
+def log_db_retry(box: EngineBox, info: str, contents: str):
+    """
+    - info는 반드시 소문자 저장
+    - end_day/end_time/info/contents 순서로 DataFrame화 후 저장
+    - DB 실패 시 무한 재시도
+    """
+    info_l = str(info).strip().lower()
+    if info_l == "":
+        info_l = "info"
+
+    day_s, time_s = _now_day_time_text()
+
+    data = {
+        "end_day": [day_s],
+        "end_time": [time_s],
+        "info": [info_l],
+        "contents": [str(contents)],
+    }
+    df_log = pd.DataFrame(data, columns=["end_day", "end_time", "info", "contents"])
+
+    sql_ins = text("""
+    INSERT INTO k_demon_heath_check.e7_log (end_day, end_time, info, contents)
+    VALUES (:end_day, :end_time, :info, :contents)
+    """)
+
+    while True:
+        try:
+            ensure_engine_alive(box)
+            ensure_log_table_retry(box)
+
+            rows = df_log.to_dict(orient="records")
+            with box.engine.begin() as conn:
+                _apply_session_limits(conn)
+                conn.execute(sql_ins, rows)
+            return
+
+        except Exception as e:
+            # 로그 저장 실패 자체는 stdout으로 남기고 재시도
+            print("[LOG][RETRY] log_db insert failed: {t}: {m}".format(
+                t=type(e).__name__, m=repr(e)
+            ), flush=True)
+            box.engine = safe_engine_recover(box.engine)
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def write_event(box: EngineBox, info: str, contents: str):
+    """콘솔 + DB 로그 동시 기록"""
+    info_l = str(info).strip().lower()
+    msg = "[{i}] {c}".format(i=info_l.upper(), c=contents)
+    print(msg, flush=True)
+    try:
+        log_db_retry(box, info_l, contents)
+    except Exception as _:
+        # 여기까지 오면 내부적으로 이미 재시도 중일 가능성이 크므로 추가 예외 억제
+        pass
+
+
+# =========================
 # 2) 유틸
 # =========================
 def norm_end_day(x) -> str:
@@ -314,7 +405,9 @@ def fetch_existing_cols_retry(box: EngineBox, schema: str, table: str) -> List[s
 def run_once(box: EngineBox):
     run_start_dt = datetime.now()
     run_start_perf = time.perf_counter()
-    print("[RUN] start_ts={}".format(run_start_dt.strftime("%Y-%m-%d %H:%M:%S")), flush=True)
+    write_event(box, "info", "run start_ts={}".format(run_start_dt.strftime("%Y-%m-%d %H:%M:%S")))
+
+    payload_for_save = None
 
     # ✅ end_day 자동 선택(오늘 → 없으면 최신)
     if AUTO_PICK_END_DAY:
@@ -331,7 +424,7 @@ def run_once(box: EngineBox):
 
         if not chk.empty:
             use_end_day_text = today_text
-            print("[AUTO] Using TODAY end_day = {}".format(use_end_day_text), flush=True)
+            write_event(box, "info", "auto using today end_day={}".format(use_end_day_text))
         else:
             SQL_LATEST = text("""
             SELECT MAX(end_day) AS max_day
@@ -342,9 +435,10 @@ def run_once(box: EngineBox):
             if latest.empty or pd.isna(latest.iloc[0]["max_day"]):
                 raise RuntimeError("[ERROR] a2_fct_table.fct_table 에 유효한 end_day 가 없습니다.")
             use_end_day_text = str(latest.iloc[0]["max_day"]).strip()
-            print("[AUTO] TODAY not found → fallback to latest end_day = {}".format(use_end_day_text), flush=True)
+            write_event(box, "info", "auto today not found -> fallback end_day={}".format(use_end_day_text))
     else:
         use_end_day_text = TARGET_END_DAY_TEXT
+        write_event(box, "info", "manual end_day={}".format(use_end_day_text))
 
     # -----------------------------
     # Cell A) boundary_run_time 로드
@@ -363,7 +457,7 @@ def run_once(box: EngineBox):
 
     boundary_run_time = float(b.loc[0, "upper_outlier"])
     boundary_src_day = str(b.loc[0, "end_day"])
-    print("[OK] boundary_run_time={} (source end_day={})".format(boundary_run_time, boundary_src_day), flush=True)
+    write_event(box, "info", "boundary_run_time={} source_end_day={}".format(boundary_run_time, boundary_src_day))
 
     # -----------------------------
     # Cell B) run_time TOP 5% (df_top)
@@ -412,7 +506,7 @@ def run_once(box: EngineBox):
         "barcode_information", "remark", "station", "end_day", "end_time", "boundary_run_time", "run_time"
     ]]
 
-    print("[OK] boundary={} / TOP5% cut={:.2f} / rows={}".format(boundary_run_time, float(cut), len(df_top)), flush=True)
+    write_event(box, "info", "top5 boundary={} cut={:.2f} rows={}".format(boundary_run_time, float(cut), len(df_top)))
     if len(df_top) == 0:
         raise RuntimeError("[ERROR] df_top이 비어있습니다. (run_time TOP5% 결과 없음)")
 
@@ -420,7 +514,7 @@ def run_once(box: EngineBox):
     # Cell X1) fct_detail 조회 + meta merge
     # -----------------------------
     barcodes = df_top["barcode_information"].dropna().astype(str).drop_duplicates().tolist()
-    print("[OK] Top barcodes = {}".format(len(barcodes)), flush=True)
+    write_event(box, "info", "top barcodes={}".format(len(barcodes)))
 
     target_end_day_date = pd.to_datetime(use_end_day_text, format="%Y%m%d", errors="raise").strftime("%Y-%m-%d")
 
@@ -461,7 +555,7 @@ def run_once(box: EngineBox):
         "run_time", "boundary_run_time", "contents", "test_ct", "test_time"
     ]].copy()
 
-    print("[OK] df_detail rows={}".format(len(df_detail)), flush=True)
+    write_event(box, "info", "df_detail rows={}".format(len(df_detail)))
 
     # -----------------------------
     # Cell X2) group 생성 + 제외 규칙 적용
@@ -511,7 +605,7 @@ def run_once(box: EngineBox):
     df2 = df2.sort_values(["group", "_is_first_3_null", "_test_ts"], ascending=[True, False, True]).reset_index(drop=True)
     df2.drop(columns=["group_key"], inplace=True, errors="ignore")
 
-    print("[OK] df2 rows={} / groups={}".format(len(df2), int(df2["group"].nunique())), flush=True)
+    write_event(box, "info", "df2 rows={} groups={}".format(len(df2), int(df2["group"].nunique())))
 
     # -----------------------------
     # Cell X3) from_to_test_ct (OK/NG만)
@@ -525,7 +619,7 @@ def run_once(box: EngineBox):
     mask = is_okng & df3["_test_ts"].notna() & df3["_base_ts"].notna()
     df3.loc[mask, "from_to_test_ct"] = (df3.loc[mask, "_test_ts"] - df3.loc[mask, "_base_ts"]).dt.total_seconds()
 
-    print("[OK] from_to_test_ct filled rows={}".format(int(df3["from_to_test_ct"].notna().sum())), flush=True)
+    write_event(box, "info", "from_to_test_ct filled={}".format(int(df3["from_to_test_ct"].notna().sum())))
 
     # -----------------------------
     # Cell X4) okng_seq + test_contents 매핑
@@ -575,7 +669,7 @@ def run_once(box: EngineBox):
         "test_contents", "test_ct", "from_to_test_ct", "okng_seq"
     ]].copy()
 
-    print("[OK] df_final rows={} / groups={}".format(len(df_final), int(df_final["group"].nunique())), flush=True)
+    write_event(box, "info", "df_final rows={} groups={}".format(len(df_final), int(df_final["group"].nunique())))
 
     # -----------------------------
     # Cell X5) df15
@@ -704,7 +798,7 @@ def run_once(box: EngineBox):
         .reset_index(drop=True)
     )
 
-    print("[OK] diff_ct worst: 원본={} → TOP5% raw={} → 최종 rows={}".format(n_all, len(df_top_raw), len(df_spike)), flush=True)
+    write_event(box, "info", "diff_ct worst all={} top_raw={} final={}".format(n_all, len(df_top_raw), len(df_spike)))
 
     # -----------------------------
     # Cell X9) file_path 매칭
@@ -756,11 +850,10 @@ def run_once(box: EngineBox):
         on=["barcode_information", "end_day", "end_time"],
         how="left"
     )
-    print("[OK] file_path filled={} / rows={}".format(int(df_spike_fp["file_path"].notna().sum()), len(df_spike_fp)), flush=True)
+    write_event(box, "info", "file_path filled={} rows={}".format(int(df_spike_fp["file_path"].notna().sum()), len(df_spike_fp)))
 
     # -----------------------------
     # Cell X10) DB 저장 (DDL + 동적 UPSERT + 실행시간 컬럼)
-    #  - run_* 컬럼은 DF에 넣되, DB에 없으면 자동 제외(에러 방지)
     # -----------------------------
     FULL_NAME = "{}.{}".format(TARGET_SCHEMA, TARGET_TABLE)
     df_save = df_spike_fp.copy()
@@ -840,8 +933,12 @@ def run_once(box: EngineBox):
         run_end_dt = datetime.now()
         run_seconds = round(time.perf_counter() - run_start_perf, 3)
 
-        print("[RUN] end_ts={}".format(run_end_dt.strftime("%Y-%m-%d %H:%M:%S")), flush=True)
-        print("[RUN] run_seconds={:.3f}".format(float(run_seconds)), flush=True)
+        write_event(box, "info", "run end_ts={}".format(run_end_dt.strftime("%Y-%m-%d %H:%M:%S")))
+        write_event(box, "info", "run run_seconds={:.3f}".format(float(run_seconds)))
+
+        if payload_for_save is None:
+            write_event(box, "error", "payload_for_save is none; skip upsert")
+            return
 
         df_save2 = payload_for_save["df_save"].copy()
         df_save2["run_end_ts"] = run_end_dt
@@ -858,7 +955,7 @@ def run_once(box: EngineBox):
             "run_start_ts", "run_end_ts", "run_seconds"
         ]
 
-        # ✅ 저장 구간: DB 실패 시 복구/재시도(블로킹) - "실행 중간 끊김" 요구사항의 핵심
+        # ✅ 저장 구간: DB 실패 시 복구/재시도(블로킹)
         while True:
             try:
                 ensure_engine_alive(box)
@@ -892,15 +989,15 @@ def run_once(box: EngineBox):
 
                     conn.execute(UPSERT_SQL, rows)
 
-                print("[OK] Saved to {} (rows={}) / used_cols={}".format(
+                write_event(box, "info", "saved {} rows={} used_cols={}".format(
                     payload_for_save["full_name"], len(df_save2), len(save_cols)
-                ), flush=True)
+                ))
                 break
 
             except Exception as e:
-                print("[DB][RETRY] UPSERT failed: {t}: {m}".format(
+                write_event(box, "down", "upsert failed retry: {t}: {m}".format(
                     t=type(e).__name__, m=repr(e)
-                ), flush=True)
+                ))
                 box.engine = safe_engine_recover(box.engine)
                 time.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -911,7 +1008,14 @@ def run_once(box: EngineBox):
 def scheduler_loop():
     box = EngineBox()
     box.engine = get_engine_blocking()
-    print("[DB] engine ready (blocking ensured) | pool_size=1 max_overflow=0 | work_mem={}".format(WORK_MEM), flush=True)
+
+    # 로그 테이블 사전 보장
+    ensure_log_table_retry(box)
+
+    write_event(
+        box, "info",
+        "engine ready blocking ensured pool_size=1 max_overflow=0 work_mem={}".format(WORK_MEM)
+    )
 
     last_state = None  # "RUN" / "WAIT"
 
@@ -920,27 +1024,23 @@ def scheduler_loop():
 
         if is_run_time(now_dt):
             if last_state != "RUN":
-                print("[SCHED] enter RUN window @ {}".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")), flush=True)
+                write_event(box, "info", "sched enter run window @ {}".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
                 last_state = "RUN"
 
             try:
-                # ✅ 매 tick ping. 실패하면 블로킹 복구
                 ensure_engine_alive(box)
                 run_once(box)
 
             except Exception as e:
-                # 윈도우 안에서 계속 돌려야 하므로 예외는 로그만 찍고 다음 tick에서 재시도
-                print("[ERROR] run_once failed: {}".format(repr(e)), flush=True)
+                write_event(box, "error", "run_once failed: {}".format(repr(e)))
                 box.engine = safe_engine_recover(box.engine)
 
             time.sleep(SLEEP_SECONDS)
 
         else:
             if last_state != "WAIT":
-                print("[SCHED] WAIT (outside windows) @ {}".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")), flush=True)
+                write_event(box, "sleep", "sched wait outside windows @ {}".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
                 last_state = "WAIT"
-
-            # ✅ 윈도우 밖에서도 1초 폴링 유지
             time.sleep(SLEEP_SECONDS)
 
 

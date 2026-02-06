@@ -30,6 +30,17 @@ h_timing_spareparts_v9_2_backfill_then_realtime.py
 [v9.2 추가 FIX]
 - "확률이 기준 이상일 때만 알람 저장"을 위해
   준비/권고 알람은 pass_prob=True일 때만 insert_alarm 수행.
+
+[v9.3 추가]
+- 실행 로그를 DB에도 저장:
+  schema: k_demon_heath_check (없으면 생성)
+  table : h_log (없으면 생성)
+  columns:
+    - end_day  : yyyymmdd
+    - end_time : hh:mi:ss
+    - info     : 소문자(error/down/sleep/info/...)
+    - contents : 상세 로그
+- end_day, end_time, info, contents 순서로 DataFrame화 후 저장
 """
 
 from __future__ import annotations
@@ -41,7 +52,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import psycopg2
+from psycopg2.extras import execute_values
 
 
 # =================================================
@@ -62,7 +75,7 @@ LOOP_INTERVAL_SEC = 5
 BATCH_LIMIT_TEST_ROWS = 5000
 
 SESSION_GUARDS_SQL = """
-SET application_name = 'h_timing_spareparts_v9_2';
+SET application_name = 'h_timing_spareparts_v9_3_logdb';
 SET statement_timeout = '30s';
 SET lock_timeout = '5s';
 SET idle_in_transaction_session_timeout = '30s';
@@ -89,13 +102,102 @@ ALARM_TABLE = "alarm_record"
 STATE_SCHEMA = "h_machine_learning"
 STATE_TABLE = "sparepart_interval_state_rt_v9_2"
 
+# DB 로그 저장 대상 (요청 스펙)
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "h_log"
+
+# 메모리 버퍼(DB 다운 시 로그 유실 방지)
+PENDING_DB_LOGS: List[Tuple[str, str, str, str]] = []
+
 
 # =================================================
 # 1) UTIL
 # =================================================
-def log(msg: str) -> None:
+def _normalize_info(info: str) -> str:
+    if not info:
+        return "info"
+    return str(info).strip().lower()
+
+
+def _make_log_row(info: str, contents: str, now: Optional[datetime] = None) -> Tuple[str, str, str, str]:
+    d = now or datetime.now()
+    end_day = d.strftime("%Y%m%d")      # yyyymmdd
+    end_time = d.strftime("%H:%M:%S")   # hh:mi:ss
+    return end_day, end_time, _normalize_info(info), str(contents)
+
+
+def print_log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def enqueue_db_log(info: str, contents: str) -> None:
+    PENDING_DB_LOGS.append(_make_log_row(info, contents))
+
+
+def ensure_log_table(conn) -> None:
+    ensure_schema(conn, LOG_SCHEMA)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {LOG_SCHEMA}.{LOG_TABLE} (
+                id BIGSERIAL PRIMARY KEY,
+                end_day  TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                info     TEXT NOT NULL,
+                contents TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE}_day_time "
+            f"ON {LOG_SCHEMA}.{LOG_TABLE} (end_day, end_time);"
+        )
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE}_info "
+            f"ON {LOG_SCHEMA}.{LOG_TABLE} (info);"
+        )
+
+
+def flush_db_logs(conn, max_batch: int = 1000) -> None:
+    """
+    end_day, end_time, info, contents 순서로 DataFrame화 후 저장.
+    """
+    if not PENDING_DB_LOGS:
+        return
+
+    rows = PENDING_DB_LOGS[:max_batch]
+    df = pd.DataFrame(rows, columns=["end_day", "end_time", "info", "contents"])
+    values = [tuple(x) for x in df[["end_day", "end_time", "info", "contents"]].to_records(index=False)]
+
+    sql = f"""
+    INSERT INTO {LOG_SCHEMA}.{LOG_TABLE}
+      (end_day, end_time, info, contents)
+    VALUES %s
+    """
+
+    with conn.cursor() as cur:
+        execute_values(cur, sql, values, page_size=500)
+
+    del PENDING_DB_LOGS[: len(rows)]
+
+
+def log(msg: str, info: str = "info", conn: Optional[psycopg2.extensions.connection] = None) -> None:
+    """
+    콘솔 출력 + DB 로그 버퍼 적재.
+    conn이 가능하면 즉시 flush 시도.
+    """
+    info_n = _normalize_info(info)
+    print_log(msg)
+    enqueue_db_log(info_n, msg)
+
+    if conn is not None and conn.closed == 0:
+        try:
+            flush_db_logs(conn)
+        except Exception:
+            # flush 실패 시 버퍼 유지
+            pass
 
 
 def connect_forever() -> psycopg2.extensions.connection:
@@ -112,10 +214,15 @@ def connect_forever() -> psycopg2.extensions.connection:
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute(SESSION_GUARDS_SQL)
-            log("[OK] DB connected")
+
+            # 로그 테이블도 최초 연결 시 보장
+            ensure_log_table(conn)
+
+            log("[OK] DB connected", info="info", conn=conn)
             return conn
         except Exception as e:
-            log(f"[ERROR] DB connect failed: {type(e).__name__}: {e}")
+            # DB 연결 전에는 콘솔 + 버퍼만
+            log(f"[ERROR] DB connect failed: {type(e).__name__}: {e}", info="error", conn=None)
             time.sleep(2)
 
 
@@ -223,6 +330,7 @@ def ts_expr(day_col: str, time_col: str) -> str:
 def ensure_tables(conn) -> None:
     ensure_schema(conn, ALARM_SCHEMA)
     ensure_schema(conn, STATE_SCHEMA)
+    ensure_log_table(conn)  # 추가
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -230,8 +338,8 @@ def ensure_tables(conn) -> None:
             station   TEXT NOT NULL,
             sparepart TEXT NOT NULL,
 
-            current_repl_end_ts TIMESTAMP,  -- 현재 교체 완료(to_time)
-            next_repl_end_ts    TIMESTAMP,  -- 다음 교체 완료(to_time)
+            current_repl_end_ts TIMESTAMP,
+            next_repl_end_ts    TIMESTAMP,
 
             last_test_ts    TIMESTAMP,
             amount          BIGINT NOT NULL DEFAULT 0,
@@ -281,7 +389,7 @@ def ensure_tables(conn) -> None:
         cur.execute(f"CREATE INDEX IF NOT EXISTS idx_alarm_runid ON {ALARM_SCHEMA}.{ALARM_TABLE} (run_id);")
         cur.execute(f"CREATE INDEX IF NOT EXISTS idx_state_updated ON {STATE_SCHEMA}.{STATE_TABLE} (updated_at DESC);")
 
-    log("[OK] ensure_tables done (NO DROP)")
+    log("[OK] ensure_tables done (NO DROP)", info="info", conn=conn)
 
 
 # =================================================
@@ -496,7 +604,7 @@ def build_features_for_model(
         feat[f"sparepart_{sp}"] = 1.0 if sparepart == sp else 0.0
     if fn:
         return [[float(feat.get(name, 0.0)) for name in fn]]
-    return [[feat["amount"], feat["max_tests"], feat["ratio"]]]
+    return [[feat["amount"], feat["max_tests"], feat["ratio"]]
 
 
 # =================================================
@@ -640,7 +748,6 @@ def fetch_new_tests_ts_list(conn, station: str, after_ts: datetime, upper_ts: da
 
 
 def roll_state_to_next(conn, st: State, station: str, sparepart: str) -> None:
-    """next_repl_end_ts를 current로 승격하고 사이클 리셋"""
     prev_current = st.current_repl_end_ts
     st.current_repl_end_ts = st.next_repl_end_ts
     st.last_test_ts = st.current_repl_end_ts
@@ -648,15 +755,16 @@ def roll_state_to_next(conn, st: State, station: str, sparepart: str) -> None:
     st.last_alarm_type = None
     st.next_repl_end_ts = find_next_repl_end_after(conn, station, sparepart, st.current_repl_end_ts)
     save_state(conn, st)
-    log(f"[ROLL] {station}/{sparepart} {prev_current} -> {st.current_repl_end_ts} next={st.next_repl_end_ts}")
+    log(f"[ROLL] {station}/{sparepart} {prev_current} -> {st.current_repl_end_ts} next={st.next_repl_end_ts}",
+        info="info", conn=conn)
 
 
 # =================================================
 # 11) MAIN
 # =================================================
 def main() -> None:
-    RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_v9_2_fix"
-    ALGO_VER = "v9_2_fix"
+    RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_v9_3_logdb"
+    ALGO_VER = "v9_3_logdb"
 
     conn: Optional[psycopg2.extensions.connection] = None
     cached_model_id: Optional[int] = None
@@ -666,34 +774,36 @@ def main() -> None:
     last_life_reload = 0.0
     last_hb = 0.0
 
-    log(f"[START] run_id={RUN_ID} algo_ver={ALGO_VER}")
+    log(f"[START] run_id={RUN_ID} algo_ver={ALGO_VER}", info="info", conn=None)
 
     while True:
         try:
             if conn is None or conn.closed != 0:
                 conn = connect_forever()
-                ensure_tables(conn)  # NO DROP
+                ensure_tables(conn)
                 preflight_required_columns(conn)
+                flush_db_logs(conn)  # 재연결 시 버퍼 플러시
 
             now_ts = time.time()
             now_dt = datetime.now()
 
             if now_ts - last_hb >= 60:
-                log(f"[HEARTBEAT] now={now_dt.strftime('%Y-%m-%d %H:%M:%S')} run_id={RUN_ID}")
+                log(f"[HEARTBEAT] now={now_dt.strftime('%Y-%m-%d %H:%M:%S')} run_id={RUN_ID}",
+                    info="info", conn=conn)
                 last_hb = now_ts
 
             if not life_map or (now_ts - last_life_reload >= 300):
                 life_map = load_life_p25_map(conn)
                 last_life_reload = now_ts
-                log(f"[OK] life(p25) loaded: {life_map}")
+                log(f"[OK] life(p25) loaded: {life_map}", info="info", conn=conn)
 
             model, mid = load_model_max_id(conn)
             if cached_model_id != mid:
                 cached_model_id = mid
                 cached_model = model
-                log(f"[OK] model loaded (id={mid})")
+                log(f"[OK] model loaded (id={mid})", info="info", conn=conn)
 
-            need_immediate = False  # backlog 있으면 sleep 0
+            need_immediate = False
 
             for station in STATIONS:
                 for sparepart in SPAREPARTS:
@@ -703,9 +813,6 @@ def main() -> None:
 
                     st = load_state(conn, station, sparepart)
 
-                    # ============================================================
-                    # (1) 초기화: 가장 이른 교체부터
-                    # ============================================================
                     if st.current_repl_end_ts is None:
                         repl_list = list_repl_end_ts(conn, station, sparepart)
                         if not repl_list:
@@ -717,33 +824,25 @@ def main() -> None:
                         st.last_alarm_type = None
                         save_state(conn, st)
                         need_immediate = True
-                        log(f"[INIT] {station}/{sparepart} current_end={st.current_repl_end_ts} next_end={st.next_repl_end_ts}")
+                        log(f"[INIT] {station}/{sparepart} current_end={st.current_repl_end_ts} next_end={st.next_repl_end_ts}",
+                            info="info", conn=conn)
 
-                    # station/sparepart 당 한 루프에서 연속 롤링/처리를 허용(무한 방지)
                     for _guard in range(50):
-                        # ========================================================
-                        # (2) next 갱신(새 교체행 생길 수 있음)
-                        # ========================================================
                         if st.current_repl_end_ts is not None:
                             nxt = find_next_repl_end_after(conn, station, sparepart, st.current_repl_end_ts)
                             if nxt is not None and (st.next_repl_end_ts is None or nxt != st.next_repl_end_ts):
                                 st.next_repl_end_ts = nxt
                                 save_state(conn, st)
                                 need_immediate = True
-                                log(f"[NEXT-UPDATE] {station}/{sparepart} next_end={st.next_repl_end_ts}")
+                                log(f"[NEXT-UPDATE] {station}/{sparepart} next_end={st.next_repl_end_ts}",
+                                    info="info", conn=conn)
 
-                        # ========================================================
-                        # (3) 교체까지 갔고 next가 없으면 집계 중단(단, next 탐지는 계속)
-                        # ========================================================
                         if st.last_alarm_type == "교체" and st.next_repl_end_ts is None:
                             break
 
                         if st.current_repl_end_ts is None:
                             break
 
-                        # ========================================================
-                        # (4) upper_ts 결정 (FIX)
-                        # ========================================================
                         if st.next_repl_end_ts is not None and now_dt >= st.next_repl_end_ts:
                             upper_ts = st.next_repl_end_ts
                         else:
@@ -753,7 +852,6 @@ def main() -> None:
                         if after_ts is None:
                             break
 
-                        # 이미 upper를 넘어섰으면(또는 같으면) 롤링 여부 확인
                         if after_ts >= upper_ts:
                             if st.next_repl_end_ts is not None and now_dt >= st.next_repl_end_ts:
                                 roll_state_to_next(conn, st, station, sparepart)
@@ -761,17 +859,12 @@ def main() -> None:
                                 continue
                             break
 
-                        # ========================================================
-                        # (5) 테스트 ts fetch
-                        # ========================================================
                         ts_list = fetch_new_tests_ts_list(conn, station, after_ts, upper_ts, BATCH_LIMIT_TEST_ROWS)
 
-                        # ========================================================
-                        # (FIX 핵심) ts_list가 비어도 교체시각이 지났으면 롤링
-                        # ========================================================
                         if not ts_list:
                             if st.next_repl_end_ts is not None and now_dt >= st.next_repl_end_ts and upper_ts == st.next_repl_end_ts:
-                                log(f"[ROLL-NO-TEST] {station}/{sparepart} gap_no_tests (after={after_ts} <= next={st.next_repl_end_ts})")
+                                log(f"[ROLL-NO-TEST] {station}/{sparepart} gap_no_tests (after={after_ts} <= next={st.next_repl_end_ts})",
+                                    info="info", conn=conn)
                                 roll_state_to_next(conn, st, station, sparepart)
                                 need_immediate = True
                                 continue
@@ -779,9 +872,6 @@ def main() -> None:
 
                         need_immediate = True
 
-                        # ========================================================
-                        # (6) 1건씩 누적하며 crossing 알람 저장
-                        # ========================================================
                         for tts in ts_list:
                             st.amount += 1
                             st.last_test_ts = tts
@@ -793,9 +883,8 @@ def main() -> None:
                                 if alarm_rank(alarm_type) > alarm_rank(st.last_alarm_type):
                                     prob = 0.0
 
-                                    # ✅ 변경 핵심: 준비/권고는 확률 기준 충족 시에만 저장
                                     if alarm_type in ("준비", "권고"):
-                                        pass_prob = False  # 기본 False (예측 실패 시 저장 방지)
+                                        pass_prob = False
                                         try:
                                             X = build_features_for_model(cached_model, station, sparepart, st.amount, max_tests, ratio)
                                             prob = predict_proba_1(cached_model, X)
@@ -803,7 +892,8 @@ def main() -> None:
                                         except Exception:
                                             pass_prob = False
 
-                                        log(f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass={pass_prob}")
+                                        log(f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass={pass_prob}",
+                                            info="info", conn=conn)
 
                                         if pass_prob:
                                             insert_alarm(
@@ -821,19 +911,21 @@ def main() -> None:
                                                 reset_repl_ts=st.current_repl_end_ts,
                                             )
                                             st.last_alarm_type = alarm_type
-                                            log(f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})")
+                                            log(f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})",
+                                                info="info", conn=conn)
                                         else:
-                                            log(f"[ALARM-SKIP] {station}/{sparepart} {alarm_type} (prob<{min_prob})")
+                                            log(f"[ALARM-SKIP] {station}/{sparepart} {alarm_type} (prob<{min_prob})",
+                                                info="info", conn=conn)
 
                                     else:
-                                        # 긴급/교체는 기존 로직 유지: 확률 게이트 없이 저장
                                         try:
                                             X = build_features_for_model(cached_model, station, sparepart, st.amount, max_tests, ratio)
                                             prob = predict_proba_1(cached_model, X)
                                         except Exception:
                                             prob = 0.0
 
-                                        log(f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass=True")
+                                        log(f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass=True",
+                                            info="info", conn=conn)
 
                                         insert_alarm(
                                             conn=conn,
@@ -850,7 +942,8 @@ def main() -> None:
                                             reset_repl_ts=st.current_repl_end_ts,
                                         )
                                         st.last_alarm_type = alarm_type
-                                        log(f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})")
+                                        log(f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})",
+                                            info="info", conn=conn)
 
                                         if alarm_type == "교체" and st.next_repl_end_ts is None:
                                             break
@@ -859,19 +952,24 @@ def main() -> None:
                         continue
 
             if need_immediate:
+                log("[LOOP] sleep 0 (backfill/realtime immediate)", info="sleep", conn=conn)
                 time.sleep(0)
             else:
+                log(f"[LOOP] sleep {LOOP_INTERVAL_SEC}s", info="sleep", conn=conn)
                 time.sleep(LOOP_INTERVAL_SEC)
 
+            # 루프 말미 버퍼 flush
+            flush_db_logs(conn)
+
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            log(f"[ERROR] DB disconnected: {type(e).__name__}: {e}")
+            log(f"[ERROR] DB disconnected: {type(e).__name__}: {e}", info="down", conn=None)
             safe_close(conn)
             conn = None
             time.sleep(2)
 
         except Exception as e:
-            log(f"[ERROR] runtime: {type(e).__name__}: {e}")
-            log(traceback.format_exc())
+            log(f"[ERROR] runtime: {type(e).__name__}: {e}", info="error", conn=conn)
+            log(traceback.format_exc(), info="error", conn=conn)
             time.sleep(2)
 
 

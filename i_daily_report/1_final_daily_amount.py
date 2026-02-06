@@ -38,6 +38,12 @@ backend1_daily_final_amount_daemon.py
   집계는 in-memory(바코드당 최신 1건) 상태를 유지하면서 갱신
 - 리셋/재시작/shift 변경 시: window_start~now 전체를 다시 로드하여 in-memory 재구성 + DELETE+INSERT
 - 일반 루프 시: last_pk 이후만 fetch하여 in-memory 갱신 + UPSERT
+
+[추가] 데몬 헬스 로그 저장
+- 스키마: k_demon_heath_check (없으면 생성)
+- 테이블: "1_log" (없으면 생성)
+- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
+- 저장 순서: end_day, end_time, info, contents
 """
 
 from __future__ import annotations
@@ -96,6 +102,15 @@ T_NIGHT_OVERALL = "a_night_daily_final_amount"
 T_NIGHT_STATION = "a_station_night_daily_final_amount"
 
 # =========================
+# [추가] DB 로그 저장 대상
+# =========================
+LOG_SCHEMA = "k_demon_heath_check"
+LOG_TABLE = "1_log"  # 숫자로 시작하므로 식별자 quoting 필수
+
+# 메모리 버퍼(일시적 DB 다운 시 로그 유실 최소화)
+PENDING_LOG_ROWS: List[Dict[str, str]] = []
+
+# =========================
 # 시간대(한 줄 라벨)
 # =========================
 DAY_BANDS = [
@@ -114,13 +129,6 @@ NIGHT_BANDS = [
     ("E'시간대(04:30:00 ~ 06:29:59)", 8*3600, 10*3600 - 1),
     ("F'시간대(06:30:00 ~ 08:29:59)",10*3600, 12*3600 - 1),
 ]
-
-# =========================
-# 로깅
-# =========================
-def log(level: str, msg: str):
-    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{now} [{level}] {msg}", flush=True)
 
 # =========================
 # SQL 식별자 quoting
@@ -153,6 +161,72 @@ def with_work_mem(conn):
     conn.execute(text("SET work_mem = :wm;"), {"wm": WORK_MEM})
 
 # =========================
+# [추가] 헬스 로그 테이블 보장/적재
+# =========================
+def ensure_log_table(engine: Engine):
+    with engine.begin() as conn:
+        with_work_mem(conn)
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {qident(LOG_SCHEMA)};"))
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {qident(LOG_SCHEMA)}.{qident(LOG_TABLE)} (
+                end_day  text,
+                end_time text,
+                info     text,
+                contents text
+            );
+        """))
+
+def _mk_log_row(info: str, contents: str, now: Optional[datetime] = None) -> Dict[str, str]:
+    ts = now or datetime.now(KST)
+    return {
+        "end_day": ts.strftime("%Y%m%d"),
+        "end_time": ts.strftime("%H:%M:%S"),
+        "info": (info or "").strip().lower(),   # 반드시 소문자
+        "contents": str(contents or ""),
+    }
+
+def flush_pending_logs(engine: Optional[Engine]):
+    if engine is None:
+        return
+    if not PENDING_LOG_ROWS:
+        return
+    try:
+        ensure_log_table(engine)
+        # 사양: end_day, end_time, info, contents 순서로 dataframe화하여 저장
+        df = pd.DataFrame(PENDING_LOG_ROWS, columns=["end_day", "end_time", "info", "contents"])
+        if df.empty:
+            return
+
+        sql = text(f"""
+            INSERT INTO {qident(LOG_SCHEMA)}.{qident(LOG_TABLE)}
+            (end_day, end_time, info, contents)
+            VALUES (:end_day, :end_time, :info, :contents)
+        """)
+        records = df.to_dict(orient="records")
+        with engine.begin() as conn:
+            with_work_mem(conn)
+            conn.execute(sql, records)
+
+        PENDING_LOG_ROWS.clear()
+    except Exception:
+        # 로그 저장 실패는 데몬 로직에 영향 주지 않음
+        pass
+
+def log(level: str, msg: str, engine: Optional[Engine] = None):
+    """
+    콘솔 출력 + DB 로그 버퍼 적재(가능 시 즉시 flush)
+    info: error/down/sleep/... 처럼 소문자 저장
+    """
+    now = datetime.now(KST)
+    print(f"{now.strftime('%Y-%m-%d %H:%M:%S')} [{level}] {msg}", flush=True)
+
+    # level을 info 컬럼으로 사용 (소문자 강제)
+    PENDING_LOG_ROWS.append(_mk_log_row(level, msg, now=now))
+
+    # 엔진이 살아있으면 즉시 flush 시도
+    flush_pending_logs(engine)
+
+# =========================
 # SHIFT WINDOW
 # =========================
 @dataclass(frozen=True)
@@ -181,13 +255,11 @@ def current_shift_window(now: datetime) -> ShiftWindow:
         prod_day = today.strftime("%Y%m%d")
         return ShiftWindow(prod_day, "day", day_start, now)
 
-    # night: 오늘 20:30 이후
     if now >= datetime(today.year, today.month, today.day, 20, 30, 0, tzinfo=KST):
         prod_day = today.strftime("%Y%m%d")
         night_start = datetime(today.year, today.month, today.day, 20, 30, 0, tzinfo=KST)
         return ShiftWindow(prod_day, "night", night_start, now)
 
-    # now < 08:30 -> 전일 night
     prev = today - timedelta(days=1)
     prod_day = prev.strftime("%Y%m%d")
     night_start = datetime(prev.year, prev.month, prev.day, 20, 30, 0, tzinfo=KST)
@@ -295,7 +367,7 @@ def detect_result_col(engine: Engine) -> str:
 @dataclass
 class LastPK:
     end_day: str
-    end_time: str  # normalized HH:MI:SS
+    end_time: str
     barcode: str
 
 def fetch_rows(
@@ -304,12 +376,6 @@ def fetch_rows(
     result_col: str,
     last_pk: Optional[LastPK],
 ) -> pd.DataFrame:
-    """
-    반환 컬럼: station, barcode_information, end_day, end_time, end_ts, result_raw
-    - window 범위 필터 포함
-    - last_pk가 있으면 (end_day,end_time,barcode) > last_pk만
-    - end_time은 ms 제거한 HH:MI:SS로 정규화하여 비교/출력
-    """
     end_days = sorted({window.start_dt.strftime("%Y%m%d"), window.end_dt.strftime("%Y%m%d")})
     rc = qident(result_col)
 
@@ -366,7 +432,12 @@ def fetch_rows(
         df = pd.read_sql(text(sql), conn, params=params)
 
     if not df.empty:
-        df["end_ts"] = pd.to_datetime(df["end_ts"], errors="coerce").dt.tz_localize(KST)
+        # DB 타입/드라이버 케이스 대응
+        ts = pd.to_datetime(df["end_ts"], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            df["end_ts"] = ts.dt.tz_localize(KST, ambiguous="NaT", nonexistent="NaT")
+        else:
+            df["end_ts"] = ts.dt.tz_convert(KST)
     return df
 
 def compute_last_pk_from_df(df: pd.DataFrame) -> Optional[LastPK]:
@@ -385,7 +456,7 @@ class LatestRow:
     end_day: str
     end_time: str
     end_ts: datetime
-    passfail: str  # "PASS"/"FAIL"
+    passfail: str
 
 def _is_fct_station(st: str) -> bool:
     return st in FCT_STATIONS
@@ -398,11 +469,6 @@ def update_latest_maps(
     latest_vis: Dict[str, LatestRow],
     df_new: pd.DataFrame,
 ) -> Tuple[int, int]:
-    """
-    ✅ dedup 범위 분리:
-    - FCT군(FCT1~4) 내 barcode별 최신 1건
-    - Vision군(Vision1~2) 내 barcode별 최신 1건
-    """
     if df_new is None or df_new.empty:
         return 0, 0
 
@@ -433,15 +499,11 @@ def update_latest_maps(
             if prev is None or row.end_ts > prev.end_ts:
                 latest_fct[barcode] = row
                 upd_fct += 1
-
         elif _is_vision_station(station):
             prev = latest_vis.get(barcode)
             if prev is None or row.end_ts > prev.end_ts:
                 latest_vis[barcode] = row
                 upd_vis += 1
-
-        else:
-            continue
 
     return upd_fct, upd_vis
 
@@ -454,10 +516,6 @@ def build_overall_df_from_latest(
     remark_map: Dict[str, Tuple[str, str]],
     updated_at: datetime,
 ) -> pd.DataFrame:
-    """
-    overall(=station 없는 테이블) 생성
-    ✅ overall은 "최종" 성격으로 Vision군만 넣는 규칙 적용
-    """
     bands = DAY_BANDS if window.shift_type == "day" else NIGHT_BANDS
     band_cols = [b[0] for b in bands]
     group_overall = ["prod_day", "shift_type", "pn", "remark"]
@@ -522,10 +580,6 @@ def build_station_df_from_latest(
     remark_map: Dict[str, Tuple[str, str]],
     updated_at: datetime,
 ) -> pd.DataFrame:
-    """
-    station 테이블 생성
-    ✅ station 테이블은 FCT군 + Vision군 모두 포함
-    """
     bands = DAY_BANDS if window.shift_type == "day" else NIGHT_BANDS
     band_cols = [b[0] for b in bands]
     group_station = ["prod_day", "shift_type", "station", "pn", "remark"]
@@ -696,35 +750,36 @@ def insert_df(engine: Engine, schema: str, table: str, df: pd.DataFrame) -> int:
 # 메인 루프
 # =========================
 def main():
-    log("BOOT", "backend1 daily final amount daemon starting")
-    log("INFO", f"stations={STATIONS} (FCT+Vision), dedup scope = FCT-group / Vision-group separated")
+    # 부팅 로그(아직 DB 엔진 없으므로 버퍼만 적재)
+    log("boot", "backend1 daily final amount daemon starting")
+    log("info", f"stations={STATIONS} (FCT+Vision), dedup scope = FCT-group / Vision-group separated")
 
     engine: Optional[Engine] = None
 
-    # 상태(메모리) - ✅ dedup 분리
     latest_fct: Dict[str, LatestRow] = {}
     latest_vis: Dict[str, LatestRow] = {}
     last_pk: Optional[LastPK] = None
 
-    current_ctx: Optional[Tuple[str, str]] = None  # (prod_day, shift_type)
+    current_ctx: Optional[Tuple[str, str]] = None
     last_reset_fired: Optional[str] = None
 
     remark_map: Dict[str, Tuple[str, str]] = {}
     result_col: Optional[str] = None
     last_remark_refresh: Optional[datetime] = None
 
-    # DB 붙을 때까지 무한 재시도(블로킹)
     while True:
         try:
             engine = make_engine()
             ensure_db_ready(engine)
-            log("INFO", f"DB connected (work_mem={WORK_MEM}, pool_size=1)")
+            ensure_log_table(engine)
+            flush_pending_logs(engine)
+            log("info", f"db connected (work_mem={WORK_MEM}, pool_size=1)", engine)
             break
         except Exception as e:
-            log("RETRY", f"DB connect failed: {type(e).__name__}: {e}")
+            log("retry", f"db connect failed: {type(e).__name__}: {e}", engine=None)
+            log("sleep", f"sleep {DB_RETRY_INTERVAL_SEC}s before reconnect", engine=None)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
-    # 초기 세팅(컬럼 감지, remark_map 로드, 스키마 준비)
     while True:
         try:
             assert engine is not None
@@ -733,13 +788,15 @@ def main():
             last_remark_refresh = datetime.now(KST)
 
             ensure_schema(engine, SAVE_SCHEMA)
-            log("INFO", f"bootstrap OK (result_col={result_col})")
+            ensure_log_table(engine)
+            flush_pending_logs(engine)
+            log("info", f"bootstrap ok (result_col={result_col})", engine)
             break
         except Exception as e:
-            log("RETRY", f"bootstrap failed: {type(e).__name__}: {e}")
+            log("retry", f"bootstrap failed: {type(e).__name__}: {e}", engine)
+            log("sleep", f"sleep {DB_RETRY_INTERVAL_SEC}s before bootstrap retry", engine)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
-    # 루프
     while True:
         loop_t0 = time_mod.time()
         now = datetime.now(KST)
@@ -748,33 +805,29 @@ def main():
             assert engine is not None
             assert result_col is not None
 
+            flush_pending_logs(engine)
+
             window = current_shift_window(now)
             ctx = (window.prod_day, window.shift_type)
 
-            # 리셋 트리거 체크
             tag = reset_tag(window, now)
-
             need_full_rebuild = False
 
-            # shift/prod_day 변경 시 풀 리빌드
             if current_ctx is None or ctx != current_ctx:
                 need_full_rebuild = True
                 last_reset_fired = None
-                log("INFO", f"[WINDOW] prod_day={window.prod_day} shift={window.shift_type} {window.start_dt} -> {window.end_dt} (ctx change)")
+                log("info", f"[window] prod_day={window.prod_day} shift={window.shift_type} {window.start_dt} -> {window.end_dt} (ctx change)", engine)
 
-            # 리셋 타이밍(±30s, 1회)
             if tag is not None and tag != last_reset_fired:
                 need_full_rebuild = True
                 last_reset_fired = tag
-                log("INFO", f"[RESET] trigger={tag} (full rebuild & delete+insert)")
+                log("info", f"[reset] trigger={tag} (full rebuild & delete+insert)", engine)
 
-            # remark_map 주기적 갱신(10분)
             if last_remark_refresh is None or (now - last_remark_refresh).total_seconds() >= 600:
                 remark_map = load_remark_map(engine)
                 last_remark_refresh = now
-                log("INFO", "remark_map refreshed")
+                log("info", "remark_map refreshed", engine)
 
-            # 테이블 선택
             if window.shift_type == "day":
                 t_overall = T_DAY_OVERALL
                 t_station = T_DAY_STATION
@@ -785,51 +838,49 @@ def main():
             KEY_OVERALL = ["prod_day", "shift_type", "pn"]
             KEY_STATION = ["prod_day", "shift_type", "station", "pn"]
 
-            # FULL REBUILD
             if need_full_rebuild:
                 latest_fct = {}
                 latest_vis = {}
                 last_pk = None
 
-                log("INFO", f"[LAST_PK] (reset) last_pk=None -> full fetch")
+                log("info", "[last_pk] (reset) last_pk=None -> full fetch", engine)
 
                 df_all = fetch_rows(engine, window, result_col, last_pk=None)
-                log("INFO", f"[FETCH] full rows={len(df_all)}")
+                log("info", f"[fetch] full rows={len(df_all)}", engine)
 
                 upd_fct, upd_vis = update_latest_maps(latest_fct, latest_vis, df_all)
                 last_pk = compute_last_pk_from_df(df_all)
 
-                log("INFO", f"[BUILD] latest_fct={len(latest_fct)}(upd={upd_fct}) latest_vis={len(latest_vis)}(upd={upd_vis}) last_pk={None if last_pk is None else (last_pk.end_day, last_pk.end_time, last_pk.barcode)}")
+                log(
+                    "info",
+                    f"[build] latest_fct={len(latest_fct)}(upd={upd_fct}) latest_vis={len(latest_vis)}(upd={upd_vis}) "
+                    f"last_pk={None if last_pk is None else (last_pk.end_day, last_pk.end_time, last_pk.barcode)}",
+                    engine
+                )
 
                 updated_at = now
-
-                # ✅ overall = Vision군만
                 overall_df = build_overall_df_from_latest(latest_vis.values(), window, remark_map, updated_at)
-
-                # ✅ station = FCT + Vision 모두
                 station_rows = list(latest_fct.values()) + list(latest_vis.values())
                 station_df = build_station_df_from_latest(station_rows, window, remark_map, updated_at)
 
                 ensure_table(engine, SAVE_SCHEMA, t_overall, overall_df.columns.tolist(), KEY_OVERALL)
                 ensure_table(engine, SAVE_SCHEMA, t_station, station_df.columns.tolist(), KEY_STATION)
 
-                log("INFO", f"[INSERT] delete+insert into {SAVE_SCHEMA}.{t_overall} / {SAVE_SCHEMA}.{t_station}")
+                log("info", f"[insert] delete+insert into {SAVE_SCHEMA}.{t_overall} / {SAVE_SCHEMA}.{t_station}", engine)
                 delete_shift_rows(engine, SAVE_SCHEMA, t_overall, window.prod_day, window.shift_type)
                 delete_shift_rows(engine, SAVE_SCHEMA, t_station, window.prod_day, window.shift_type)
 
                 ins1 = insert_df(engine, SAVE_SCHEMA, t_overall, overall_df)
                 ins2 = insert_df(engine, SAVE_SCHEMA, t_station, station_df)
 
-                log("INFO", f"[INSERT] inserted overall(Vision)={ins1}, station(FCT+Vision)={ins2}")
-
+                log("info", f"[insert] inserted overall(vision)={ins1}, station(fct+vision)={ins2}", engine)
                 current_ctx = ctx
 
-            # INCREMENTAL
             else:
-                log("INFO", f"[LAST_PK] last_pk={None if last_pk is None else (last_pk.end_day, last_pk.end_time, last_pk.barcode)}")
+                log("info", f"[last_pk] last_pk={None if last_pk is None else (last_pk.end_day, last_pk.end_time, last_pk.barcode)}", engine)
 
                 df_new = fetch_rows(engine, window, result_col, last_pk=last_pk)
-                log("INFO", f"[FETCH] new rows={len(df_new)}")
+                log("info", f"[fetch] new rows={len(df_new)}", engine)
 
                 if not df_new.empty:
                     upd_fct, upd_vis = update_latest_maps(latest_fct, latest_vis, df_new)
@@ -838,49 +889,55 @@ def main():
                     if last_pk_new is not None:
                         last_pk = last_pk_new
 
-                    log("INFO", f"[BUILD] latest_fct={len(latest_fct)}(upd={upd_fct}) latest_vis={len(latest_vis)}(upd={upd_vis}) last_pk={(last_pk.end_day, last_pk.end_time, last_pk.barcode) if last_pk else None}")
+                    log(
+                        "info",
+                        f"[build] latest_fct={len(latest_fct)}(upd={upd_fct}) latest_vis={len(latest_vis)}(upd={upd_vis}) "
+                        f"last_pk={(last_pk.end_day, last_pk.end_time, last_pk.barcode) if last_pk else None}",
+                        engine
+                    )
 
                     updated_at = now
-
-                    # ✅ overall = Vision군만
                     overall_df = build_overall_df_from_latest(latest_vis.values(), window, remark_map, updated_at)
-
-                    # ✅ station = FCT + Vision 모두
                     station_rows = list(latest_fct.values()) + list(latest_vis.values())
                     station_df = build_station_df_from_latest(station_rows, window, remark_map, updated_at)
 
                     ensure_table(engine, SAVE_SCHEMA, t_overall, overall_df.columns.tolist(), KEY_OVERALL)
                     ensure_table(engine, SAVE_SCHEMA, t_station, station_df.columns.tolist(), KEY_STATION)
 
-                    log("INFO", f"[UPSERT] saving to {SAVE_SCHEMA}.{t_overall} / {SAVE_SCHEMA}.{t_station}")
+                    log("info", f"[upsert] saving to {SAVE_SCHEMA}.{t_overall} / {SAVE_SCHEMA}.{t_station}", engine)
                     up1 = upsert_df(engine, SAVE_SCHEMA, t_overall, overall_df, KEY_OVERALL)
                     up2 = upsert_df(engine, SAVE_SCHEMA, t_station, station_df, KEY_STATION)
-                    log("INFO", f"[UPSERT] upserted overall(Vision)={up1}, station(FCT+Vision)={up2}")
+                    log("info", f"[upsert] upserted overall(vision)={up1}, station(fct+vision)={up2}", engine)
 
                 current_ctx = ctx
 
         except (OperationalError, DBAPIError) as e:
-            log("RETRY", f"DB error: {type(e).__name__}: {e}")
+            log("down", f"db error: {type(e).__name__}: {e}", engine=None)
             while True:
                 try:
                     engine = make_engine()
                     ensure_db_ready(engine)
-                    log("INFO", f"DB reconnected (work_mem={WORK_MEM})")
+                    ensure_log_table(engine)
+                    flush_pending_logs(engine)
+                    log("info", f"db reconnected (work_mem={WORK_MEM})", engine)
 
                     result_col = detect_result_col(engine)
                     remark_map = load_remark_map(engine)
                     last_remark_refresh = datetime.now(KST)
-                    log("INFO", f"re-bootstrap OK (result_col={result_col})")
+                    log("info", f"re-bootstrap ok (result_col={result_col})", engine)
                     break
                 except Exception as e2:
-                    log("RETRY", f"DB reconnect failed: {type(e2).__name__}: {e2}")
+                    log("retry", f"db reconnect failed: {type(e2).__name__}: {e2}", engine=None)
+                    log("sleep", f"sleep {DB_RETRY_INTERVAL_SEC}s before reconnect retry", engine=None)
                     time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
         except Exception as e:
-            log("RETRY", f"Unhandled error: {type(e).__name__}: {e}")
+            log("error", f"unhandled error: {type(e).__name__}: {e}", engine)
 
         elapsed = time_mod.time() - loop_t0
-        time_mod.sleep(max(0.0, LOOP_INTERVAL_SEC - elapsed))
+        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+        log("sleep", f"loop sleep {sleep_sec:.3f}s", engine)
+        time_mod.sleep(sleep_sec)
 
 if __name__ == "__main__":
     main()
