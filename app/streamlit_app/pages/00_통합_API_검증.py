@@ -17,18 +17,15 @@ if _ROOT not in sys.path:
 
 from api_client import (  # noqa: E402
     get_worker_info, post_worker_info,
-    get_email_list, post_email_list,
-    get_remark_info, post_remark_info,
+    get_email_list, post_email_list_sync,
+    get_remark_info, post_remark_info_sync,
+    get_mastersample,
     get_planned_today, post_planned_today,
     get_non_operation_time, post_non_operation_time,
     get_alarm_records,
     get_pd_board_check,
     get_report,
 )
-
-# /email_list/sync 직접 호출용 (api_client에 sync 함수가 없어도 동작)
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
-API_TIMEOUT_SEC = float(os.getenv("API_TIMEOUT_SEC", "30"))
 
 st.set_page_config(page_title="통합 API 검증", layout="wide")
 st.title("통합 API 검증")
@@ -44,6 +41,7 @@ tabs = st.tabs([
     "2.worker_info",
     "3.email_list",
     "4.remark_info",
+    "5.mastersample",
     "6.planned_time",
     "7.non_operation_time",
     "9.alarm_record",
@@ -54,7 +52,11 @@ tabs = st.tabs([
 
 def show_exc(e: Exception):
     if isinstance(e, requests.HTTPError) and e.response is not None:
-        st.error(f"HTTP {e.response.status_code}: {e.response.text}")
+        msg = e.response.text or ""
+        if "OperationalError" in msg or "Connection timed out" in msg or "connection refused" in msg:
+            st.error("DB 연결 실패: 서버 접속 불가. 네트워크/VPN/DB 상태를 확인하세요.")
+        else:
+            st.error(f"HTTP {e.response.status_code}: {msg[:500]}")
     else:
         st.error(str(e))
 
@@ -65,7 +67,6 @@ def to_df(data: Any) -> pd.DataFrame:
     if isinstance(data, list):
         return pd.DataFrame(data)
     if isinstance(data, dict):
-        # {"rows":[...]} 구조 대응
         if "rows" in data and isinstance(data["rows"], list):
             return pd.DataFrame(data["rows"])
         return pd.DataFrame([data])
@@ -84,15 +85,10 @@ def _norm_text(v: Any) -> str:
 
 
 def _norm_email(v: Any) -> str:
-    s = _norm_text(v).lower()
-    return s
+    return _norm_text(v).lower()
 
 
 def parse_cosine_similarity(cell: Any) -> dict | None:
-    """
-    cosine_similarity 컬럼이 dict 또는 문자열(dict 형태)일 수 있어 안전 파싱
-    예: {"th":0.7,"type":"timeseries","x":["20260203",...],"y":[...]}
-    """
     if cell is None:
         return None
     if isinstance(cell, dict):
@@ -106,26 +102,6 @@ def parse_cosine_similarity(cell: Any) -> dict | None:
         except Exception:
             return None
     return None
-
-
-def _post_email_sync(emails: list[str], admin_password: str):
-    """
-    /email_list/sync 직접 호출
-    헤더: X-ADMIN-PASS
-    바디: {"emails":[...]}
-    """
-    if not admin_password:
-        raise ValueError("admin_password를 입력해 주세요.")
-
-    url = f"{API_BASE_URL.rstrip('/')}/email_list/sync"
-    headers = {"X-ADMIN-PASS": admin_password}
-    body = {"emails": emails}
-    r = requests.post(url, json=body, headers=headers, timeout=API_TIMEOUT_SEC)
-    r.raise_for_status()
-    ct = r.headers.get("content-type", "")
-    if "application/json" in ct:
-        return r.json()
-    return r.text
 
 
 # 2) worker_info
@@ -149,17 +125,17 @@ with tabs[0]:
             show_exc(e)
 
 
-# 3) email_list
+# 3) email_list (GET + sync만)
 with tabs[1]:
     st.subheader("GET email_list")
     c_get, c_pw = st.columns([1, 2])
+
     with c_get:
         if st.button("조회##e"):
             try:
                 data = get_email_list()
                 df = to_df(data)
 
-                # 서버 응답 컬럼명 편차 대응: email / email_list
                 if "email_list" not in df.columns and "email" in df.columns:
                     df = df.rename(columns={"email": "email_list"})
                 if "email_list" not in df.columns:
@@ -174,18 +150,9 @@ with tabs[1]:
     with c_pw:
         email_admin_pw = st.text_input("admin_password", type="password", value="", key="email_admin_pw")
 
-    st.subheader("POST email_list (단건)")
-    email = st.text_input("email", value="hong.gildong@aptiv.com")
-    if st.button("저장##e"):
-        try:
-            out = post_email_list(email, admin_password=email_admin_pw)
-            st.success(out)
-        except Exception as e:
-            show_exc(e)
-
     st.divider()
-    st.subheader("전체 목록 편집/동기화 저장")
-    st.caption("표에서 행 추가/삭제 후 저장하면 DB와 동기화됩니다. (같은 값 중복은 자동 정리)")
+    st.subheader("POST email_list/sync (전체 동기화)")
+    st.caption("표에서 행 추가/삭제 후 저장하면 DB와 동기화됩니다. (중복/빈값 자동 정리)")
 
     if "email_df" in st.session_state:
         edited_email_df = st.data_editor(
@@ -200,6 +167,8 @@ with tabs[1]:
         try:
             if "email_df_edited" not in st.session_state:
                 st.warning("먼저 [조회]로 목록을 불러오세요.")
+            elif not email_admin_pw:
+                st.warning("admin_password를 입력해 주세요.")
             else:
                 edited: pd.DataFrame = st.session_state["email_df_edited"].copy()
                 if "email_list" not in edited.columns:
@@ -215,10 +184,9 @@ with tabs[1]:
                             seen.add(em)
                             emails.append(em)
 
-                    out = _post_email_sync(emails, email_admin_pw)
+                    out = post_email_list_sync(emails, email_admin_pw)
                     st.success(out)
 
-                    # 저장 후 재조회
                     latest = to_df(get_email_list())
                     if "email_list" not in latest.columns and "email" in latest.columns:
                         latest = latest.rename(columns={"email": "email_list"})
@@ -229,31 +197,103 @@ with tabs[1]:
             show_exc(e)
 
 
-# 4) remark_info
+# 4) remark_info (GET + sync만)
 with tabs[2]:
     st.subheader("GET remark_info")
-    if st.button("조회##r"):
+    c_get_r, c_pw_r = st.columns([1, 2])
+
+    with c_get_r:
+        if st.button("조회##r"):
+            try:
+                data = get_remark_info()
+                df = to_df(data)
+
+                # key 호환 컬럼이 있으면 barcode_information으로 통일
+                if "barcode_information" not in df.columns and "key" in df.columns:
+                    df = df.rename(columns={"key": "barcode_information"})
+
+                if "barcode_information" not in df.columns:
+                    df["barcode_information"] = ""
+                if "pn" not in df.columns:
+                    df["pn"] = ""
+                if "remark" not in df.columns:
+                    df["remark"] = ""
+
+                df = df[["barcode_information", "pn", "remark"]].copy()
+                st.session_state["remark_df"] = df
+                st.session_state["remark_df_edited"] = df.copy()
+            except Exception as e:
+                show_exc(e)
+
+    with c_pw_r:
+        remark_admin_pw = st.text_input("admin_password##remark", type="password", value="")
+
+    st.divider()
+    st.subheader("POST remark_info/sync (전체 동기화)")
+    st.caption("표에서 행 추가/삭제/수정 후 저장하면 DB와 동기화됩니다. (barcode_information 기준)")
+
+    if "remark_df" in st.session_state:
+        edited_remark_df = st.data_editor(
+            st.session_state["remark_df"],
+            use_container_width=True,
+            num_rows="dynamic",
+            key="remark_editor",
+        )
+        st.session_state["remark_df_edited"] = edited_remark_df
+
+    if st.button("저장##r_sync"):
         try:
-            data = get_remark_info()
-            st.dataframe(to_df(data), use_container_width=True)
+            if "remark_df_edited" not in st.session_state:
+                st.warning("먼저 [조회]로 목록을 불러오세요.")
+            elif not remark_admin_pw:
+                st.warning("admin_password를 입력해 주세요.")
+            else:
+                edited: pd.DataFrame = st.session_state["remark_df_edited"].copy()
+                needed = {"barcode_information", "pn", "remark"}
+                if not needed.issubset(set(edited.columns)):
+                    st.error(f"필수 컬럼 누락: {needed - set(edited.columns)}")
+                else:
+                    rows: list[dict] = []
+                    last_by_barcode: dict[str, dict] = {}
+
+                    for _, row in edited.iterrows():
+                        barcode = _norm_text(row.get("barcode_information"))
+                        if not barcode:
+                            continue
+                        last_by_barcode[barcode] = {
+                            "barcode_information": barcode,
+                            "pn": _norm_text(row.get("pn")) or None,
+                            "remark": _norm_text(row.get("remark")) or None,
+                        }
+
+                    rows = [last_by_barcode[k] for k in sorted(last_by_barcode.keys())]
+                    out = post_remark_info_sync(rows, remark_admin_pw)
+                    st.success(out)
+
+                    latest = to_df(get_remark_info())
+                    if "barcode_information" not in latest.columns and "key" in latest.columns:
+                        latest = latest.rename(columns={"key": "barcode_information"})
+                    for c in ["barcode_information", "pn", "remark"]:
+                        if c not in latest.columns:
+                            latest[c] = ""
+                    st.session_state["remark_df"] = latest[["barcode_information", "pn", "remark"]].copy()
         except Exception as e:
             show_exc(e)
 
-    st.subheader("POST remark_info")
-    key = st.text_input("key (예: J)", value="J")
-    pn = st.text_input("pn", value="TEST_PN")
-    remark = st.text_input("remark", value="테스트 비고")
-    remark_admin_pw = st.text_input("admin_password##remark", type="password", value="")
-    if st.button("저장##r"):
+
+# 5) mastersample
+with tabs[3]:
+    st.subheader("GET mastersample (e_mastersample_test)")
+    if st.button("조회##m"):
         try:
-            out = post_remark_info(key, pn, remark, admin_password=remark_admin_pw)
-            st.success(out)
+            data = get_mastersample(day, shift)
+            st.dataframe(to_df(data), use_container_width=True)
         except Exception as e:
             show_exc(e)
 
 
 # 6) planned_time
-with tabs[3]:
+with tabs[4]:
     st.subheader("GET planned_time/today")
     if st.button("조회##p"):
         try:
@@ -275,7 +315,7 @@ with tabs[3]:
 
 
 # 7) non_operation_time
-with tabs[4]:
+with tabs[5]:
     st.subheader("GET non_operation_time")
     if st.button("조회##n"):
         try:
@@ -287,8 +327,6 @@ with tabs[4]:
 
             if "nonop_df" in st.session_state:
                 base_df = st.session_state["nonop_df"].copy()
-
-                # reason/sparepart 컬럼 없으면 생성
                 if "reason" not in base_df.columns:
                     base_df["reason"] = ""
                 if "sparepart" not in base_df.columns:
@@ -352,7 +390,7 @@ with tabs[4]:
 
 
 # 9) alarm_record
-with tabs[5]:
+with tabs[6]:
     st.subheader("GET alarm_record/recent")
     st.caption("end_day 기준 조회")
     if st.button("조회##a"):
@@ -365,7 +403,7 @@ with tabs[5]:
 
 
 # 10) pd_board_check
-with tabs[6]:
+with tabs[7]:
     st.subheader("GET predictive/pd-board-check/{prod_day}")
     pd_day = st.text_input("prod_day", value=day, key="pd_day")
     if st.button("조회##pd"):
@@ -373,11 +411,9 @@ with tabs[6]:
             data = get_pd_board_check(pd_day)
             df = to_df(data)
 
-            # 테이블: cosine_similarity 제외
             df_show = df.drop(columns=["cosine_similarity"], errors="ignore")
             st.dataframe(df_show, use_container_width=True)
 
-            # 그래프: cosine_similarity 내부 x/y/th 사용
             if "cosine_similarity" in df.columns and not df.empty:
                 series_df_list = []
                 th_value = None
@@ -406,8 +442,6 @@ with tabs[6]:
                 if series_df_list:
                     chart_df = pd.concat(series_df_list, axis=1)
                     chart_df = chart_df.loc[:, ~chart_df.columns.duplicated()]
-
-                    # threshold 라인 추가
                     if th_value is not None:
                         chart_df["COS_TH"] = th_value
 
@@ -423,7 +457,7 @@ with tabs[6]:
 
 
 # 11) reports
-with tabs[7]:
+with tabs[8]:
     st.subheader("GET reports")
     report_name = st.selectbox(
         "report endpoint",
@@ -453,7 +487,6 @@ with tabs[7]:
             data = get_report(report_name, day, shift)
             df = to_df(data)
 
-            # 요청사항: b_station_percentage는 updated_at 컬럼 제거
             if report_name == "b_station_percentage" and "updated_at" in df.columns:
                 df = df.drop(columns=["updated_at"], errors="ignore")
 

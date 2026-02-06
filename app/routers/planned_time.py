@@ -27,7 +27,6 @@ def get_today(engine: Engine = Depends(get_engine)):
 async def post_today(body: PlannedTimeIn, engine: Engine = Depends(get_engine)):
     planned_time_svc.upsert_today(engine, body)
 
-    # planned_time_event 발행
     await event_bus.publish(
         "planned_time_event",
         {

@@ -7,7 +7,6 @@ from typing import Any, Optional
 import requests
 
 API = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
-# 타임아웃 상향 (기본 30초)
 TIMEOUT = float(os.getenv("API_TIMEOUT_SEC", "30"))
 
 _session = requests.Session()
@@ -59,49 +58,9 @@ def get_email_list():
     return _req("GET", "/email_list")
 
 
-def post_email_list(email: str, admin_password: Optional[str] = None):
-    """
-    권장:
-    - POST /email_list
-    - header: X-ADMIN-PASS
-    - body: {"email":"..."}
-    하위호환:
-    - /email_list/sync, /email_list/post
-    - 비밀번호를 body로 받는 서버도 대응
-    """
-    paths = [
-        "/email_list",        # 권장
-        "/email_list/sync",   # 하위호환
-        "/email_list/post",   # 하위호환
-    ]
-
-    header_variants = [None]
-    if admin_password:
-        header_variants.extend([
-            {"X-ADMIN-PASS": admin_password},
-            {"x-admin-pass": admin_password},
-        ])
-
-    body_variants = [{"email": email}]
-    if admin_password:
-        body_variants.extend([
-            {"email": email, "admin_password": admin_password},
-            {"email": email, "password": admin_password},
-        ])
-
-    last_err = None
-    for path in paths:
-        for headers in header_variants:
-            for body in body_variants:
-                try:
-                    return _req("POST", path, json_body=body, headers=headers)
-                except requests.HTTPError as e:
-                    last_err = e
-                    continue
-
-    if last_err:
-        raise last_err
-    raise RuntimeError("POST email_list failed")
+def post_email_list_sync(emails: list[str], admin_password: str):
+    headers = {"X-ADMIN-PASS": admin_password}
+    return _req("POST", "/email_list/sync", json_body={"emails": emails}, headers=headers)
 
 
 # ---------- 4. remark_info ----------
@@ -109,58 +68,22 @@ def get_remark_info():
     return _req("GET", "/remark_info")
 
 
-def post_remark_info(
-    key: str,
-    pn: str,
-    remark: str,
-    admin_password: Optional[str] = None,
-    barcode_information: Optional[str] = None,
-):
+def post_remark_info_sync(rows: list[dict], admin_password: str):
     """
-    Swagger/서버 편차 대응:
-    - /remark_info/{key} 또는 /remark_info
-    - X-ADMIN-PASS 헤더 우선
-    - body 키명 편차(admin_password/password)도 보조 시도
-    - 서버가 barcode_information 필수인 경우 대응
+    rows 예시:
+    [
+      {"barcode_information":"J","pn":"TEST_PN","remark":"테스트 비고"},
+      ...
+    ]
     """
-    path_candidates = [f"/remark_info/{key}", "/remark_info"]
+    headers = {"X-ADMIN-PASS": admin_password}
+    return _req("POST", "/remark_info/sync", json_body={"rows": rows}, headers=headers)
 
-    base1 = {"pn": pn, "remark": remark}
-    base2 = {"key": key, "pn": pn, "remark": remark}
 
-    if barcode_information is not None and str(barcode_information).strip() != "":
-        base1["barcode_information"] = str(barcode_information).strip()
-        base2["barcode_information"] = str(barcode_information).strip()
-
-    body_candidates = [base1, base2]
-    if admin_password:
-        body_candidates.extend([
-            {**base1, "admin_password": admin_password},
-            {**base1, "password": admin_password},
-            {**base2, "admin_password": admin_password},
-            {**base2, "password": admin_password},
-        ])
-
-    header_variants = [None]
-    if admin_password:
-        header_variants.extend([
-            {"X-ADMIN-PASS": admin_password},
-            {"x-admin-pass": admin_password},
-        ])
-
-    last_err = None
-    for path in path_candidates:
-        for headers in header_variants:
-            for body in body_candidates:
-                try:
-                    return _req("POST", path, json_body=body, headers=headers)
-                except requests.HTTPError as e:
-                    last_err = e
-                    continue
-
-    if last_err:
-        raise last_err
-    raise RuntimeError("POST remark_info failed")
+# ---------- 5. mastersample ----------
+def get_mastersample(prod_day: str, shift_type: str):
+    # reports의 e_mastersample_test endpoint 재사용
+    return _req("GET", f"/report/e_mastersample_test/{prod_day}", params={"shift_type": shift_type})
 
 
 # ---------- 6. planned_time ----------
@@ -169,10 +92,6 @@ def get_planned_today():
 
 
 def post_planned_today(from_time: str, to_time: str, reason: str, end_day: Optional[str] = None):
-    """
-    station 없이 today 기준 POST
-    서버가 end_day를 받는 경우를 위해 optional로 실어줌
-    """
     body = {
         "from_time": from_time,
         "to_time": to_time,
@@ -209,13 +128,11 @@ def post_non_operation_time(
 
 # ---------- 9. alarm_record ----------
 def get_alarm_records(end_day: str):
-    # Swagger 기준: /alarm_record/recent?end_day=YYYYMMDD
     return _req("GET", "/alarm_record/recent", params={"end_day": end_day})
 
 
 # ---------- 10. pd_board_check ----------
 def get_pd_board_check(prod_day: str):
-    # Swagger 기준: /predictive/pd-board-check/{prod_day}
     return _req("GET", f"/predictive/pd-board-check/{prod_day}")
 
 

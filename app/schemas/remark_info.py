@@ -1,6 +1,7 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, field_validator
+
 import string
+from pydantic import BaseModel, Field, field_validator
 
 
 class RemarkInfoIn(BaseModel):
@@ -22,3 +23,7 @@ class RemarkInfoOut(BaseModel):
     barcode_information: str
     pn: str | None = None
     remark: str | None = None
+
+
+class RemarkInfoSyncIn(BaseModel):
+    items: list[RemarkInfoIn] = Field(default_factory=list)
