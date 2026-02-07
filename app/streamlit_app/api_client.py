@@ -53,6 +53,17 @@ def post_worker_info(end_day: str, shift_type: str, worker_name: str, order_numb
     return _req("POST", "/worker_info", json_body=body)
 
 
+def post_worker_info_sync(rows: list[dict]):
+    """
+    rows 예시:
+    [
+      {"end_day":"20260205","shift_type":"day","worker_name":"홍길동","order_number":"123"},
+      ...
+    ]
+    """
+    return _req("POST", "/worker_info/sync", json_body={"rows": rows})
+
+
 # ---------- 3. email_list ----------
 def get_email_list():
     return _req("GET", "/email_list")
@@ -102,6 +113,11 @@ def post_planned_today(from_time: str, to_time: str, reason: str, end_day: Optio
     return _req("POST", "/planned_time/today", json_body=body)
 
 
+def post_planned_time_sync(rows: list[dict]):
+    # rows: [{"from_time":"HH:MM:SS","to_time":"HH:MM:SS","reason":"..."}, ...]
+    return _req("POST", "/planned_time/sync", json_body={"rows": rows})
+
+
 # ---------- 7. non_operation_time ----------
 def get_non_operation_time(end_day: str, shift_type: str):
     return _req("GET", "/non_operation_time", params={"end_day": end_day, "shift_type": shift_type})
@@ -126,9 +142,31 @@ def post_non_operation_time(
     return _req("POST", "/non_operation_time", json_body=body)
 
 
+def post_non_operation_time_sync(rows: list[dict]):
+    return _req("POST", "/non_operation_time/sync", json_body={"rows": rows})
+
+
+# ---------- 8. worst_case ----------
+def get_worst_case(prod_day: str, shift_type: str):
+    # worst_case 전용 호출
+    return _req("GET", f"/report/f_worst_case/{prod_day}", params={"shift_type": shift_type})
+
+
 # ---------- 9. alarm_record ----------
 def get_alarm_records(end_day: str):
-    return _req("GET", "/alarm_record/recent", params={"end_day": end_day})
+    paths = ["/alarm_record/recent5", "/alarm_record/recent", "/alarm_record"]
+    last_err = None
+    for p in paths:
+        try:
+            return _req("GET", p, params={"end_day": end_day})
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                last_err = e
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("alarm_record endpoint not found")
 
 
 # ---------- 10. pd_board_check ----------

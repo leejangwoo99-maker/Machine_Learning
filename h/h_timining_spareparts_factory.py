@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-h_timing_spareparts_v9_2_backfill_then_realtime.py
+h_timing_spareparts_v9_3_backfill_then_realtime_logdb.py
 ============================================================
 목표
 - fct_non_operation_time(sparepart 교체 이력) 기반으로 구간을 나눠서
@@ -102,7 +102,7 @@ ALARM_TABLE = "alarm_record"
 STATE_SCHEMA = "h_machine_learning"
 STATE_TABLE = "sparepart_interval_state_rt_v9_2"
 
-# DB 로그 저장 대상 (요청 스펙)
+# DB 로그 저장 대상
 LOG_SCHEMA = "k_demon_heath_check"
 LOG_TABLE = "h_log"
 
@@ -604,7 +604,7 @@ def build_features_for_model(
         feat[f"sparepart_{sp}"] = 1.0 if sparepart == sp else 0.0
     if fn:
         return [[float(feat.get(name, 0.0)) for name in fn]]
-    return [[feat["amount"], feat["max_tests"], feat["ratio"]]
+    return [[feat["amount"], feat["max_tests"], feat["ratio"]]]
 
 
 # =================================================
@@ -755,8 +755,11 @@ def roll_state_to_next(conn, st: State, station: str, sparepart: str) -> None:
     st.last_alarm_type = None
     st.next_repl_end_ts = find_next_repl_end_after(conn, station, sparepart, st.current_repl_end_ts)
     save_state(conn, st)
-    log(f"[ROLL] {station}/{sparepart} {prev_current} -> {st.current_repl_end_ts} next={st.next_repl_end_ts}",
-        info="info", conn=conn)
+    log(
+        f"[ROLL] {station}/{sparepart} {prev_current} -> {st.current_repl_end_ts} next={st.next_repl_end_ts}",
+        info="info",
+        conn=conn,
+    )
 
 
 # =================================================
@@ -788,8 +791,11 @@ def main() -> None:
             now_dt = datetime.now()
 
             if now_ts - last_hb >= 60:
-                log(f"[HEARTBEAT] now={now_dt.strftime('%Y-%m-%d %H:%M:%S')} run_id={RUN_ID}",
-                    info="info", conn=conn)
+                log(
+                    f"[HEARTBEAT] now={now_dt.strftime('%Y-%m-%d %H:%M:%S')} run_id={RUN_ID}",
+                    info="info",
+                    conn=conn,
+                )
                 last_hb = now_ts
 
             if not life_map or (now_ts - last_life_reload >= 300):
@@ -813,6 +819,7 @@ def main() -> None:
 
                     st = load_state(conn, station, sparepart)
 
+                    # (1) 초기화
                     if st.current_repl_end_ts is None:
                         repl_list = list_repl_end_ts(conn, station, sparepart)
                         if not repl_list:
@@ -824,25 +831,35 @@ def main() -> None:
                         st.last_alarm_type = None
                         save_state(conn, st)
                         need_immediate = True
-                        log(f"[INIT] {station}/{sparepart} current_end={st.current_repl_end_ts} next_end={st.next_repl_end_ts}",
-                            info="info", conn=conn)
+                        log(
+                            f"[INIT] {station}/{sparepart} current_end={st.current_repl_end_ts} next_end={st.next_repl_end_ts}",
+                            info="info",
+                            conn=conn,
+                        )
 
+                    # 한 루프 내 연속 롤링 처리
                     for _guard in range(50):
+                        # (2) next 갱신
                         if st.current_repl_end_ts is not None:
                             nxt = find_next_repl_end_after(conn, station, sparepart, st.current_repl_end_ts)
                             if nxt is not None and (st.next_repl_end_ts is None or nxt != st.next_repl_end_ts):
                                 st.next_repl_end_ts = nxt
                                 save_state(conn, st)
                                 need_immediate = True
-                                log(f"[NEXT-UPDATE] {station}/{sparepart} next_end={st.next_repl_end_ts}",
-                                    info="info", conn=conn)
+                                log(
+                                    f"[NEXT-UPDATE] {station}/{sparepart} next_end={st.next_repl_end_ts}",
+                                    info="info",
+                                    conn=conn,
+                                )
 
+                        # (3) 교체 후 next 없음 -> 집계 중단
                         if st.last_alarm_type == "교체" and st.next_repl_end_ts is None:
                             break
 
                         if st.current_repl_end_ts is None:
                             break
 
+                        # (4) upper_ts 결정 (FIX)
                         if st.next_repl_end_ts is not None and now_dt >= st.next_repl_end_ts:
                             upper_ts = st.next_repl_end_ts
                         else:
@@ -859,12 +876,17 @@ def main() -> None:
                                 continue
                             break
 
+                        # (5) 테스트 fetch
                         ts_list = fetch_new_tests_ts_list(conn, station, after_ts, upper_ts, BATCH_LIMIT_TEST_ROWS)
 
+                        # (FIX) 테스트 없어도 next 도달 시 롤링
                         if not ts_list:
                             if st.next_repl_end_ts is not None and now_dt >= st.next_repl_end_ts and upper_ts == st.next_repl_end_ts:
-                                log(f"[ROLL-NO-TEST] {station}/{sparepart} gap_no_tests (after={after_ts} <= next={st.next_repl_end_ts})",
-                                    info="info", conn=conn)
+                                log(
+                                    f"[ROLL-NO-TEST] {station}/{sparepart} gap_no_tests (after={after_ts} <= next={st.next_repl_end_ts})",
+                                    info="info",
+                                    conn=conn,
+                                )
                                 roll_state_to_next(conn, st, station, sparepart)
                                 need_immediate = True
                                 continue
@@ -872,6 +894,7 @@ def main() -> None:
 
                         need_immediate = True
 
+                        # (6) 1건씩 누적
                         for tts in ts_list:
                             st.amount += 1
                             st.last_test_ts = tts
@@ -883,17 +906,23 @@ def main() -> None:
                                 if alarm_rank(alarm_type) > alarm_rank(st.last_alarm_type):
                                     prob = 0.0
 
+                                    # 준비/권고: 확률 게이트
                                     if alarm_type in ("준비", "권고"):
                                         pass_prob = False
                                         try:
-                                            X = build_features_for_model(cached_model, station, sparepart, st.amount, max_tests, ratio)
+                                            X = build_features_for_model(
+                                                cached_model, station, sparepart, st.amount, max_tests, ratio
+                                            )
                                             prob = predict_proba_1(cached_model, X)
                                             pass_prob = (prob >= float(min_prob))
                                         except Exception:
                                             pass_prob = False
 
-                                        log(f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass={pass_prob}",
-                                            info="info", conn=conn)
+                                        log(
+                                            f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass={pass_prob}",
+                                            info="info",
+                                            conn=conn,
+                                        )
 
                                         if pass_prob:
                                             insert_alarm(
@@ -911,21 +940,33 @@ def main() -> None:
                                                 reset_repl_ts=st.current_repl_end_ts,
                                             )
                                             st.last_alarm_type = alarm_type
-                                            log(f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})",
-                                                info="info", conn=conn)
+                                            log(
+                                                f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})",
+                                                info="info",
+                                                conn=conn,
+                                            )
                                         else:
-                                            log(f"[ALARM-SKIP] {station}/{sparepart} {alarm_type} (prob<{min_prob})",
-                                                info="info", conn=conn)
+                                            log(
+                                                f"[ALARM-SKIP] {station}/{sparepart} {alarm_type} (prob<{min_prob})",
+                                                info="info",
+                                                conn=conn,
+                                            )
 
                                     else:
+                                        # 긴급/교체: 확률게이트 없이 저장
                                         try:
-                                            X = build_features_for_model(cached_model, station, sparepart, st.amount, max_tests, ratio)
+                                            X = build_features_for_model(
+                                                cached_model, station, sparepart, st.amount, max_tests, ratio
+                                            )
                                             prob = predict_proba_1(cached_model, X)
                                         except Exception:
                                             prob = 0.0
 
-                                        log(f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass=True",
-                                            info="info", conn=conn)
+                                        log(
+                                            f"[EVAL] {station}/{sparepart} amount={st.amount} ratio={ratio:.3f} -> {alarm_type} prob={prob:.4f} pass=True",
+                                            info="info",
+                                            conn=conn,
+                                        )
 
                                         insert_alarm(
                                             conn=conn,
@@ -942,8 +983,11 @@ def main() -> None:
                                             reset_repl_ts=st.current_repl_end_ts,
                                         )
                                         st.last_alarm_type = alarm_type
-                                        log(f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})",
-                                            info="info", conn=conn)
+                                        log(
+                                            f"[ALARM-SAVED] {station}/{sparepart} {alarm_type} (event_ts={tts})",
+                                            info="info",
+                                            conn=conn,
+                                        )
 
                                         if alarm_type == "교체" and st.next_repl_end_ts is None:
                                             break

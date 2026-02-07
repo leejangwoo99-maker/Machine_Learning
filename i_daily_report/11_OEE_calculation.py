@@ -21,7 +21,7 @@
   - Import failures are logged with stacktrace (critical for EXE packaging issues)
 
 [PATCH]
-- Log path is FORCE-FIXED to: C:\AptivAgent\_logs\11_oee_calculation.log
+- Log path is FORCE-FIXED to: C:\\AptivAgent\\_logs\\11_oee_calculation.log
 - If logger/file handler init fails, print immediately to stderr
 - If normal logger call fails at runtime, fallback to stderr
 
@@ -33,6 +33,10 @@
   - info is always lowercase
   - each log write is dataframe-ized in column order:
     [end_day, end_time, info, contents]
+
+[FIX]
+- If non_time / quality source row is missing, DO NOT raise loop exception.
+  -> skip upsert and sleep/retry (with warning log)
 """
 
 from __future__ import annotations
@@ -85,14 +89,9 @@ def _stderr_now(msg: str) -> None:
         pass
 
 def _ensure_log_dir_fixed() -> str:
-    """
-    Force fixed log directory only.
-    If creation fails, raise so caller can fallback to stderr-only logger.
-    """
     d = FORCED_LOG_DIR
     os.makedirs(d, exist_ok=True)
 
-    # write-test (strict)
     test_path = os.path.join(d, ".__write_test")
     with open(test_path, "w", encoding="utf-8") as f:
         f.write("ok")
@@ -105,13 +104,11 @@ def _init_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    # Prevent duplicate handlers in re-entry
     if logger.handlers:
         return logger
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    # 1) Console handler first (so at least stdout logging works)
     try:
         sh = logging.StreamHandler(stream=sys.stdout)
         sh.setFormatter(fmt)
@@ -119,14 +116,13 @@ def _init_logger() -> logging.Logger:
     except Exception as e:
         _stderr_now(f"StreamHandler init failed: {repr(e)}")
 
-    # 2) Forced fixed file handler
     try:
         log_dir = _ensure_log_dir_fixed()
         log_path = os.path.join(log_dir, LOG_FILE_NAME)
 
         fh = RotatingFileHandler(
             log_path,
-            maxBytes=10_000_000,  # 10MB
+            maxBytes=10_000_000,
             backupCount=10,
             encoding="utf-8",
             delay=True,
@@ -152,15 +148,11 @@ def _init_logger() -> logging.Logger:
 
 LOGGER = _init_logger()
 
-# -------------------------
-# DB log bridge globals
-# -------------------------
 DB_LOG_ENGINE = None
 _DB_LOG_ENABLED = False
 _DB_LOG_REENTRANT_GUARD = False
 
 def _safe_logger_call(level: str, msg: str) -> None:
-    """Wrapper to avoid losing logs when logger itself fails."""
     try:
         if level == "info":
             LOGGER.info(msg)
@@ -174,11 +166,6 @@ def _safe_logger_call(level: str, msg: str) -> None:
         _stderr_now(f"LOGGER_CALL_FAIL level={level} msg={msg} err={repr(e)}")
 
 def _db_health_log(info: str, contents: str) -> None:
-    """
-    Write log row to DB (best effort).
-    Required order via DataFrame:
-      end_day, end_time, info, contents
-    """
     global _DB_LOG_REENTRANT_GUARD
 
     if (not _DB_LOG_ENABLED) or (DB_LOG_ENGINE is None):
@@ -189,7 +176,6 @@ def _db_health_log(info: str, contents: str) -> None:
     try:
         _DB_LOG_REENTRANT_GUARD = True
 
-        # local import already loaded later; guard for very early stage
         if "pd" not in globals():
             return
 
@@ -213,7 +199,6 @@ def _db_health_log(info: str, contents: str) -> None:
             conn.execute(sql, payload)
 
     except Exception as e:
-        # absolutely no recursive log path here
         _stderr_now(f"DB_HEALTH_LOG_FAIL info={info} err={repr(e)}")
     finally:
         _DB_LOG_REENTRANT_GUARD = False
@@ -290,7 +275,6 @@ REMARKS  = ["PD", "Non-PD"]
 
 SAVE_SCHEMA = "i_daily_report"
 
-# input tables
 T_REMARK_CHANGE_DAY   = "j_remark_change_day_daily"
 T_REMARK_CHANGE_NIGHT = "j_remark_change_night_daily"
 
@@ -306,14 +290,12 @@ T_QUALITY_NIGHT       = "b_station_night_daily_percentage"
 T_FINAL_AMT_DAY       = "a_station_day_daily_final_amount"
 T_FINAL_AMT_NIGHT     = "a_station_night_daily_final_amount"
 
-# ideal ct tables
 IDEAL_SCHEMA_VISION = "e1_FCT_ct"
 IDEAL_TABLE_VISION  = "fct_whole_op_ct"
 
 IDEAL_SCHEMA_FCT = "e1_FCT_ct"
 IDEAL_TABLE_FCT  = "fct_op_ct"
 
-# output tables
 T_TOTAL_DAY   = "k_total_oee_day_daily"
 T_TOTAL_NIGHT = "k_total_oee_night_daily"
 T_LINE_DAY    = "k_line_oee_day_daily"
@@ -322,8 +304,6 @@ T_ST_DAY      = "k_station_oee_day_daily"
 T_ST_NIGHT    = "k_station_oee_night_daily"
 
 SLEEP_SEC = 5
-
-# work_mem
 DEFAULT_WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
 DB_CONFIG = {
@@ -344,7 +324,7 @@ def make_engine() -> Engine:
     )
     eng = create_engine(
         url,
-        pool_size=5,         # 5 threads => up to 5 conns
+        pool_size=5,
         max_overflow=0,
         pool_pre_ping=True,
         pool_recycle=1800,
@@ -387,7 +367,6 @@ def enable_db_health_logging(engine: Engine) -> None:
     DB_LOG_ENGINE = engine
     ensure_health_log_table(DB_LOG_ENGINE)
     _DB_LOG_ENABLED = True
-    # first DB log record
     _db_health_log("info", "health logging enabled")
 
 def connect_blocking() -> Engine:
@@ -400,12 +379,10 @@ def connect_blocking() -> Engine:
                 conn.exec_driver_sql("SELECT 1;")
             log_info(f"DB engine OK (pool_size=5, work_mem={DEFAULT_WORK_MEM})")
 
-            # enable DB logging after DB is alive
             try:
                 enable_db_health_logging(eng)
                 log_info(f'DB health log target ready => "{HEALTH_SCHEMA}"."{HEALTH_TABLE}"')
             except Exception as e:
-                # keep daemon running even if health log table creation failed
                 _stderr_now(f"enable_db_health_logging failed: {repr(e)}")
 
             return eng
@@ -425,12 +402,6 @@ def yyyymmdd(d: date) -> str:
     return f"{d:%Y%m%d}"
 
 def current_window(now: datetime) -> Tuple[str, str, datetime, datetime]:
-    """
-    Returns (prod_day, shift_type, window_start, window_end)
-    half-open [start, end)
-    day   = [08:30, 20:30)
-    night = [20:30, next 08:30)
-    """
     t = now.timetz().replace(tzinfo=None)
 
     day_start = time(8, 30, 0)
@@ -459,12 +430,12 @@ def current_window(now: datetime) -> Tuple[str, str, datetime, datetime]:
     return pd, shift, start, end
 
 # -----------------------------
-# Interval utils (half-open)
+# Interval utils
 # -----------------------------
 @dataclass(frozen=True)
 class Interval:
     start: datetime
-    end: datetime  # exclusive
+    end: datetime
 
 def merge_intervals(intervals: List[Interval]) -> List[Interval]:
     if not intervals:
@@ -492,9 +463,6 @@ def total_seconds(intervals: List[Interval]) -> int:
 # -----------------------------
 # Parsers
 # -----------------------------
-PASS_RE = re.compile(r"PASS\s*[:=]\s*(\d+)", re.IGNORECASE)
-FAIL_RE = re.compile(r"FAIL\s*[:=]\s*(\d+)", re.IGNORECASE)
-
 def parse_korean_duration_to_sec(v) -> int:
     if v is None:
         return 0
@@ -553,7 +521,7 @@ def clean_remark(v) -> Optional[str]:
     return s
 
 # -----------------------------
-# PK caches (recent 5)
+# PK caches
 # -----------------------------
 class SeenPK:
     def __init__(self, maxlen: int = 5):
@@ -574,7 +542,7 @@ class SeenPK:
         return key in self.s
 
 # -----------------------------
-# Column introspection
+# DB helpers
 # -----------------------------
 def get_columns(engine: Engine, schema: str, table: str) -> List[str]:
     sql = text("""
@@ -596,12 +564,12 @@ def pick_col(cols: List[str], candidates: List[str], required=True) -> Optional[
         raise ValueError(f"Missing columns, tried={candidates}, have={cols}")
     return None
 
-# -----------------------------
-# Data Fetch
-# -----------------------------
 def fqn(schema: str, table: str) -> str:
     return f'"{schema}"."{table}"'
 
+# -----------------------------
+# Data Fetch
+# -----------------------------
 def load_remark_changes_incremental(
     engine: Engine,
     table_fqn: str,
@@ -712,7 +680,7 @@ def load_final_amount_full(engine: Engine, table_fqn: str, prod_day: str, shift_
         return pd.read_sql(sql, conn, params={"prod_day": prod_day, "shift_type": shift_type, "stations": STATIONS})
 
 # -----------------------------
-# Ideal CT load (once per window)
+# Ideal CT
 # -----------------------------
 SIDE_TO_STATION = {"left": "Vision1", "right": "Vision2"}
 
@@ -762,7 +730,7 @@ def load_ideal_ct(engine: Engine) -> pd.DataFrame:
     return pd.concat([df_vision, df_fct], ignore_index=True)
 
 # -----------------------------
-# Remark segments
+# Segments
 # -----------------------------
 def base_remark_for_station(df_final: pd.DataFrame, station: str) -> str:
     s = df_final[df_final["station"] == station].copy()
@@ -846,7 +814,7 @@ def remark_window_seconds(segments: Dict[str, List[Tuple[str, Interval]]], stati
     return sec
 
 # -----------------------------
-# Planned stop intervals
+# Planned stop
 # -----------------------------
 def _is_missing_time(v) -> bool:
     if v is None:
@@ -892,7 +860,6 @@ def stops_to_intervals(
 
         if edt < sdt:
             sdt, edt = edt, sdt
-
         if edt <= sdt:
             continue
 
@@ -938,7 +905,11 @@ def calc_oee(
     df_q: pd.DataFrame,
     df_final: pd.DataFrame,
     df_ideal: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+
+    # FIX: source rows missing => skip
+    if df_non.empty or df_q.empty:
+        return None, None, None
 
     base_remark_map = {st: base_remark_for_station(df_final, st) for st in STATIONS}
 
@@ -984,11 +955,6 @@ def calc_oee(
             for ps in stop_union[st]:
                 sec += overlap_seconds(ps, seg_iv)
             planned_sec_by_station_remark[(st, r)] += sec
-
-    if df_non.empty:
-        raise ValueError("non_time returned 0 rows")
-    if df_q.empty:
-        raise ValueError("quality returned 0 rows")
 
     non_row = df_non.iloc[0].to_dict()
     q_row   = df_q.iloc[0].to_dict()
@@ -1049,11 +1015,7 @@ def calc_oee(
 
     df_oee_by_station = pd.DataFrame(station_rows)
 
-    LINES = [
-        {"line": "left",  "vision": "Vision1"},
-        {"line": "right", "vision": "Vision2"},
-    ]
-
+    LINES = [{"line": "left", "vision": "Vision1"}, {"line": "right", "vision": "Vision2"}]
     line_rows = []
     line_intermediate: Dict[str, Dict[str, Any]] = {}
 
@@ -1085,11 +1047,11 @@ def calc_oee(
 
     df_oee_by_line = pd.DataFrame(line_rows)
 
-    PPT_tot   = sum(v["PPT"] for v in line_intermediate.values())
-    run_tot   = sum(v["run"] for v in line_intermediate.values())
+    PPT_tot = sum(v["PPT"] for v in line_intermediate.values())
+    run_tot = sum(v["run"] for v in line_intermediate.values())
     ideal_tot = sum(v["ideal_qty"] for v in line_intermediate.values())
     total_cnt_tot = int(sum(v["total_cnt"] for v in line_intermediate.values()))
-    good_cnt_tot  = int(sum(v["good_cnt"]  for v in line_intermediate.values()))
+    good_cnt_tot  = int(sum(v["good_cnt"] for v in line_intermediate.values()))
 
     Q_tot = _safe_div(good_cnt_tot, total_cnt_tot)
     A_tot = _safe_div(run_tot, PPT_tot)
@@ -1106,7 +1068,7 @@ def calc_oee(
     return df_oee_total, df_oee_by_line, df_oee_by_station
 
 # -----------------------------
-# Save to DB (CREATE + ENSURE UNIQUE INDEX + UPSERT)
+# Output tables & upsert
 # -----------------------------
 def ensure_output_tables(engine: Engine, shift_type: str) -> Tuple[str, str, str]:
     t_total   = T_TOTAL_DAY   if shift_type == "day" else T_TOTAL_NIGHT
@@ -1219,7 +1181,7 @@ def upsert_outputs(
 
     with engine.begin() as conn:
         conn.execute(sql_total, payload_total)
-        conn.execute(sql_line,  payload_line)
+        conn.execute(sql_line, payload_line)
         conn.execute(sql_station, payload_st)
 
 # -----------------------------
@@ -1227,8 +1189,8 @@ def upsert_outputs(
 # -----------------------------
 def run_daemon():
     log_boot("OEE daemon starting (5-thread fetch, 5s loop)")
-
     log_info(f"DB target={DB_CONFIG['host']}:{DB_CONFIG['port']} db={DB_CONFIG['dbname']} user={DB_CONFIG['user']}")
+
     engine = connect_blocking()
 
     last_window_key = None
@@ -1236,7 +1198,6 @@ def run_daemon():
 
     last_at_time_by_station: Dict[str, str] = {}
     seen_remark_pk = SeenPK(maxlen=5)
-
     df_remark_all = pd.DataFrame(columns=["prod_day","shift_type","station","at_time","from_remark","to_remark"])
 
     while True:
@@ -1314,6 +1275,18 @@ def run_daemon():
             if df_ideal is None or df_ideal.empty:
                 raise ValueError("ideal_ct not loaded")
 
+            # 선제 체크: source row 미도착이면 skip
+            if df_non.empty or df_q.empty:
+                log_warn(
+                    f"source row missing before calc | "
+                    f"prod_day={prod_day} shift={shift_type} "
+                    f"non_rows={len(df_non)} quality_rows={len(df_q)} "
+                    f"remark_rows={len(df_remark_all)} final_rows={len(df_final)} stop_rows={len(df_stop)}"
+                )
+                log_sleep(SLEEP_SEC, "waiting source rows(non_time/quality)")
+                time_mod.sleep(SLEEP_SEC)
+                continue
+
             df_oee_total, df_oee_by_line, df_oee_by_station = calc_oee(
                 prod_day=prod_day,
                 shift_type=shift_type,
@@ -1326,6 +1299,16 @@ def run_daemon():
                 df_final=df_final,
                 df_ideal=df_ideal,
             )
+
+            if df_oee_total is None:
+                log_warn(
+                    f"source row missing -> skip upsert | "
+                    f"prod_day={prod_day} shift={shift_type} "
+                    f"non_rows={len(df_non)} quality_rows={len(df_q)}"
+                )
+                log_sleep(SLEEP_SEC, "waiting source rows(non_time/quality)")
+                time_mod.sleep(SLEEP_SEC)
+                continue
 
             try:
                 f_total, f_line, f_station = ensure_output_tables(engine, shift_type)
