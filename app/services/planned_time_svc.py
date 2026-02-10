@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from sqlalchemy.engine import Engine
 from app.core.timewindow import now_kst, yyyymmdd
 from app.repos import planned_time_repo

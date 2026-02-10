@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -20,9 +20,9 @@ class EventMessage:
 
 class EventBus:
     """
-    프로세스 내부 pub/sub (단일 uvicorn 프로세스 기준).
-    - 구독자별 Queue
-    - publish 시 fan-out
+    ?꾨줈?몄뒪 ?대? pub/sub (?⑥씪 uvicorn ?꾨줈?몄뒪 湲곗?).
+    - 援щ룆?먮퀎 Queue
+    - publish ??fan-out
     """
     def __init__(self) -> None:
         self._subs: set[asyncio.Queue[EventMessage]] = set()
@@ -51,7 +51,7 @@ class EventBus:
                 try:
                     q.put_nowait(msg)
                 except asyncio.QueueFull:
-                    # 휘발성 허용: 느린 구독자 큐는 drop
+                    # ?섎컻???덉슜: ?먮┛ 援щ룆???먮뒗 drop
                     pass
                 except Exception:
                     dead.append(q)

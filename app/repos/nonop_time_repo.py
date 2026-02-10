@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -87,8 +87,8 @@ def update_reason_sparepart_by_key(
     sparepart: str | None,
 ) -> None:
     """
-    station prefix로 대상 테이블 선택 후,
-    key row의 reason/sparepart만 수정한다. (INSERT 없음)
+    station prefix濡?????뚯씠釉??좏깮 ??
+    key row??reason/sparepart留??섏젙?쒕떎. (INSERT ?놁쓬)
     """
     s = (station or "").strip()
     table = settings.FCT_NONOP_TABLE if s.upper().startswith("FCT") else settings.VISION_NONOP_TABLE

@@ -1,4 +1,4 @@
-# app/schemas/email_list.py
+﻿# app/schemas/email_list.py
 from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
@@ -11,8 +11,8 @@ def _normalize_and_check_email(v: str) -> str:
     if not s:
         raise ValueError("email is required")
 
-    # 최소한의 형식 검증 (email-validator 없이 동작)
-    # 너무 빡세지 않게 실무용 최소 체크
+    # 理쒖냼?쒖쓽 ?뺤떇 寃利?(email-validator ?놁씠 ?숈옉)
+    # ?덈Т 鍮≪꽭吏 ?딄쾶 ?ㅻТ??理쒖냼 泥댄겕
     if "@" not in s or s.count("@") != 1:
         raise ValueError("invalid email format")
     local, domain = s.split("@", 1)
@@ -40,5 +40,5 @@ class EmailListSyncIn(BaseModel):
     @classmethod
     def validate_emails(cls, v: list[str]) -> list[str]:
         normalized = [_normalize_and_check_email(x) for x in v]
-        # 중복 제거 + 정렬
+        # 以묐났 ?쒓굅 + ?뺣젹
         return sorted(set(normalized))

@@ -1,57 +1,88 @@
+﻿# app/routers/events.py
 from __future__ import annotations
 
-import asyncio
-import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
-
-from app.core.event_bus import event_bus
+from fastapi import APIRouter
 
 router = APIRouter(tags=["0.events"])
 
-KST = timezone(timedelta(hours=9))
+KST = ZoneInfo("Asia/Seoul")
 
 
-@router.get(
-    "/events",
-    summary="Stream Events",
-    description=(
-        "통합 SSE endpoint\n\n"
-        "- 모든 이벤트를 한 스트림으로 전달\n"
-        "- 클라이언트는 event 이름으로 필터링"
-    ),
-)
-async def stream_events(request: Request):
-    async def gen():
-        q = await event_bus.subscribe()
-        try:
-            # 연결 확인 이벤트
-            connected_payload = {"ok": True, "ts_kst": datetime.now(KST).isoformat()}
-            yield f"event: connected\ndata: {json.dumps(connected_payload, ensure_ascii=False)}\n\n"
+def _now_kst() -> datetime:
+    return datetime.now(tz=KST)
 
-            while True:
-                if await request.is_disconnected():
-                    break
 
-                try:
-                    item = await asyncio.wait_for(q.get(), timeout=15.0)
-                    event = item["event"]
-                    data = item["data"]
-                    yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-                except asyncio.TimeoutError:
-                    # keepalive comment
-                    yield ": keepalive\n\n"
-        finally:
-            await event_bus.unsubscribe(q)
+def _shift_type_by_now(now_kst: datetime) -> str:
+    """
+    ?щ궡 湲곗?:
+    - day   : 08:30:00 ~ 20:29:59
+    - night : 洹???
+    """
+    hhmmss = now_kst.strftime("%H%M%S")
+    return "day" if "083000" <= hhmmss <= "202959" else "night"
 
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
+
+@router.get("/events")
+def get_events():
+    """
+    ??쒕낫???ㅻ뜑/?뺤콉 ?덈궡??硫뷀? endpoint.
+    - ?ㅼ젣 ?뚮엺 popup ?곗씠?곕뒗 /alarm_record/recent?먯꽌 議고쉶
+    - report 怨꾩뿴 ?뚮씪誘명꽣 洹쒖튃 怨듭?
+    - POST ?덉슜 ?뺤콉 怨듭?
+    """
+    now_kst = _now_kst()
+    prod_day = now_kst.strftime("%Y%m%d")
+    shift_type = _shift_type_by_now(now_kst)
+
+    return {
+        "ok": True,
+        "server_time_kst": now_kst.isoformat(),
+        "prod_day": prod_day,
+        "shift_type": shift_type,
+        "title": f"{prod_day} {shift_type} ?앹궛 ?꾪솴",
+        "post_policy": {
+            "allowed_post_only": [
+                "/worker_info/sync",
+                "/email_list/sync",
+                "/remark_info/sync",
+                "/planned_time/sync",
+                "/non_operation_time/sync",
+            ]
         },
-    )
+        "report_policy": {
+            "base_prefix": "/report",
+            "query_required": ["shift_type=day|night"],
+            "path_required": ["{prod_day}=YYYYMMDD"],
+            "must_have_get": [
+                "/report/b_station_percentage/{prod_day}",
+                "/report/a_station_final_amount/{prod_day}",
+                "/report/c_fct_step_1time/{prod_day}",
+                "/report/c_fct_step_2time/{prod_day}",
+                "/report/c_fct_step_3over/{prod_day}",
+                "/report/d_vision_step_1time/{prod_day}",
+                "/report/d_vision_step_2time/{prod_day}",
+                "/report/d_vision_step_3over/{prod_day}",
+                "/report/k_oee_line/{prod_day}",
+                "/report/k_oee_station/{prod_day}",
+                "/report/k_oee_total/{prod_day}",
+                "/report/f_worst_case/{prod_day}",
+                "/report/g_afa_wasted_time/{prod_day}",
+                "/report/h_mes_wasted_time/{prod_day}",
+                "/report/i_planned_stop_time/{prod_day}",
+                "/report/i_non_time/{prod_day}",
+            ],
+        },
+        "alarm_policy": {
+            "source": "/alarm_record/recent",
+            "type_alarm_values": ["沅뚭퀬", "湲닿툒", "援먯껜"],
+            "popup_message_templates": {
+                "沅뚭퀬": "{station}, {sparepart} 援먯껜 沅뚭퀬 ?쒕┰?덈떎.",
+                "湲닿툒": "{station}, {sparepart} 援먯껜 湲닿툒?⑸땲??",
+                "援먯껜": "{station}, {sparepart} 援먯껜 ??대컢??吏?ъ뒿?덈떎.",
+            },
+            "close_action": "?뺤씤 踰꾪듉 ?대┃ ???ロ옒",
+        },
+    }

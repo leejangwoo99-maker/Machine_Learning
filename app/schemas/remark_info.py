@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import string
 from pydantic import BaseModel, Field, field_validator

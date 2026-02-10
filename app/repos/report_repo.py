@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -12,8 +12,8 @@ def list_rows_excluding_updated_at(
     prod_day_col: str = "prod_day",
 ) -> list[dict[str, Any]]:
     """
-    - Postgres에서 updated_at을 SELECT에서 제외하려고 컬럼 목록을 information_schema로 읽어서 동적 SELECT.
-    - 테이블/컬럼 편차가 있어도 robust.
+    - Postgres?먯꽌 updated_at??SELECT?먯꽌 ?쒖쇅?섎젮怨?而щ읆 紐⑸줉??information_schema濡??쎌뼱???숈쟻 SELECT.
+    - ?뚯씠釉?而щ읆 ?몄감媛 ?덉뼱??robust.
     """
     cols_sql = text("""
         SELECT column_name
@@ -26,7 +26,7 @@ def list_rows_excluding_updated_at(
     with engine.connect() as conn:
         cols = conn.execute(cols_sql, {"schema": schema, "table": table}).scalars().all()
 
-        # 응답에서 updated_at key 자체 제거 => SELECT에서 제외
+        # ?묐떟?먯꽌 updated_at key ?먯껜 ?쒓굅 => SELECT?먯꽌 ?쒖쇅
         cols = [c for c in cols if c != "updated_at"]
         if not cols:
             return []

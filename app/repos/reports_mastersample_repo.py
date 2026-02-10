@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -18,7 +18,7 @@ def fqn_night() -> str:
 def list_by_prod_day(engine: Engine, prod_day: str, shift_type: str) -> list[MastersampleOut]:
     table = fqn_day() if shift_type == "day" else fqn_night()
 
-    # updated_at은 SELECT에서 제외
+    # updated_at? SELECT?먯꽌 ?쒖쇅
     sql = text(f"""
         SELECT
             prod_day,

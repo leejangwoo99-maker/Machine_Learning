@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -52,7 +52,7 @@ def delete_one(engine: Engine, barcode_information: str) -> int:
 
 
 def sync(engine: Engine, items: list[RemarkInfoIn]) -> tuple[int, int]:
-    # target map (동일 key 중 마지막 값 우선)
+    # target map (?숈씪 key 以?留덉?留?媛??곗꽑)
     target_map: dict[str, dict] = {}
     for it in items:
         d = it.model_dump()

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 from typing import Any
@@ -20,7 +20,7 @@ class EventBus:
             self._subs.discard(q)
 
     async def publish(self, event_name: str, data: dict[str, Any]) -> None:
-        # lock 구간 최소화
+        # lock 援ш컙 理쒖냼??
         async with self._lock:
             subs = list(self._subs)
 
@@ -28,7 +28,7 @@ class EventBus:
             try:
                 q.put_nowait({"event": event_name, "data": data})
             except asyncio.QueueFull:
-                # 느린 구독자는 오래된 1개 버리고 최신 이벤트 넣기 시도
+                # ?먮┛ 援щ룆?먮뒗 ?ㅻ옒??1媛?踰꾨━怨?理쒖떊 ?대깽???ｊ린 ?쒕룄
                 try:
                     _ = q.get_nowait()
                 except Exception:

@@ -1,4 +1,4 @@
-# app/services/email_list_svc.py
+﻿# app/services/email_list_svc.py
 from __future__ import annotations
 from sqlalchemy.engine import Engine
 from app.repos import email_list_repo
@@ -10,7 +10,7 @@ def list_emails(engine: Engine) -> list[str]:
 
 def sync_emails(engine: Engine, emails: list[str]) -> tuple[int, int]:
     """
-    주의: 전달 목록으로 전체 동기화(없는 건 삭제)
+    二쇱쓽: ?꾨떖 紐⑸줉?쇰줈 ?꾩껜 ?숆린???녿뒗 嫄???젣)
     """
     current = set(email_list_repo.list_all(engine))
     wanted = set(emails)
@@ -27,7 +27,7 @@ def sync_emails(engine: Engine, emails: list[str]) -> tuple[int, int]:
     return ins, dele
 
 
-# ✅ 단건 추가(이미 있으면 그대로 0)
+# ???④굔 異붽?(?대? ?덉쑝硫?洹몃?濡?0)
 def add_email(engine: Engine, email: str) -> int:
     with engine.begin() as conn:
         return email_list_repo.upsert_one(conn, email)

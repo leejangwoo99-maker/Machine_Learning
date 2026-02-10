@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from sqlalchemy.engine import Engine
 from app.core.timewindow import validate_yyyymmdd
 from app.repos import alarm_record_repo

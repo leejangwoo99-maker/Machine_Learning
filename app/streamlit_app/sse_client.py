@@ -1,4 +1,4 @@
-import json, queue, threading, requests, streamlit as st
+﻿import json, queue, threading, requests, streamlit as st
 
 API = "http://127.0.0.1:8000"
 EVENTS_URL = f"{API}/events"
@@ -32,7 +32,7 @@ def _listener(evt_q: queue.Queue):
                             data = {"raw": data_str}
                         evt_q.put({"event": event_name, "data": data})
         except Exception:
-            # 연결 끊김 시 자동 재시도
+            # ?곌껐 ?딄? ???먮룞 ?ъ떆??
             continue
 
 def ensure_sse():

@@ -1,37 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-fct_database_factory.py (공장 운영형 완전 통합본 - A안: file_path skip 비활성 + 워터마크 + PK로 중복방지)
+fct_database_factory.py (Nuitka 배포 안정화 통합본)
 
-요청 추가 반영(이번 요청 핵심)
-- ✅ 실행 중간에 DB 서버가 끊어져도: "무한 재접속(블로킹)" 후 자동 복구하여 계속 진행
-  * connect() / begin() / raw_connection() 모두 블로킹 재시도 래퍼 사용
-  * COPY/DIRECT 업서트 중 끊김도 무한 재시도(절대 raise로 종료하지 않음)
-- ✅ 백엔드별 상시 연결 1개 고정: pool_size=1, max_overflow=0 (전역 엔진 1개 재사용)
-- ✅ work_mem 폭증 방지: 세션마다 SET work_mem 적용 (+ options에도 반영)
-
-기존 요청 유지
-- 멀티프로세스 = 1개 (실시간 모드 단일 프로세스/단일 워커)
-- 무한 루프 인터벌 = 5초
-- 단발(main) + 실시간(REALTIME_TODAY) 동시 포함
-- bootstrap(스키마/테이블/인덱스 IF NOT EXISTS)
-- 워터마크 상태 테이블(ETL state)로 중복 처리 방지
-- PK 중복 방지(ON CONFLICT)
-- 대량(COPY+UNLOGGED staging) vs 소량(DIRECT execute_values) 자동 분기
-- numpy scalar -> python scalar 변환(_py)로 psycopg2 adapt 에러 방지
-
-추가 반영(로그 저장)
-1) 로그 생성
-2) 컬럼 end_day : yyyymmdd
-3) 컬럼 end_time : hh:mi:ss
-4) 컬럼 info : error, down, sleep 등 소문자
-5) 컬럼 contents : 나머지 내용
-6) end_day,end_time,info,contents 순서 dataframe화 후 저장
-7) 스키마 k_demon_heath_check / 테이블 f_log (없으면 생성)
+핵심 반영
+- DB 끊김 시 무한 재접속(블로킹) 유지
+- 엔진 풀 1개 고정(pool_size=1, max_overflow=0)
+- work_mem 세션 적용
+- 로그 DB 저장(k_demon_heath_check.f_log)
+- REALTIME 5초 루프
+- Nuitka/Windows EXE 시작 직후 종료 방지:
+  1) freeze_support() 추가
+  2) 최상위 fatal guard + 자동 재기동 루프
+  3) 파일 로그 병행(로컬)
 """
 
 import io
 import os
 import re
+import sys
 import time
 import urllib.parse
 import multiprocessing as mp
@@ -59,6 +45,37 @@ DIRECT_UPSERT_BATCH_ROWS = 5_000
 COPY_CHUNK_START_ROWS = 200_000
 COPY_CHUNK_FALLBACKS = [200_000, 100_000, 50_000, 20_000]
 COPY_RETRY_SLEEP_SEC = 5
+
+# 로컬 파일 로그(중요: DB와 독립)
+LOCAL_LOG_DIR = r"C:\AptivAgent\_logs"
+LOCAL_LOG_FILE = os.path.join(LOCAL_LOG_DIR, "fct_database_factory.log")
+
+
+def _ensure_local_log_dir():
+    try:
+        os.makedirs(LOCAL_LOG_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _append_local_log(line: str):
+    try:
+        _ensure_local_log_dir()
+        with open(LOCAL_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log_console(level: str, msg: str):
+    level_l = (level or "info").lower()
+    line = f"{_now_text()} [{level_l}] {msg}"
+    print(line, flush=True)
+    _append_local_log(line)
 
 
 # ============================================================
@@ -154,9 +171,7 @@ def get_engine_blocking():
                 conn.execute(text("SELECT 1"))
             return _ENGINE
         except Exception as e:
-            print("[DB][RETRY] connect failed -> retry in {}s | {}: {}".format(
-                DB_RETRY_SLEEP_SEC, type(e).__name__, repr(e)
-            ), flush=True)
+            log_console("down", f"[DB][RETRY] connect failed -> retry in {DB_RETRY_SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
             _dispose_engine_silent()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -185,7 +200,7 @@ def connect_blocking():
                     pass
             break
         except Exception as e:
-            print("[DB][RETRY] connect() failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] connect() failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -200,7 +215,7 @@ def begin_blocking():
                 yield conn
             break
         except Exception as e:
-            print("[DB][RETRY] begin() failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] begin() failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -212,7 +227,7 @@ def raw_connection_blocking():
             raw = eng.raw_connection()
             return raw
         except Exception as e:
-            print("[DB][RETRY] raw_connection() failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] raw_connection() failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -223,7 +238,7 @@ def read_sql_blocking(sql_obj, params=None) -> pd.DataFrame:
             with connect_blocking() as conn:
                 return pd.read_sql(sql_obj, conn, params=params)
         except Exception as e:
-            print("[DB][RETRY] read_sql failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] read_sql failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -271,10 +286,10 @@ def bootstrap_log_table(_engine_unused=None):
                 CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE}_info
                 ON {LOG_SCHEMA}.{LOG_TABLE} (info);
                 """))
-            print(f"[OK] log table ensured: {LOG_SCHEMA}.{LOG_TABLE}", flush=True)
+            log_console("info", f"[OK] log table ensured: {LOG_SCHEMA}.{LOG_TABLE}")
             return
         except Exception as e:
-            print("[DB][RETRY] bootstrap_log_table failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] bootstrap_log_table failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -317,12 +332,13 @@ def log_event(info: str, contents: str, also_print: bool = True):
                 })
             break
         except Exception as e:
-            print("[DB][RETRY] log insert failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            # DB down이어도 로컬 파일에는 남겨서 원인 추적 가능
+            log_console("down", f"[DB][RETRY] log insert failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
     if also_print:
-        print(f"[{info_lc}] {msg}", flush=True)
+        log_console(info_lc, msg)
 
 
 # ============================================================
@@ -373,10 +389,10 @@ def bootstrap_fct_database(_engine_unused=None):
                 ON {OUT_SCHEMA}.{OUT_TABLE} (file_path);
                 """))
 
-            print(f"[OK] bootstrap done: {OUT_SCHEMA}.{OUT_TABLE} ensured (NO DROP)", flush=True)
+            log_console("info", f"[OK] bootstrap done: {OUT_SCHEMA}.{OUT_TABLE} ensured (NO DROP)")
             return
         except Exception as e:
-            print("[DB][RETRY] bootstrap_fct_database failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] bootstrap_fct_database failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -443,8 +459,10 @@ NONPD_STEP_MAP = [
 def normalize_barcode(s: pd.Series) -> pd.Series:
     return s.astype("string").fillna("").str.replace(r"\s+", "", regex=True).str.strip()
 
+
 def to_day_text_from_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.strftime("%Y%m%d").astype("string")
+
 
 def to_time_text_from_time(s: pd.Series) -> pd.Series:
     ss = s.astype("string").fillna("").str.strip()
@@ -481,12 +499,14 @@ def to_time_text_from_time(s: pd.Series) -> pd.Series:
 
     return out.astype("string")
 
+
 def hhmiss_to_seconds(hhmiss: pd.Series) -> pd.Series:
     x = pd.to_numeric(hhmiss, errors="coerce").fillna(-1).astype("int64")
     hh = (x // 10000).clip(lower=0, upper=23)
     mm = ((x // 100) % 100).clip(lower=0, upper=59)
     ss = (x % 100).clip(lower=0, upper=59)
     return (hh * 3600 + mm * 60 + ss).astype("int64")
+
 
 def normalize_test_time_for_sort(s: pd.Series) -> pd.Series:
     ss = s.astype("string").fillna("").str.strip()
@@ -506,6 +526,7 @@ def normalize_test_time_for_sort(s: pd.Series) -> pd.Series:
 
     return out
 
+
 def strip_step_prefix_by_remark(step: pd.Series, remark: pd.Series) -> pd.Series:
     out = step.astype("string")
     is_pd = remark.astype("string") == "PD"
@@ -514,12 +535,14 @@ def strip_step_prefix_by_remark(step: pd.Series, remark: pd.Series) -> pd.Series
     out.loc[is_np] = out.loc[is_np].str.replace(r"^nonpd_", "", regex=True)
     return out.fillna(pd.NA).astype("string").str.strip()
 
+
 def norm_step_key(s: pd.Series) -> pd.Series:
     ss = s.astype("string").fillna("")
     ss = ss.str.replace("\u00a0", " ", regex=False)
     ss = ss.str.replace(r"[_\s]+", " ", regex=True)
     ss = ss.str.replace(r"\s+", " ", regex=True)
     return ss.str.strip().str.lower()
+
 
 def _safe_date(v):
     if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -534,6 +557,7 @@ def _safe_date(v):
     if isinstance(v, date):
         return v
     return None
+
 
 def resolve_date_range(_engine_unused=None):
     if DATE_MODE == "MANUAL_RANGE":
@@ -578,15 +602,16 @@ def resolve_date_range(_engine_unused=None):
             return from_day, to_day
 
         except Exception as e:
-            print("[DB][RETRY] resolve_date_range failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] resolve_date_range failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
 
 # ============================================================
-# 6) file_path 기준 처리 제외(단발 모드용) + 날짜 캐시
+# 6) file_path 기준 처리 제외 + 날짜 캐시
 # ============================================================
 _processed_paths_cache = {}
+
 
 def get_processed_file_paths(_engine_unused, candidate_paths, chunk_size: int = 5000) -> set:
     if candidate_paths is None:
@@ -617,11 +642,12 @@ def get_processed_file_paths(_engine_unused, candidate_paths, chunk_size: int = 
                         exist.add(r[0])
                 break
             except Exception as e:
-                print("[DB][RETRY] get_processed_file_paths failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+                log_console("down", f"[DB][RETRY] get_processed_file_paths failed -> {type(e).__name__}: {repr(e)}")
                 safe_engine_recover()
                 time.sleep(DB_RETRY_SLEEP_SEC)
         i += chunk_size
     return exist
+
 
 def get_processed_file_paths_cached(engine_, day_: date, candidate_paths) -> set:
     key = day_.strftime("%Y-%m-%d")
@@ -631,11 +657,12 @@ def get_processed_file_paths_cached(engine_, day_: date, candidate_paths) -> set
     _processed_paths_cache[key] = exist
     return exist
 
+
 def apply_file_path_skip(df0: pd.DataFrame, processed_paths: set) -> pd.DataFrame:
     if df0 is None or df0.empty:
         return df0
     if not processed_paths:
-        print("[OK] file_path skip applied: processed_paths=0", flush=True)
+        log_console("info", "[OK] file_path skip applied: processed_paths=0")
         return df0
 
     fp = df0["file_path"].astype("string").fillna("").str.strip()
@@ -647,12 +674,12 @@ def apply_file_path_skip(df0: pd.DataFrame, processed_paths: set) -> pd.DataFram
     skipped_rows = before - len(out)
     skipped_files = int(fp.loc[mask_skip].nunique()) if skipped_rows > 0 else 0
 
-    print(f"[OK] file_path skip applied: skipped_rows={skipped_rows} / remain_rows={len(out)} / unique_file_path_skipped={skipped_files}", flush=True)
+    log_console("info", f"[OK] file_path skip applied: skipped_rows={skipped_rows} / remain_rows={len(out)} / unique_file_path_skipped={skipped_files}")
     return out
 
 
 # ============================================================
-# 7) Source 로드 + MES group 제외 + group 생성 + 정렬
+# 7) Source 로드 + MES 제외 + group 생성 + 정렬
 # ============================================================
 def load_source(_engine_unused, d_from: date, d_to: date) -> pd.DataFrame:
     sql = text(f"""
@@ -664,7 +691,7 @@ def load_source(_engine_unused, d_from: date, d_to: date) -> pd.DataFrame:
     df = read_sql_blocking(sql, params={"d1": d_from, "d2": d_to})
 
     if df.empty:
-        print(f"[SKIP] source 0 rows in range {d_from} ~ {d_to}", flush=True)
+        log_console("sleep", f"[SKIP] source 0 rows in range {d_from} ~ {d_to}")
         return df
 
     df["_key"] = (
@@ -692,7 +719,7 @@ def load_source(_engine_unused, d_from: date, d_to: date) -> pd.DataFrame:
     out_cols = ["group", "barcode_information", "remark", "end_day", "end_time", "contents", "test_ct", "test_time", "file_path"]
     df = df[out_cols + ["_key", "_gkey", "_seq", "_tt"]].copy()
 
-    print("[OK] loaded:", len(df), "rows / groups:", df["group"].nunique(), "/ mes_filtered_keys:", len(mes_keys), flush=True)
+    log_console("info", f"[OK] loaded: {len(df)} rows / groups: {df['group'].nunique()} / mes_filtered_keys: {len(mes_keys)}")
     return df
 
 
@@ -720,6 +747,7 @@ DROP_STEPS = {
     "nonpd_1.28 Test USB1 error","nonpd_1.29 Test USB1 benchmark.maxrd(Mbit/s)","nonpd_1.30 Test USB1 benchmark.maxwr(Mbit/s)",
     "nonpd_1.31 Test USB1 benchmark.avgrw(Mbit/s)",
 }
+
 
 def build_steps_and_setup_ct(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
@@ -756,13 +784,13 @@ def build_steps_and_setup_ct(df: pd.DataFrame) -> pd.DataFrame:
     cnt = okng.groupby(["group", "remark"], sort=False).size().reset_index(name="okng_cnt")
     bad_pd = cnt[(cnt["remark"] == "PD") & (cnt["okng_cnt"] != PD_OKNG_EXPECT)]
     bad_np = cnt[(cnt["remark"] == "Non-PD") & (cnt["okng_cnt"] != NONPD_OKNG_EXPECT)]
-    print(f"[OK] okng count check: bad_PD={len(bad_pd)} bad_NonPD={len(bad_np)}", flush=True)
+    log_console("info", f"[OK] okng count check: bad_PD={len(bad_pd)} bad_NonPD={len(bad_np)}")
 
     before = len(work)
     work = work[~work["step_description"].isin(DROP_STEPS)].copy()
     after = len(work)
     if before != after:
-        print(f"[OK] dropped steps rows: {before - after}", flush=True)
+        log_console("info", f"[OK] dropped steps rows: {before - after}")
 
     work = work.sort_values(["end_day", "end_time", "group", "_tt", "_seq"],
                             ascending=[True, True, True, True, True],
@@ -820,7 +848,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
         out["run_time"] = pd.Series(np.nan, index=out.index, dtype="float64")
 
     if fct is None or fct.empty:
-        print("[DBG] fct empty -> snap skip", flush=True)
+        log_console("info", "[DBG] fct empty -> snap skip")
         return out
 
     if "barcode_norm" not in out.columns:
@@ -845,7 +873,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     reps = out.groupby("group", sort=False).head(1)[["group", "barcode_norm", "end_day_text", "end_sec"]].copy()
     reps = reps.dropna(subset=["barcode_norm", "end_day_text", "end_sec"]).reset_index(drop=True)
     if reps.empty:
-        print("[DBG] reps empty -> snap skip", flush=True)
+        log_console("info", "[DBG] reps empty -> snap skip")
         return out
 
     j = reps.merge(
@@ -855,7 +883,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
         suffixes=("", "_fct"),
     )
     if j.empty:
-        print("[DBG] snap join empty", flush=True)
+        log_console("info", "[DBG] snap join empty")
         return out
 
     col_time = "end_time_int_fct" if "end_time_int_fct" in j.columns else "end_time_int"
@@ -866,7 +894,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     j["diff"] = (pd.to_numeric(j["fct_end_sec"], errors="coerce") - pd.to_numeric(j["end_sec"], errors="coerce")).abs()
     j = j[(j["diff"].notna()) & (j["diff"] <= END_TIME_TOL_SECONDS)].copy()
     if j.empty:
-        print("[DBG] snap: no cand within tol", flush=True)
+        log_console("info", "[DBG] snap: no cand within tol")
         return out
 
     best_idx = j.groupby("group")["diff"].idxmin()
@@ -882,7 +910,7 @@ def snap_group_cycle_to_fct(df: pd.DataFrame, fct: pd.DataFrame) -> pd.DataFrame
     matched_rows = int(out["fct_end_sec"].notna().sum())
     total_groups = int(out["group"].nunique())
     matched_groups = int(out.loc[out["fct_end_sec"].notna(), "group"].nunique())
-    print(f"[OK] snap group cycle: matched_groups={matched_groups}/{total_groups} (rows with fct_end_sec={matched_rows})", flush=True)
+    log_console("info", f"[OK] snap group cycle: matched_groups={matched_groups}/{total_groups} (rows with fct_end_sec={matched_rows})")
     return out
 
 
@@ -895,7 +923,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
         out[c] = pd.Series(pd.NA, index=out.index, dtype="string")
 
     if fct is None or fct.empty:
-        print("[CHK] value matched: 0 /", len(out), "(fct empty)", flush=True)
+        log_console("info", f"[CHK] value matched: 0 / {len(out)} (fct empty)")
         return out
 
     out["barcode_norm"] = normalize_barcode(out["barcode_information"])
@@ -914,7 +942,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
     ].copy()
 
     if need.empty:
-        print("[CHK] value matched: 0 /", len(out), "(need empty)", flush=True)
+        log_console("info", f"[CHK] value matched: 0 / {len(out)} (need empty)")
         return out.drop(columns=["_row_id"], errors="ignore")
 
     need["_step_stripped"] = strip_step_prefix_by_remark(need["step_description"], need["remark"])
@@ -942,8 +970,8 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
         right_on=["barcode_norm", "end_day_text", "station", "end_time_int_fct", "step_key_norm"]
     )
 
-    print("[DBG-MATCH] join rows:", len(j), "/", len(need2), flush=True)
-    print("[DBG-MATCH] non-null value in join:", int(j["value"].notna().sum()), flush=True)
+    log_console("info", f"[DBG-MATCH] join rows: {len(j)} / {len(need2)}")
+    log_console("info", f"[DBG-MATCH] non-null value in join: {int(j['value'].notna().sum())}")
 
     j = j.sort_values("_row_id").drop_duplicates("_row_id", keep="first")
     got = j[["_row_id", "value", "min", "max", "result"]]
@@ -954,7 +982,7 @@ def match_value_min_max_result_by_cycle(df: pd.DataFrame, fct: pd.DataFrame) -> 
 
     out = out.drop(columns=[f"{c}_m" for c in ["value", "min", "max", "result"]], errors="ignore")
     out = out.drop(columns=["_row_id"], errors="ignore")
-    print("[CHK] value matched:", int(out["value"].notna().sum()), "/", len(out), flush=True)
+    log_console("info", f"[CHK] value matched: {int(out['value'].notna().sum())} / {len(out)}")
     return out
 
 
@@ -966,6 +994,7 @@ FINAL_COLS = [
     "contents", "step_description", "set_up_or_test_ct", "value", "min", "max", "result",
     "test_ct", "test_time", "file_path"
 ]
+
 
 def _prepare_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -985,6 +1014,7 @@ def _prepare_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
     end_time_hhmiss = to_time_text_from_time(df2["end_time"])
     df2["end_time"] = pd.to_datetime(end_time_hhmiss, format="%H%M%S", errors="coerce").dt.time
     return df2
+
 
 def _copy_one_chunk_blocking(staging: str, chunk: pd.DataFrame, start: int, end: int):
     def to_copy_buffer(frame: pd.DataFrame) -> io.StringIO:
@@ -1044,13 +1074,11 @@ def _copy_one_chunk_blocking(staging: str, chunk: pd.DataFrame, start: int, end:
                 """)
                 raw.commit()
 
-            print(f"[OK] bulk upsert chunk: {start}~{end-1} ({end-start} rows)", flush=True)
+            log_console("info", f"[OK] bulk upsert chunk: {start}~{end-1} ({end-start} rows)")
             return
 
         except Exception as e:
-            print("[DB][RETRY] COPY chunk failed -> {}: {} | chunk {}~{}".format(
-                type(e).__name__, repr(e), start, end-1
-            ), flush=True)
+            log_console("down", f"[DB][RETRY] COPY chunk failed -> {type(e).__name__}: {repr(e)} | chunk {start}~{end-1}")
             try:
                 if raw is not None:
                     raw.close()
@@ -1069,7 +1097,7 @@ def _copy_one_chunk_blocking(staging: str, chunk: pd.DataFrame, start: int, end:
 
 def bulk_upsert_copy(_engine_unused, df: pd.DataFrame):
     if df.empty:
-        print("[SKIP] df empty", flush=True)
+        log_console("sleep", "[SKIP] df empty")
         return
 
     df2 = _prepare_df_for_db(df)
@@ -1098,12 +1126,13 @@ def bulk_upsert_copy(_engine_unused, df: pd.DataFrame):
         chunk = chunk.drop_duplicates(subset=PK_COLS, keep="last").copy()
         dropped = before_rows - len(chunk)
         if dropped > 0:
-            print(f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})", flush=True)
+            log_console("info", f"[WARN] staging chunk PK duplicates dropped: {dropped} (rows {before_rows} -> {len(chunk)})")
 
         _copy_one_chunk_blocking(staging, chunk, start, end)
         start = end
 
-    print(f"[DONE] UPSERT(COPY) 완료: {total} rows / sec={time.time()-t0:.2f}", flush=True)
+    log_console("info", f"[DONE] UPSERT(COPY) 완료: {total} rows / sec={time.time()-t0:.2f}")
+
 
 def _py(v):
     if v is None:
@@ -1125,9 +1154,10 @@ def _py(v):
         return v.to_pytimedelta()
     return v
 
+
 def direct_upsert(_engine_unused, df: pd.DataFrame):
     if df.empty:
-        print("[SKIP] df empty", flush=True)
+        log_console("sleep", "[SKIP] df empty")
         return
 
     df2 = _prepare_df_for_db(df)
@@ -1136,7 +1166,7 @@ def direct_upsert(_engine_unused, df: pd.DataFrame):
     df2 = df2.drop_duplicates(subset=PK_COLS, keep="last").copy()
     dropped = before - len(df2)
     if dropped > 0:
-        print(f"[WARN] direct upsert PK duplicates dropped: {dropped} (rows {before} -> {len(df2)})", flush=True)
+        log_console("info", f"[WARN] direct upsert PK duplicates dropped: {dropped} (rows {before} -> {len(df2)})")
 
     cols = [
         "group","barcode_information","station","remark","end_day","end_time","run_time",
@@ -1184,18 +1214,18 @@ def direct_upsert(_engine_unused, df: pd.DataFrame):
                         records.append(tuple(_py(v) for v in row))
                     execute_values(cur, sql, records, page_size=min(1000, len(records)))
                     raw.commit()
-                    print(f"[OK] direct upsert batch: {start}~{end-1} ({end-start} rows)", flush=True)
+                    log_console("info", f"[OK] direct upsert batch: {start}~{end-1} ({end-start} rows)")
 
             try:
                 raw.close()
             except Exception:
                 pass
 
-            print(f"[DONE] UPSERT(DIRECT) 완료: {len(df2)} rows / sec={time.time()-t0:.2f}", flush=True)
+            log_console("info", f"[DONE] UPSERT(DIRECT) 완료: {len(df2)} rows / sec={time.time()-t0:.2f}")
             return
 
         except Exception as e:
-            print("[DB][RETRY] direct_upsert failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] direct_upsert failed -> {type(e).__name__}: {repr(e)}")
             try:
                 if raw is not None:
                     raw.close()
@@ -1209,13 +1239,13 @@ def direct_upsert(_engine_unused, df: pd.DataFrame):
 def upsert_auto(engine_, df: pd.DataFrame):
     n = int(len(df))
     if n <= 0:
-        print("[SKIP] df empty", flush=True)
+        log_console("sleep", "[SKIP] df empty")
         return
     if n <= UPSERT_DIRECT_THRESHOLD_ROWS:
-        print(f"[MODE] DIRECT UPSERT (rows={n} <= threshold={UPSERT_DIRECT_THRESHOLD_ROWS})", flush=True)
+        log_console("info", f"[MODE] DIRECT UPSERT (rows={n} <= threshold={UPSERT_DIRECT_THRESHOLD_ROWS})")
         direct_upsert(engine_, df)
     else:
-        print(f"[MODE] COPY+STAGING UPSERT (rows={n} > threshold={UPSERT_DIRECT_THRESHOLD_ROWS})", flush=True)
+        log_console("info", f"[MODE] COPY+STAGING UPSERT (rows={n} > threshold={UPSERT_DIRECT_THRESHOLD_ROWS})")
         bulk_upsert_copy(engine_, df)
 
 
@@ -1228,26 +1258,25 @@ def main():
     log_event("info", "main start")
 
     run_start = datetime.now()
-    print("=" * 120, flush=True)
-    print(f"[RUN] START : {run_start.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-    print(f"[RUN] MODE  : DATE_MODE={DATE_MODE}, SAFETY_LOOKBACK_DAYS={SAFETY_LOOKBACK_DAYS}, MAX_DAYS_PER_RUN={MAX_DAYS_PER_RUN}", flush=True)
-    print(f"[RUN] DB    : pool_size=1 max_overflow=0 work_mem={WORK_MEM_MB}MB", flush=True)
-    print("=" * 120, flush=True)
+    log_console("info", "=" * 120)
+    log_console("info", f"[RUN] START : {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
+    log_console("info", f"[RUN] MODE  : DATE_MODE={DATE_MODE}, SAFETY_LOOKBACK_DAYS={SAFETY_LOOKBACK_DAYS}, MAX_DAYS_PER_RUN={MAX_DAYS_PER_RUN}")
+    log_console("info", f"[RUN] DB    : pool_size=1 max_overflow=0 work_mem={WORK_MEM_MB}MB")
+    log_console("info", "=" * 120)
 
     bootstrap_fct_database(None)
     d_from, d_to = resolve_date_range(None)
-    print(f"[RUN] DATE_RANGE : {d_from} ~ {d_to}", flush=True)
+    log_console("info", f"[RUN] DATE_RANGE : {d_from} ~ {d_to}")
 
     cur = d_from
     while cur <= d_to:
         day_start = time.time()
-        print("\n" + "-" * 120, flush=True)
-        print(f"[RUN] DAY : {cur}", flush=True)
-        print("-" * 120, flush=True)
+        log_console("info", "-" * 120)
+        log_console("info", f"[RUN] DAY : {cur}")
+        log_console("info", "-" * 120)
 
         df0 = load_source(None, cur, cur)
         if df0.empty:
-            print("[SKIP] no source rows", flush=True)
             log_event("sleep", f"day={cur} no source rows")
             cur = cur + timedelta(days=1)
             continue
@@ -1255,7 +1284,6 @@ def main():
         processed = get_processed_file_paths_cached(None, cur, df0["file_path"].tolist())
         df0 = apply_file_path_skip(df0, processed)
         if df0.empty:
-            print("[SKIP] all rows skipped by file_path", flush=True)
             log_event("sleep", f"day={cur} all rows skipped by file_path")
             cur = cur + timedelta(days=1)
             continue
@@ -1271,7 +1299,7 @@ def main():
         fct = load_fct_table(None, days, patterns)
 
         if fct.empty:
-            print("[WARN] fct_table empty for this day -> value/min/max/result will be all NULL", flush=True)
+            log_console("info", "[WARN] fct_table empty for this day -> value/min/max/result will be all NULL")
 
         df2 = snap_group_cycle_to_fct(df1, fct)
         df3 = match_value_min_max_result_by_cycle(df2, fct)
@@ -1286,11 +1314,11 @@ def main():
 
     run_end = datetime.now()
     run_seconds = (run_end - run_start).total_seconds()
-    print("=" * 120, flush=True)
-    print(f"[RUN] END   : {run_end.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-    print(f"[RUN] SEC   : {run_seconds:.2f} sec", flush=True)
-    print("=" * 120, flush=True)
-    print("[DONE] 전체 파이프라인 종료", flush=True)
+    log_console("info", "=" * 120)
+    log_console("info", f"[RUN] END   : {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
+    log_console("info", f"[RUN] SEC   : {run_seconds:.2f} sec")
+    log_console("info", "=" * 120)
+    log_console("info", "[DONE] 전체 파이프라인 종료")
     log_event("info", f"main end run_seconds={run_seconds:.2f}")
 
 
@@ -1338,10 +1366,10 @@ def bootstrap_state_table(_engine_unused=None):
                 finally:
                     conn.execute(text("SELECT pg_advisory_unlock(hashtext(:k)::bigint);"), {"k": f"{STATE_SCHEMA}.{STATE_TABLE}"})
 
-            print(f"[OK] state table ensured: {STATE_SCHEMA}.{STATE_TABLE}", flush=True)
+            log_console("info", f"[OK] state table ensured: {STATE_SCHEMA}.{STATE_TABLE}")
             return
         except Exception as e:
-            print("[DB][RETRY] bootstrap_state_table failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] bootstrap_state_table failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -1358,7 +1386,7 @@ def read_watermark_end_time(_engine_unused, worker_id: int, day_: date):
                 row = conn.execute(sql, {"job": REALTIME_JOB_NAME, "wid": int(worker_id), "day": day_}).fetchone()
             return row[0] if row and row[0] is not None else None
         except Exception as e:
-            print("[DB][RETRY] read_watermark_end_time failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] read_watermark_end_time failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -1393,7 +1421,7 @@ def write_watermark_end_time(_engine_unused, worker_id: int, day_: date, last_en
                 conn.execute(sql, {"job": REALTIME_JOB_NAME, "wid": int(worker_id), "day": day_, "t": last_end_time_})
             return
         except Exception as e:
-            print("[DB][RETRY] write_watermark_end_time failed -> {}: {}".format(type(e).__name__, repr(e)), flush=True)
+            log_console("down", f"[DB][RETRY] write_watermark_end_time failed -> {type(e).__name__}: {repr(e)}")
             safe_engine_recover()
             time.sleep(DB_RETRY_SLEEP_SEC)
 
@@ -1531,9 +1559,9 @@ def realtime_loop_single():
     worker_id = 0
     last_day = None
 
-    print("=" * 120, flush=True)
-    print(f"[REALTIME] START | loop={REALTIME_LOOP_INTERVAL_SEC}s | limit={REALTIME_FETCH_LIMIT_ROWS} | lookback={REALTIME_LOOKBACK_SEC}s | work_mem={WORK_MEM_MB}MB", flush=True)
-    print("=" * 120, flush=True)
+    log_console("info", "=" * 120)
+    log_console("info", f"[REALTIME] START | loop={REALTIME_LOOP_INTERVAL_SEC}s | limit={REALTIME_FETCH_LIMIT_ROWS} | lookback={REALTIME_LOOKBACK_SEC}s | work_mem={WORK_MEM_MB}MB")
+    log_console("info", "=" * 120)
 
     get_engine_blocking()
     bootstrap_fct_database(None)
@@ -1564,14 +1592,14 @@ def realtime_loop_single():
 
                 elapsed = time.time() - t0
                 msg = f"day={day_} loaded={len(df0)} upsert_in={rows_in} watermark={max_t} sec={elapsed:.2f}"
-                print(f"[REALTIME] {msg}", flush=True)
+                log_console("info", f"[REALTIME] {msg}")
                 log_event("info", msg)
             else:
                 log_event("sleep", f"no new rows day={day_}")
 
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
-            print(f"[REALTIME][ERROR] {err_msg}", flush=True)
+            log_console("error", f"[REALTIME][ERROR] {err_msg}")
             log_event("error", err_msg + "\n" + traceback.format_exc())
 
             safe_engine_recover()
@@ -1588,19 +1616,71 @@ def realtime_loop_single():
 
 
 def realtime_main():
+    """
+    Nuitka/EXE에서 시작 직후 종료 방지:
+    - set_start_method 예외 무시
+    - realtime_loop_single 바깥 fatal guard
+    - fatal 시 5초 간격 재시도(프로세스 생존)
+    """
     try:
-        mp.set_start_method("spawn", force=True)
-    except Exception:
-        pass
-    realtime_loop_single()
+        try:
+            mp.set_start_method("spawn", force=True)
+        except Exception:
+            pass
+
+        while True:
+            try:
+                realtime_loop_single()
+            except Exception as e:
+                msg = f"fatal realtime_main loop crash: {type(e).__name__}: {e}"
+                log_console("error", msg)
+                try:
+                    log_event("error", msg + "\n" + traceback.format_exc())
+                except Exception:
+                    pass
+                time.sleep(5)
+
+    except Exception as e:
+        # 마지막 방어벽
+        msg = f"fatal realtime_main outer crash: {type(e).__name__}: {e}"
+        log_console("error", msg)
+        _append_local_log(traceback.format_exc())
+        while True:
+            time.sleep(5)
 
 
 # ============================================================
-# 15) Entry
+# 15) Entry (freeze_support 필수)
 # ============================================================
 if __name__ == "__main__":
+    try:
+        mp.freeze_support()  # Nuitka/PyInstaller frozen 환경 안정화
+    except Exception:
+        pass
+
+    try:
+        _ensure_local_log_dir()
+        log_console("info", "[BOOT] process start")
+        log_console("info", f"[BOOT] python={sys.version}")
+        log_console("info", f"[BOOT] executable={sys.executable}")
+        log_console("info", f"[BOOT] argv={sys.argv}")
+    except Exception:
+        pass
+
     REALTIME_TODAY = True
     if REALTIME_TODAY:
         realtime_main()
     else:
-        main()
+        # 단발도 fatal guard 적용
+        while True:
+            try:
+                main()
+                break
+            except Exception as e:
+                msg = f"fatal main crash: {type(e).__name__}: {e}"
+                log_console("error", msg)
+                try:
+                    log_event("error", msg + "\n" + traceback.format_exc())
+                except Exception:
+                    pass
+                time.sleep(5)
