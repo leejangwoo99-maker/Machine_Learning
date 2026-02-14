@@ -39,7 +39,8 @@ from app.routers.pd_board_check import router as pd_board_check_router
 from app.routers.reports import router as reports_router
 from app.routers.master_sample_info import router as master_sample_info_router
 from app.routers.production_progress_graph import router as production_progress_graph_router
-
+from app.routers.events_sse import router as events_sse_router
+from app.routers.events_sections import router as events_sections_router
 
 def _mask_db_url(url: str | None) -> str:
     """로그 출력용 DB URL 마스킹."""
@@ -131,3 +132,5 @@ app.include_router(pd_board_check_router)
 app.include_router(reports_router)
 app.include_router(master_sample_info_router)
 app.include_router(production_progress_graph_router)
+app.include_router(events_sse_router)
+app.include_router(events_sections_router)
