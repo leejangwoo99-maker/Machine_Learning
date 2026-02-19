@@ -83,7 +83,7 @@ DB_CONFIG = {
     "dbname": os.getenv("PGDATABASE", "postgres"),
     "user": os.getenv("PGUSER", "postgres"),
     # ⚠️ 운영에서는 환경변수 PGPASSWORD 권장
-    "password": os.getenv("PGPASSWORD", "leejangwoo1!"),
+    "password": os.getenv("PGPASSWORD", ""),
 }
 
 # =========================
