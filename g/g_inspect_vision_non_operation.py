@@ -62,7 +62,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "leejangwoo1!",
+    "password": "",
 }
 
 DAEMON_NAME = "g_inspect_vision_non_operation_daemon"

@@ -33,7 +33,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "leejangwoo1!",
+    "password": "",
 }
 
 # NAS로 바꿀 때는 이거 쓰면 됨

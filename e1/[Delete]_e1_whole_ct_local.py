@@ -20,7 +20,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "leejangwoo1!",
+    "password": "",
 }
 
 # ==== ★ 기간 고정: 2025-10-01 ~ 2025-11-30 ====

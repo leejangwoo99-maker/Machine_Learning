@@ -42,7 +42,7 @@ DB_LOCAL = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "leejangwoo1!",
+    "password": "",
 }
 
 DB_REMOTE = {
@@ -50,7 +50,7 @@ DB_REMOTE = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "leejangwoo1!",
+    "password": "",
 }
 
 

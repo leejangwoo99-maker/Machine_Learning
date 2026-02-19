@@ -16,7 +16,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "leejangwoo1!",
+    "password": "",
 }
 
 # a. 비전 JSON 테이블 (station, result 매핑용)

@@ -25,7 +25,7 @@ from multiprocessing import Pool
 # DB 접속 (SQLAlchemy 엔진)
 # ============================================
 user = "postgres"
-password_raw = "leejangwoo1!"
+password_raw = ""
 host = "100.105.75.47"
 port = 5432
 dbname = "postgres"
