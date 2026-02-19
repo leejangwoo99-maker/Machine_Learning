@@ -19,7 +19,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",
+    "password": "",#비번은 보완 사항
 }
 
 SCHEMA_NAME = "d1_machine_log"

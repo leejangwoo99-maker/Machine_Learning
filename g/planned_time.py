@@ -14,7 +14,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",
+    "password": "",#비번은 보완 사항
 }
 
 SCHEMA = "g_production_film"

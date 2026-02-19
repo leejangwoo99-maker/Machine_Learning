@@ -56,7 +56,7 @@ DB_CONFIG = {
     "port": int(os.getenv("PGPORT", "5432")),
     "dbname": os.getenv("PGDATABASE", "postgres"),
     "user": os.getenv("PGUSER", "postgres"),
-    "password": os.getenv("PGPASSWORD", ""),
+    "password": os.getenv("PGPASSWORD", ""),#비번은 보완 사항
 }
 
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")

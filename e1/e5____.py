@@ -30,7 +30,7 @@ class DBConfig:
     port: int = 5432
     dbname: str = "postgres"
     user: str = "postgres"
-    password: str = ""
+    password: str = ""#비번은 보완 사항
 
 
 # Source

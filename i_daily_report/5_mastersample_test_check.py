@@ -133,7 +133,7 @@ def make_engine() -> Engine:
         "port": int(os.getenv("PG_PORT", "5432")),
         "dbname": os.getenv("PG_DBNAME", "postgres"),
         "user": os.getenv("PG_USER", "postgres"),
-        "password": os.getenv("PG_PASSWORD", ""),
+        "password": os.getenv("PG_PASSWORD", ""),#비번은 보완 사항
     }
     url = (
         f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}"

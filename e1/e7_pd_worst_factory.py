@@ -38,7 +38,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",
+    "password": "",#비번은 보완 사항
 }
 
 # ✅ 오늘 날짜 자동 + 없으면 최신일 fallback

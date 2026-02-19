@@ -33,7 +33,7 @@ def main():
         "port": 5432,
         "dbname": "postgres",
         "user": "postgres",
-        "password": "",
+        "password": "",#비번은 보완 사항
     }
 
     engine = create_engine(

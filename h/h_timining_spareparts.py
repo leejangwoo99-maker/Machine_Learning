@@ -40,7 +40,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",
+    "password": "",#비번은 보완 사항
 }
 
 STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]

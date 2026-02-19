@@ -59,7 +59,7 @@ DB_CONFIG = {
     "dbname": "postgres",
     "user": "postgres",
     # ✅ exe 환경에서는 환경변수로 override 가능하게 해두는 걸 추천
-    "password": os.getenv("PGPASSWORD", ""),
+    "password": os.getenv("PGPASSWORD", ""),#비번은 보완 사항
 }
 
 AFA_SCHEMA = "d1_machine_log"
