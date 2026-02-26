@@ -34,8 +34,10 @@ def _norm_shift(v: str) -> str:
 
 
 class WorkerInfoRow(BaseModel):
-    end_day: str = Field(..., description="YYYYMMDD")
-    shift_type: Literal["day", "night"]
+    # ✅ body에는 없어도 됨 (query 기준으로 저장)
+    end_day: Optional[str] = Field(default=None, description="YYYYMMDD (optional)")
+    shift_type: Optional[Literal["day", "night"]] = Field(default=None, description="day|night (optional)")
+
     worker_name: Optional[str] = ""
     order_number: Optional[str] = ""
 
@@ -59,9 +61,9 @@ def get_worker_info(
             text(
                 f"""
                 SELECT
-                    end_day::text     AS end_day,
-                    shift_type::text  AS shift_type,
-                    worker_name::text AS worker_name,
+                    end_day::text      AS end_day,
+                    shift_type::text   AS shift_type,
+                    worker_name::text  AS worker_name,
                     order_number::text AS order_number
                 FROM {SCHEMA}.{TABLE}
                 WHERE end_day = :end_day
@@ -94,7 +96,7 @@ def post_worker_info_sync(
         d = _norm_day(end_day)
         s = _norm_shift(shift_type)
 
-        # 같은 날짜/주야간 기존 데이터 정리 후 재적재(기존 운영 방식 맞춤)
+        # ✅ 같은 날짜/주야간 기존 데이터 정리 후 재적재(Replace)
         db.execute(
             text(
                 f"""
@@ -115,7 +117,17 @@ def post_worker_info_sync(
         )
 
         count = 0
-        for row in body.rows:
+        for row in (body.rows or []):
+            # ✅ (선택) row에 end_day/shift_type이 같이 오면 query와 불일치 방지
+            if row.end_day is not None:
+                rd = _norm_day(str(row.end_day))
+                if rd != d:
+                    raise ValueError(f"row.end_day({rd}) != query.end_day({d})")
+            if row.shift_type is not None:
+                rs = _norm_shift(str(row.shift_type))
+                if rs != s:
+                    raise ValueError(f"row.shift_type({rs}) != query.shift_type({s})")
+
             wn = (row.worker_name or "").strip()
             on = (row.order_number or "").strip()
             if not wn and not on:
@@ -123,12 +135,7 @@ def post_worker_info_sync(
 
             db.execute(
                 ins_sql,
-                {
-                    "end_day": d,
-                    "shift_type": s,
-                    "worker_name": wn,
-                    "order_number": on,
-                },
+                {"end_day": d, "shift_type": s, "worker_name": wn, "order_number": on},
             )
             count += 1
 

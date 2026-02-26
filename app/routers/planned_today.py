@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+﻿# app/api/routers/planned_today.py
+from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
@@ -20,6 +21,8 @@ TABLE = "planned_time"
 KST = ZoneInfo("Asia/Seoul")
 DAY_START = "08:30:00"
 DAY_END = "20:29:59"
+NIGHT_START = "20:30:00"
+NIGHT_END = "08:29:59"
 
 
 # ------------------------------------------------------------
@@ -35,7 +38,6 @@ def _norm_day(v: str) -> str:
 
 
 def _norm_shift(v: str) -> str:
-    # ?명꽣?섏씠???명솚??寃利??뚯씠釉붿뿏 shift_type 而щ읆 ?놁쓬)
     s = (v or "").strip().lower()
     if s not in {"day", "night"}:
         raise ValueError("shift_type must be day/night")
@@ -76,6 +78,9 @@ def _to_hhmmss(v: str) -> str:
 
 def _ensure_table_exists(db: Session) -> None:
     db.execute(text(f"""
+        CREATE SCHEMA IF NOT EXISTS {SCHEMA};
+    """))
+    db.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {SCHEMA}.{TABLE} (
             end_day   text NOT NULL,
             from_time text NOT NULL,
@@ -92,38 +97,20 @@ def _ensure_unique_index(db: Session) -> None:
     """))
 
 
-def _fetch_keys_for_day(db: Session, end_day: str) -> Set[Tuple[str, str, str]]:
-    rows = db.execute(text(f"""
-        SELECT end_day, from_time, to_time
-        FROM {SCHEMA}.{TABLE}
-        WHERE replace(end_day, '-', '') = :end_day
-    """), {"end_day": end_day}).mappings().all()
-
-    out: Set[Tuple[str, str, str]] = set()
-    for r in rows:
-        d_raw = (r.get("end_day") or "").strip()
-        d = _norm_day(d_raw) if d_raw else ""
-        f = (r.get("from_time") or "").strip()
-        t = (r.get("to_time") or "").strip()
-        if d and f and t:
-            out.add((d, _to_hhmmss(f), _to_hhmmss(t)))
-    return out
-
-
 def _resolve_kst_day_shift() -> Tuple[str, str]:
     """
-    KST 湲곗? ?꾩옱 ?쒓컖???ъ뼇??留욎떠 (YYYYMMDD, shift_type)濡??섏궛
-    - day   : D-day 08:30:00 ~ 20:29:59
-    - night : D-day 20:30:00 ~ 23:59:59 + D+1 00:00:00 ~ 08:29:59
-      => 00:00~08:29??'?꾩씪 night'
+    KST 현재 시각 기준 자동 (YYYYMMDD, shift_type)
+    - day   : D 08:30:00 ~ 20:29:59
+    - night : D 20:30:00 ~ 23:59:59 + D+1 00:00:00 ~ 08:29:59
+      => 00:00~08:29 는 '전일 night'
     """
     now = datetime.now(KST)
-    t = now.time()
+    t = now.strftime("%H:%M:%S")
 
-    if DAY_START <= t.strftime("%H:%M:%S") <= DAY_END:
+    if DAY_START <= t <= DAY_END:
         return now.strftime("%Y%m%d"), "day"
 
-    if t.strftime("%H:%M:%S") < DAY_START:
+    if t < DAY_START:
         prev = now - timedelta(days=1)
         return prev.strftime("%Y%m%d"), "night"
 
@@ -135,7 +122,42 @@ def _in_shift_window(from_time: str, shift_type: str) -> bool:
     if shift_type == "day":
         return DAY_START <= ft <= DAY_END
     # night
-    return (ft >= "20:30:00") or (ft <= "08:29:59")
+    return (ft >= NIGHT_START) or (ft <= NIGHT_END)
+
+
+def _fetch_rows_for_day(db: Session, end_day: str) -> List[Dict[str, Any]]:
+    rows = db.execute(text(f"""
+        SELECT end_day, from_time, to_time, reason
+        FROM {SCHEMA}.{TABLE}
+        WHERE replace(end_day, '-', '') = :end_day
+        ORDER BY from_time, to_time
+    """), {"end_day": end_day}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _fetch_keys_for_day_shift(db: Session, end_day: str, shift_type: str) -> Set[Tuple[str, str, str]]:
+    """
+    planned_time에는 shift_type 컬럼이 없으므로,
+    'from_time'이 shift window에 해당하는 것만 키로 잡는다.
+    """
+    rows = _fetch_rows_for_day(db, end_day)
+    out: Set[Tuple[str, str, str]] = set()
+
+    for r in rows:
+        d_raw = (r.get("end_day") or "").strip()
+        d = _norm_day(d_raw) if d_raw else ""
+        f = (r.get("from_time") or "").strip()
+        t = (r.get("to_time") or "").strip()
+        if not d or not f or not t:
+            continue
+
+        f2 = _to_hhmmss(f)
+        t2 = _to_hhmmss(t)
+
+        if _in_shift_window(f2, shift_type):
+            out.add((d, f2, t2))
+
+    return out
 
 
 # ------------------------------------------------------------
@@ -173,7 +195,7 @@ class PlannedTimeSyncIn(BaseModel):
 
 
 # ------------------------------------------------------------
-# Read API (?ъ뼇 寃쎈줈)
+# Read API
 # ------------------------------------------------------------
 @router.get("")
 def get_planned_time(
@@ -182,11 +204,8 @@ def get_planned_time(
     db: Session = Depends(get_db),
 ) -> Response:
     """
-    planned_time ?뚯씠釉붿뿉 shift_type 而щ읆???놁뼱??
-    from_time ?쒓컙? ?덈룄?곕줈 day/night ?꾪꽣留곹븳??
-
-    - end_day/shift_type ?????놁쑝硫?KST ?꾩옱 湲곗? ?먮룞 怨꾩궛
-    - ?섎굹留?二쇰㈃ ?섎㉧吏???먮룞 怨꾩궛媛??ъ슜
+    planned_time 테이블에 shift_type 컬럼이 없으므로
+    from_time 시간대를 기준으로 day/night 필터링.
     """
     try:
         _ensure_table_exists(db)
@@ -196,16 +215,7 @@ def get_planned_time(
         d = _norm_day(end_day) if end_day is not None else auto_day
         s = _norm_shift(shift_type) if shift_type is not None else auto_shift
 
-        rows = db.execute(text(f"""
-            SELECT
-                end_day,
-                from_time,
-                to_time,
-                reason
-            FROM {SCHEMA}.{TABLE}
-            WHERE replace(end_day, '-', '') = :end_day
-            ORDER BY from_time, to_time
-        """), {"end_day": d}).mappings().all()
+        rows = _fetch_rows_for_day(db, d)
 
         payload: List[Dict[str, Any]] = []
         for r in rows:
@@ -232,56 +242,63 @@ def get_planned_time(
         raise HTTPException(status_code=500, detail=f"planned_time get failed: {e}") from e
 
 
-# ------------------------------------------------------------
-# Read API (湲곗〈 ?명솚 寃쎈줈 ?좎?)
-# ------------------------------------------------------------
 @router.get("/today")
 def get_planned_time_today(
     end_day: Optional[str] = None,
     shift_type: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> Response:
-    """
-    湲곗〈 ?대씪?댁뼵???명솚??
-    ?대??곸쑝濡?GET /planned_time 怨??숈씪?섍쾶 ?숈옉.
-    """
     return get_planned_time(end_day=end_day, shift_type=shift_type, db=db)
 
 
 # ------------------------------------------------------------
-# Sync API
+# Sync API  ✅ 핵심 수정
 # ------------------------------------------------------------
 @router.post("/sync")
 def post_planned_time_sync(
     body: PlannedTimeSyncIn,
+    # ✅ api_client는 mode=replace 로 보냄
     mode: Literal["add", "replace"] = Query("add"),
+    # ✅ streamlit client가 end_day/shift_type을 query로 보냄 (중요)
+    end_day: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    shift_type: Optional[str] = Query(None, description="day/night"),
     dry_run: bool = Query(False),
     min_keep_ratio: float = Query(0.7, ge=0.0, le=1.0),
     db: Session = Depends(get_db),
 ):
     """
     mode=add
-      - (end_day, from_time, to_time) 湲곗? upsert
-      - 湲곗〈 ?곗씠????젣 ?놁쓬
+      - (end_day, from_time, to_time) 기준 upsert
+      - 삭제 없음
 
-    mode=replace
-      - payload瑜?end_day蹂?理쒖쥌 ?ㅻ깄?룹쑝濡?媛꾩＜
-      - ?대떦 end_day?먯꽌 payload???녿뒗 range????젣 ???      - dry_run=true硫?諛섏쁺 ?놁씠 移댁슫?몃쭔 諛섑솚
-      - min_keep_ratio 蹂댄샇 ?곸슜
+    mode=replace  ✅ FIXED
+      - Query(end_day, shift_type) 스코프를 '반드시' 기준으로 replace 수행
+      - payload가 비어도: 해당 end_day + shift window 데이터는 전부 삭제됨 (전체삭제 가능)
+      - payload가 있으면: (현재 shift window에서) payload에 없는 range는 삭제됨
+      - dry_run=true면 카운트만 반환
+      - min_keep_ratio 가드:
+          payload가 0이면 "전체 삭제 의도"로 간주하고 가드 미적용
+          payload>0이면 기존 대비 payload 비율이 너무 낮을 때 차단
     """
     try:
         _ensure_table_exists(db)
         _ensure_unique_index(db)
 
-        # payload dedup: key=(end_day, from_time, to_time), last-write-wins
-        dedup: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        scope_days: Dict[str, Set[Tuple[str, str, str]]] = {}
+        auto_day, auto_shift = _resolve_kst_day_shift()
+        d = _norm_day(end_day) if end_day is not None else auto_day
+        s = _norm_shift(shift_type) if shift_type is not None else auto_shift
 
-        for r in body.rows:
+        # payload dedup (end_day는 query d로 강제 고정)
+        dedup: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+        for r in (body.rows or []):
             row = r.model_dump()
-            d = _norm_day(row["end_day"])
             f = _to_hhmmss(row["from_time"])
             t = _to_hhmmss(row["to_time"])
+
+            # ✅ query shift window 밖은 무시 (UI/조회와 동일 규칙)
+            if not _in_shift_window(f, s):
+                continue
 
             k = (d, f, t)
             dedup[k] = {
@@ -291,47 +308,49 @@ def post_planned_time_sync(
                 "reason": row.get("reason"),
             }
 
-            if d not in scope_days:
-                scope_days[d] = set()
-            scope_days[d].add(k)
-
         target_keys: Set[Tuple[str, str, str]] = set(dedup.keys())
         upsert_count = len(target_keys)
 
-        delete_keys: Set[Tuple[str, str, str]] = set()
-        if mode == "replace":
-            for d, target_in_day in scope_days.items():
-                current_in_day = _fetch_keys_for_day(db, d)
+        # ✅ 현재 DB의 "해당 end_day + shift window" 키 집합
+        current_keys = _fetch_keys_for_day_shift(db, d, s)
 
-                base = len(current_in_day) if len(current_in_day) > 0 else 1
-                keep_ratio = float(len(target_in_day)) / float(base)
+        delete_keys: Set[Tuple[str, str, str]] = set()
+
+        if mode == "replace":
+            # ✅ replace는 shift-window 범위 안에서만 replace 한다
+            # payload=0이면 -> current_keys 전부 삭제(전체 삭제)
+            delete_keys = current_keys - target_keys
+
+            # ✅ 가드(선택)
+            if len(target_keys) > 0:
+                base = len(current_keys) if len(current_keys) > 0 else 1
+                keep_ratio = float(len(target_keys)) / float(base)
                 if keep_ratio < float(min_keep_ratio):
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            f"guard blocked on day({d}): "
+                            f"guard blocked on day({d}) shift({s}): "
                             f"keep_ratio={keep_ratio:.4f} < min_keep_ratio={min_keep_ratio:.4f}"
                         ),
                     )
-
-                delete_keys |= (current_in_day - target_in_day)
+            # payload=0이면 keep_ratio=0이지만, 이건 '전체 삭제' 케이스라 가드 안 건다.
 
         if dry_run:
+            total_after = 0
             if mode == "replace":
-                total_after = len(target_keys)
+                total_after = len((current_keys - delete_keys) | target_keys)
             else:
-                current_all: Set[Tuple[str, str, str]] = set()
-                for d in scope_days.keys():
-                    current_all |= _fetch_keys_for_day(db, d)
-                total_after = len(current_all | target_keys)
+                total_after = len(current_keys | target_keys)
 
             return {
                 "ok": True,
                 "mode": mode,
+                "end_day": d,
+                "shift_type": s,
                 "dry_run": True,
                 "upserted": upsert_count,
                 "deleted": len(delete_keys),
-                "total_after": total_after,
+                "total_after_in_shift": total_after,
             }
 
         # 1) upsert
@@ -349,27 +368,28 @@ def post_planned_time_sync(
         # 2) delete (replace)
         deleted = 0
         if mode == "replace" and delete_keys:
-            for d, f, t in sorted(delete_keys):
+            for dd, f, t in sorted(delete_keys):
                 db.execute(text(f"""
                     DELETE FROM {SCHEMA}.{TABLE}
                     WHERE replace(end_day, '-', '') = :end_day
                       AND from_time = :from_time
                       AND to_time = :to_time
-                """), {"end_day": d, "from_time": f, "to_time": t})
+                """), {"end_day": dd, "from_time": f, "to_time": t})
                 deleted += 1
 
         db.commit()
 
-        total_after = 0
-        for d in scope_days.keys():
-            total_after += len(_fetch_keys_for_day(db, d))
+        # after-count (shift window 기준)
+        total_after = len(_fetch_keys_for_day_shift(db, d, s))
 
         return {
             "ok": True,
             "mode": mode,
+            "end_day": d,
+            "shift_type": s,
             "upserted": upsert_count,
             "deleted": deleted,
-            "total_after": total_after,
+            "total_after_in_shift": total_after,
         }
 
     except HTTPException:

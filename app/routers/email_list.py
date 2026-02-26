@@ -16,9 +16,6 @@ SCHEMA = "g_production_film"
 TABLE = "email_list"
 
 
-# ------------------------------------------------------------
-# Utils
-# ------------------------------------------------------------
 def _norm_day(v: str) -> str:
     s = (v or "").strip()
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
@@ -53,7 +50,6 @@ def _norm_email(v: str) -> str:
 
 
 def _ensure_table_and_index(db: Session) -> None:
-    # ?⑥씪 而щ읆 ?뚯씠釉?媛??(email only)
     db.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {SCHEMA}.{TABLE} (
             email text PRIMARY KEY
@@ -66,10 +62,7 @@ def _ensure_table_and_index(db: Session) -> None:
 
 
 def _fetch_all_set(db: Session) -> Set[str]:
-    rows = db.execute(text(f"""
-        SELECT email
-        FROM {SCHEMA}.{TABLE}
-    """)).mappings().all()
+    rows = db.execute(text(f"SELECT email FROM {SCHEMA}.{TABLE}")).mappings().all()
     out: Set[str] = set()
     for r in rows:
         e = (r.get("email") or "").strip().lower()
@@ -78,9 +71,6 @@ def _fetch_all_set(db: Session) -> Set[str]:
     return out
 
 
-# ------------------------------------------------------------
-# Schemas
-# ------------------------------------------------------------
 class EmailListIn(BaseModel):
     email: str
 
@@ -94,19 +84,12 @@ class EmailListSyncIn(BaseModel):
     rows: List[EmailListIn]
 
 
-# ------------------------------------------------------------
-# Read API
-# ------------------------------------------------------------
 @router.get("")
 def get_email_list(
     end_day: str,
     shift_type: str,
     db: Session = Depends(get_db),
 ) -> Response:
-    """
-    email_list??day/shift 而щ읆???놁쑝誘濡?
-    荑쇰━ ?뚮씪誘명꽣???명꽣?섏씠???명솚??寃利앹슜.
-    """
     try:
         _ = _norm_day(end_day)
         _ = _norm_shift(shift_type)
@@ -131,9 +114,6 @@ def get_email_list(
         raise HTTPException(status_code=500, detail=f"email_list get failed: {e}") from e
 
 
-# ------------------------------------------------------------
-# Sync API
-# ------------------------------------------------------------
 @router.post("/sync")
 def post_email_list_sync(
     body: EmailListSyncIn,
@@ -147,7 +127,6 @@ def post_email_list_sync(
         _admin_guard(x_admin_pass)
         _ensure_table_and_index(db)
 
-        # payload dedup (last-write-wins)
         dedup: Dict[str, Dict[str, str]] = {}
         for r in body.rows:
             e = _norm_email(r.email)
@@ -156,9 +135,7 @@ def post_email_list_sync(
         target_keys: Set[str] = set(dedup.keys())
         current_keys: Set[str] = _fetch_all_set(db)
 
-        upsert_count = len(target_keys)
         delete_keys: Set[str] = set()
-
         if mode == "replace":
             base = len(current_keys) if len(current_keys) > 0 else 1
             keep_ratio = float(len(target_keys)) / float(base)
@@ -175,29 +152,31 @@ def post_email_list_sync(
                 "ok": True,
                 "mode": mode,
                 "dry_run": True,
-                "upserted": upsert_count,
+                "upserted": len(target_keys),
                 "deleted": len(delete_keys),
                 "total_after": total_after,
             }
 
-        # 1) upsert
-        for e in sorted(target_keys):
-            db.execute(text(f"""
-                INSERT INTO {SCHEMA}.{TABLE} (email)
-                VALUES (:email)
-                ON CONFLICT (email)
-                DO UPDATE SET email = EXCLUDED.email
-            """), {"email": e})
+        # ✅ bulk upsert (executemany)
+        if target_keys:
+            params = [{"email": e} for e in sorted(target_keys)]
+            db.execute(
+                text(f"""
+                    INSERT INTO {SCHEMA}.{TABLE} (email)
+                    VALUES (:email)
+                    ON CONFLICT (email) DO NOTHING
+                """),
+                params,
+            )
 
-        # 2) delete (replace)
+        # ✅ bulk delete (replace)
         deleted = 0
         if mode == "replace" and delete_keys:
-            for e in sorted(delete_keys):
-                db.execute(text(f"""
-                    DELETE FROM {SCHEMA}.{TABLE}
-                    WHERE email = :email
-                """), {"email": e})
-                deleted += 1
+            res = db.execute(
+                text(f"DELETE FROM {SCHEMA}.{TABLE} WHERE email = ANY(:emails)"),
+                {"emails": list(delete_keys)},
+            )
+            deleted = int(res.rowcount or 0)
 
         db.commit()
 
@@ -205,7 +184,7 @@ def post_email_list_sync(
         return {
             "ok": True,
             "mode": mode,
-            "upserted": upsert_count,
+            "upserted": len(target_keys),
             "deleted": deleted,
             "total_after": total_after,
         }

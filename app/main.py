@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+﻿# app/main.py
+from __future__ import annotations
 
 import os
 import uuid
@@ -9,6 +10,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # -------------------------------------------------
 # .env 로드 우선순위:
@@ -42,6 +44,7 @@ from app.routers.production_progress_graph import router as production_progress_
 from app.routers.events_sse import router as events_sse_router
 from app.routers.events_sections import router as events_sections_router
 
+
 def _mask_db_url(url: str | None) -> str:
     """로그 출력용 DB URL 마스킹."""
     if not url:
@@ -55,6 +58,29 @@ def _mask_db_url(url: str | None) -> str:
     return url
 
 
+def _parse_cors_origins() -> list[str]:
+    """
+    CORS 허용 Origin 목록
+    - env: CORS_ALLOW_ORIGINS="http://localhost:8501,http://127.0.0.1:8501"
+    - 미설정 시 Streamlit 기본(8501) 2개를 기본 허용
+    """
+    raw = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
+    if raw:
+        items = []
+        for x in raw.split(","):
+            x = x.strip()
+            if x:
+                items.append(x)
+        if items:
+            return items
+
+    # ✅ 기본값(사내/로컬 운영)
+    return [
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+    ]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[BOOT] ENV_APP exists:", ENV_APP.exists(), str(ENV_APP), flush=True)
@@ -62,6 +88,7 @@ async def lifespan(app: FastAPI):
     print("[BOOT] DATABASE_URL:", _mask_db_url(os.getenv("DATABASE_URL")), flush=True)
     print("[BOOT] ADMIN_PASS set?:", bool(os.getenv("ADMIN_PASS")), flush=True)
     print("[BOOT] PG_WORK_MEM:", os.getenv("PG_WORK_MEM", "<EMPTY>"), flush=True)
+    print("[BOOT] CORS_ALLOW_ORIGINS:", _parse_cors_origins(), flush=True)
     yield
     print("[SHUTDOWN] app stopped", flush=True)
 
@@ -73,6 +100,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# -------------------------------------------------
+# ✅ CORS (Streamlit(8501) → FastAPI(8000) SSE/REST 허용)
+# - SSE(EventSource)도 결국 CORS 정책 적용됨
+# - allow_headers="*" 로 X-ADMIN-PASS 등 포함
+# -------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_parse_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------------------------------
 # 공통 미들웨어:
