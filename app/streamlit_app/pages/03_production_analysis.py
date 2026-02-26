@@ -29,15 +29,30 @@ STATION_ORDER = ["FCT1", "FCT2", "FCT3", "FCT4", "Vision1", "Vision2"]
 # -----------------------------
 # Helpers
 # -----------------------------
-def _now_prod_day_shift() -> Tuple[str, str]:
+def _now_prod_day_shift() -> tuple[str, str]:
+    """
+    Shift window (KST):
+      - day   : 08:30 ~ 20:30  (same prod_day)
+      - night : 20:30 ~ next day 08:30
+        * if now < 08:30 => prod_day = yesterday, shift=night
+        * if now >= 20:30 => prod_day = today, shift=night
+    """
     now = datetime.now(tz=KST)
-    h = now.hour
-    if 8 <= h < 20:
+
+    day_start = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    night_start = now.replace(hour=20, minute=30, second=0, microsecond=0)
+
+    if day_start <= now < night_start:
+        # ✅ 08:30~20:30 => day
         return now.strftime("%Y%m%d"), "day"
-    if h < 8:
-        d = (now - timedelta(days=1)).strftime("%Y%m%d")
-        return d, "night"
-    return now.strftime("%Y%m%d"), "night"
+
+    if now >= night_start:
+        # ✅ 20:30~24:00 => night (prod_day = today)
+        return now.strftime("%Y%m%d"), "night"
+
+    # ✅ 00:00~08:30 => night (prod_day = yesterday)
+    y = (now - timedelta(days=1)).strftime("%Y%m%d")
+    return y, "night"
 
 
 def _norm_day(v: Any) -> str:
