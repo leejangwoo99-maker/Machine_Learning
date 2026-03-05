@@ -15,9 +15,10 @@ pd_worst_service.py
 - ✅ 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
 - ✅ end_day, end_time, info, contents 순서로 DataFrame화하여 저장
 
-Nuitka 안정화:
-- list/dict/set comprehension 신규 추가 금지(가능한 범위 내)
-- f-string 내 복잡식/inline comp 제거(가능한 범위 내)
+[이번 반영]
+- ✅ 윈도우 밖 대기(WAIT) 상태에서도 DB에 1분 간격으로 "대기중" 로그가 남도록 throttle 적용
+  - 1초 폴링(SLEEP_SECONDS=1.0)은 유지
+  - DB 적재는 60초마다 1회만(로그 폭증 방지)
 """
 
 import math
@@ -38,7 +39,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",#비번은 보완 사항
+    "password": "",  # 비번은 보완 사항
 }
 
 # ✅ 오늘 날짜 자동 + 없으면 최신일 fallback
@@ -532,7 +533,11 @@ def run_once(box: EngineBox):
       AND remark = :remark
       AND barcode_information = ANY(CAST(:barcodes AS text[]))
     """)
-    df_detail = read_sql_retry(box, SQL_FCT_DETAIL, params={"end_day": target_end_day_date, "remark": TARGET_REMARK, "barcodes": barcodes})
+    df_detail = read_sql_retry(
+        box,
+        SQL_FCT_DETAIL,
+        params={"end_day": target_end_day_date, "remark": TARGET_REMARK, "barcodes": barcodes}
+    )
     if df_detail.empty:
         raise RuntimeError("[ERROR] c1_fct_detail.fct_detail 조회 결과가 비어있습니다. end_day={}, remark={}".format(target_end_day_date, TARGET_REMARK))
 
@@ -1018,6 +1023,7 @@ def scheduler_loop():
     )
 
     last_state = None  # "RUN" / "WAIT"
+    last_wait_db_ts = 0.0  # ✅ WAIT 상태 DB 로그 throttle
 
     while True:
         now_dt = datetime.now()
@@ -1041,6 +1047,19 @@ def scheduler_loop():
             if last_state != "WAIT":
                 write_event(box, "sleep", "sched wait outside windows @ {}".format(now_dt.strftime("%Y-%m-%d %H:%M:%S")))
                 last_state = "WAIT"
+                # ✅ WAIT 진입 시점도 DB 로그로 남겼으니 throttle 기준도 같이 갱신
+                last_wait_db_ts = time.time()
+
+            # ✅ WAIT 유지 중에도 1분 간격으로 DB에 "대기중" 로그 적재
+            now_ts = time.time()
+            if (now_ts - last_wait_db_ts) >= 60.0:
+                write_event(
+                    box,
+                    "wait",
+                    "sched waiting... now={} (outside run windows)".format(now_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                )
+                last_wait_db_ts = now_ts
+
             time.sleep(SLEEP_SECONDS)
 
 

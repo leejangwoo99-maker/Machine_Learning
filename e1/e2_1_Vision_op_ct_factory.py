@@ -18,7 +18,7 @@ Vision OP-CT 분석 파이프라인 - current-month incremental + periodic UPSER
 
 ✅ 요청 반영(핵심 사양):
 - ✅ 멀티프로세스 = 1개
-- ✅ 무한 루프(5초) 사용 금지: main()은 매일 08:22 / 20:22 에만 1회 실행 후 종료
+- ✅ (2번 방식) ALWAYS-ON: main()은 종료하지 않고 매일 08:22 / 20:22에만 1회 실행, 그 외 대기하며 다음날 반복
 - ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공할 때까지 블로킹)
 - ✅ 백엔드별 상시 연결을 1개로 고정(풀 최소화)
   * SQLAlchemy engine: pool_size=1, max_overflow=0
@@ -39,13 +39,16 @@ Vision OP-CT 분석 파이프라인 - current-month incremental + periodic UPSER
   2) 테이블: e2_1_log (없으면 생성)
   3) 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
   4) 저장 전 DataFrame 컬럼 순서 고정: end_day, end_time, info, contents
+
+[운영 안정화 추가]
+- ✅ SLEEP/IDLE heartbeat 로그는 DB 저장 안 함(콘솔만) -> 로그 테이블 폭증 방지
 """
 
 import os
 import sys
 import warnings
 import urllib.parse
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 import time as time_mod
 
 import numpy as np
@@ -80,7 +83,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",#비번은 보완 사항
+    "password": "",  # 비번은 보완 사항
 }
 
 SRC_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
@@ -172,24 +175,6 @@ def current_yyyymm(now: datetime | None = None) -> str:
     return now.strftime("%Y%m")
 
 
-def _next_run_datetimes(now_dt: datetime):
-    d = now_dt.date()
-    cands = [
-        datetime(d.year, d.month, d.day, RUN_TIME_1.hour, RUN_TIME_1.minute, RUN_TIME_1.second),
-        datetime(d.year, d.month, d.day, RUN_TIME_2.hour, RUN_TIME_2.minute, RUN_TIME_2.second),
-    ]
-    return cands
-
-
-def _sleep_until(target_dt: datetime):
-    while True:
-        now = datetime.now()
-        if now >= target_dt:
-            return
-        sec = (target_dt - now).total_seconds()
-        time_mod.sleep(min(max(sec, 1.0), 30.0))
-
-
 def _is_conn_error(e: Exception) -> bool:
     if isinstance(e, (OperationalError, DBAPIError)):
         return True
@@ -209,6 +194,78 @@ def _is_conn_error(e: Exception) -> bool:
         "no route to host",
     ]
     return any(k in msg for k in keys)
+
+
+# =========================
+# ✅ ALWAYS-ON 스케줄 유틸
+# =========================
+def _schedule_candidates_for_day(day: date):
+    return [
+        datetime(day.year, day.month, day.day, RUN_TIME_1.hour, RUN_TIME_1.minute, RUN_TIME_1.second),
+        datetime(day.year, day.month, day.day, RUN_TIME_2.hour, RUN_TIME_2.minute, RUN_TIME_2.second),
+    ]
+
+
+def _next_run_datetime(now_dt: datetime) -> datetime:
+    """
+    now_dt 기준 "가장 가까운 다음 실행시각" 1개 반환.
+    - 오늘 08:22 아직이면 -> 오늘 08:22
+    - else 오늘 20:22 아직이면 -> 오늘 20:22
+    - else -> 내일 08:22
+    """
+    today = now_dt.date()
+    t1, t2 = _schedule_candidates_for_day(today)
+    if now_dt < t1:
+        return t1
+    if now_dt < t2:
+        return t2
+    tomorrow = today + timedelta(days=1)
+    return _schedule_candidates_for_day(tomorrow)[0]
+
+
+def _sleep_until(target_dt: datetime):
+    """
+    target_dt까지 대기. DB/CPU 부하 최소화.
+
+    ✅ 요구사항 반영:
+    - 대기 중에도 로그 DB에 1분 간격으로 '대기중' 로그 적재
+    - 로그 테이블 폭증 방지: DB 저장은 60초마다 1회만
+    """
+    last_db_log_ts = 0.0  # epoch seconds
+
+    while True:
+        now = datetime.now()
+        if now >= target_dt:
+            return
+
+        remaining = (target_dt - now).total_seconds()
+
+        # 멀리 있으면 크게, 가까우면 촘촘히
+        if remaining > 3600:
+            sleep_sec = 300.0   # 5분
+        elif remaining > 600:
+            sleep_sec = 60.0    # 1분
+        elif remaining > 120:
+            sleep_sec = 30.0
+        else:
+            sleep_sec = 5.0
+
+        # ✅ DB에는 1분에 1번만 적재
+        now_ts = time_mod.time()
+        should_db_log = (now_ts - last_db_log_ts) >= 60.0
+
+        msg = (
+            f"[WAITING] until={target_dt:%Y-%m-%d %H:%M:%S} | "
+            f"remaining={int(remaining)}s | sleep={sleep_sec:.0f}s"
+        )
+
+        # 콘솔은 항상, DB는 1분 간격
+        db_log("wait", msg, echo=True, save_db=should_db_log)
+
+        if should_db_log:
+            last_db_log_ts = now_ts
+
+        time_mod.sleep(sleep_sec)
 
 
 # =========================
@@ -268,7 +325,6 @@ def get_engine_blocking():
                 conn.execute(text("SELECT 1"))
             return _ENGINE
         except Exception as e:
-            # DB down 시점은 DB 로그 저장이 불가능할 수 있으므로 콘솔만 출력
             log(f"[DB][RETRY] engine connect failed: {type(e).__name__}: {repr(e)}")
             _dispose_engine()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
@@ -373,9 +429,9 @@ def _ensure_log_table_blocking():
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
 
-def db_log(info: str, contents: str, echo: bool = True):
+def db_log(info: str, contents: str, echo: bool = True, save_db: bool = True):
     """
-    로그를 콘솔 + DB에 저장.
+    로그를 콘솔 + (선택) DB에 저장.
     - info는 소문자로 강제
     - DataFrame 컬럼 순서: end_day, end_time, info, contents
     """
@@ -391,7 +447,9 @@ def db_log(info: str, contents: str, echo: bool = True):
     if echo:
         print(f"[{info_l}] {contents_s}", flush=True)
 
-    # 요구사항: dataframe화 후 저장 (컬럼 순서 고정)
+    if not save_db:
+        return
+
     df_log = pd.DataFrame(
         [[end_day, end_time, info_l, contents_s]],
         columns=["end_day", "end_time", "info", "contents"]
@@ -412,7 +470,6 @@ def db_log(info: str, contents: str, echo: bool = True):
             conn.commit()
             return
         except Exception as e:
-            # 재귀 방지: log()/db_log() 호출 금지, print만 사용
             print(f"[DB][RETRY] log insert failed: {type(e).__name__}: {repr(e)}", flush=True)
             try:
                 if conn:
@@ -630,6 +687,12 @@ def fmt_range(a: float, b: float) -> str:
 # 4) only_run 판정/분석/summarize
 # =========================
 def mark_only_runs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    only-run 판정 로직:
+    - end_dt 시간순 정렬
+    - station이 바뀔 때마다 run_id 증가
+    - 해당 run 길이가 ONLY_RUN_MIN_LEN 이상이고 Vision1/2이면 only-run
+    """
     out = df.copy()
     if out is None or out.empty:
         out = pd.DataFrame(columns=list(df.columns) if df is not None else [])
@@ -895,7 +958,7 @@ def run_pipeline_once(label: str):
         db_log("info", f"fetch_sec={t_fetch:.2f}, rows={0 if df is None else len(df)}")
 
     if df is None or df.empty:
-        db_log("sleep", f"{label} no rows in month={run_month}, skip")
+        db_log("info", f"{label} no rows in month={run_month}, skip")
         return
 
     df["end_day"] = df["end_day"].astype(str).str.replace(r"\D", "", regex=True)
@@ -907,11 +970,14 @@ def run_pipeline_once(label: str):
         return
 
     t1 = time_mod.time()
+
+    # ✅ cache_df에는 end_ts 유지(절대 rename하지 않음)
     cache_df = df[["station", "remark", "end_day", "end_time_str", "end_ts"]].copy()
     cache_df = cache_df.sort_values(["station", "remark", "end_ts"], kind="mergesort").reset_index(drop=True)
     cache_df["op_ct"] = cache_df.groupby(["station", "remark"])["end_ts"].diff().dt.total_seconds()
     cache_df["month"] = cache_df["end_ts"].dt.strftime("%Y%m")
 
+    # ✅ 분석 직전에만 end_dt로 변환
     df_for_analysis = cache_df.rename(columns={"end_ts": "end_dt"}).copy()
 
     df_marked = mark_only_runs(df_for_analysis)
@@ -930,7 +996,7 @@ def run_pipeline_once(label: str):
 
 
 # =========================
-# main: 08:22 / 20:22 에만 실행 후 종료(2회 완료되면 종료)
+# main: ✅ (2번 방식) ALWAYS-ON: 매일 08:22/20:22 실행, 종료 없이 다음날 반복
 # =========================
 def main():
     start_dt = datetime.now()
@@ -941,7 +1007,7 @@ def main():
     get_conn_pg_blocking()
     _ensure_log_table_blocking()
 
-    db_log("info", "schedule mode start: run only at 08:22 and 20:22 then exit")
+    db_log("info", "ALWAYS-ON schedule mode: run at 08:22 and 20:22 EVERY DAY (no exit)")
     db_log("info", f"wait_interval={WAIT_INTERVAL_SEC}s, fetch_limit={FETCH_LIMIT}, work_mem={WORK_MEM}")
     db_log(
         "info",
@@ -951,44 +1017,61 @@ def main():
 
     ensure_tables_and_indexes()
 
-    ran_1 = False
-    ran_2 = False
+    # 날짜별 실행 완료 체크: {"yyyymmdd": {"08:22:00","20:22:00"}}
+    done_map: dict[str, set] = {}
 
     try:
         while True:
             now = datetime.now()
-            t1_dt, t2_dt = _next_run_datetimes(now)
+            next_dt = _next_run_datetime(now)
 
-            if (not ran_1) and (now >= t1_dt):
-                run_pipeline_once("run_08_22")
-                ran_1 = True
+            target_day = next_dt.strftime("%Y%m%d")
+            target_label = next_dt.strftime("%H:%M:%S")
 
-            if (not ran_2) and (now >= t2_dt):
-                run_pipeline_once("run_20_22")
-                ran_2 = True
+            done_set = done_map.setdefault(target_day, set())
 
-            if ran_1 and ran_2:
-                db_log("info", "both schedules executed, exit")
-                return
+            # 이미 실행한 스케줄이면 스킵
+            if target_label in done_set:
+                time_mod.sleep(1.0)
+                continue
 
-            next_targets = []
-            if not ran_1:
-                next_targets.append(t1_dt)
-            if not ran_2:
-                next_targets.append(t2_dt)
+            # 오래된 날짜 정리(메모리 누수 방지)
+            if len(done_map) > 5:
+                for k in sorted(list(done_map.keys()))[:-3]:
+                    done_map.pop(k, None)
 
-            if not next_targets:
-                db_log("info", "no remaining targets, exit")
-                return
-
-            next_dt = min(next_targets)
+            # ✅ IDLE heartbeat는 콘솔만(DB 저장 안 함)
             if IDLE_HEARTBEAT:
                 db_log(
                     "sleep",
-                    f"now={now:%H:%M:%S}, next={next_dt:%H:%M:%S}, ran_1={ran_1}, ran_2={ran_2}"
+                    f"now={now:%H:%M:%S}, next={next_dt:%H:%M:%S}, done({target_day})={sorted(list(done_set))}",
+                    echo=True,
+                    save_db=False
                 )
+            else:
+                log(f"[WAIT] next_run={next_dt:%Y-%m-%d %H:%M:%S}")
 
             _sleep_until(next_dt)
+
+            # ✅ 스케줄 1회는 "성공할 때까지" 재시도
+            while True:
+                try:
+                    run_pipeline_once(f"run_{target_label.replace(':','_')}")
+                    done_map.setdefault(target_day, set()).add(target_label)
+                    db_log("info", f"[OK] done day={target_day} time={target_label} -> {sorted(list(done_map[target_day]))}")
+                    break
+                except Exception as e:
+                    if _is_conn_error(e):
+                        db_log("down", f"[RUN][RETRY] {target_label} conn error -> rebuild engine: {type(e).__name__}: {repr(e)}")
+                        _dispose_engine()
+                        _ = get_engine_blocking()
+                    else:
+                        db_log("error", f"[RUN][RETRY] {target_label} failed: {type(e).__name__}: {repr(e)}")
+                    time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+            # 하루 2회 모두 완료되면 요약만 찍고 계속
+            if done_map.get(target_day) == {"08:22:00", "20:22:00"}:
+                db_log("end", f"[DAY-END] {target_day} both runs completed. keep alive for next day.")
 
     finally:
         try:

@@ -6,7 +6,7 @@ e1_1_FCT_op_ct_factory_schedule.py
 - 매일 08:22:00에 1회 실행 -> 계산/UPSERT
 - 매일 20:22:00에 1회 실행 -> 계산/UPSERT
 - 그 외 시간에는 대기만 함
-- 2회 모두 완료되면 종료
+- ✅ 2회 모두 완료되더라도 종료하지 않고, 다음날 스케줄까지 대기하며 무한 반복 (ALWAYS-ON)
 
 [요청 반영(안정화)]
 - ✅ 멀티프로세스 = 1개 (MP=2 제거)
@@ -25,7 +25,7 @@ e1_1_FCT_op_ct_factory_schedule.py
 
 (추가: 실행 중 끊김 복구 강화)
 - ✅ SQLAlchemy engine 사용 구간: pool_pre_ping + 연결 오류 감지 시 dispose 후 재생성
-- ✅ psycopg2 직접 접속 구간: 연결 오류 시 무한 재접속/재시도 (이미 while True로 감싸져 있음)
+- ✅ psycopg2 직접 접속 구간: 연결 오류 시 무한 재접속/재시도
 - ✅ keepalive(connect_args/환경변수) 옵션 추가(가능 범위 내)
 
 [추가: 데몬 헬스체크 로그 DB 저장]
@@ -33,15 +33,18 @@ e1_1_FCT_op_ct_factory_schedule.py
 - 테이블: e1_1_log (없으면 생성)
 - 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
 - 로그는 end_day, end_time, info, contents 순서로 DataFrame화 후 저장
+
+[추가 운영 안정화]
+- ✅ SLEEP 로그는 DB 저장 안 함(콘솔만) -> 로그 테이블 폭증 방지
 """
 
 import time
 import os
 import urllib.parse
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 import numpy as np
 import pandas as pd
@@ -50,7 +53,7 @@ import plotly.express as px
 import psycopg2
 from psycopg2 import sql
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError, OperationalError, DBAPIError
+from sqlalchemy.exc import OperationalError, DBAPIError
 from pandas.api.types import CategoricalDtype
 
 
@@ -62,7 +65,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",#비번은 보완 사항
+    "password": "",  # 비번은 보완 사항
 }
 
 SRC_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
@@ -282,13 +285,7 @@ def ensure_log_table():
 
 def _save_log_to_db(info: str, contents: str):
     """
-    요구사항:
-    1) 로그 생성
-    2) end_day : yyyymmdd
-    3) end_time: hh:mi:ss
-    4) info: 소문자
-    5) contents: 나머지 내용
-    6) end_day, end_time, info, contents 순서 DataFrame화 후 저장
+    end_day, end_time, info, contents 순서 DataFrame화 후 저장
     """
     now = datetime.now()
     row = {
@@ -298,16 +295,16 @@ def _save_log_to_db(info: str, contents: str):
         "contents": str(contents),
     }
 
-    # 컬럼 순서 고정 DataFrame
-    log_df = pd.DataFrame([[row["end_day"], row["end_time"], row["info"], row["contents"]]],
-                          columns=["end_day", "end_time", "info", "contents"])
+    log_df = pd.DataFrame(
+        [[row["end_day"], row["end_time"], row["info"], row["contents"]]],
+        columns=["end_day", "end_time", "info", "contents"]
+    )
 
     insert_sql = sql.SQL("""
         INSERT INTO {}.{} (end_day, end_time, info, contents)
         VALUES (%(end_day)s, %(end_time)s, %(info)s, %(contents)s)
     """).format(sql.Identifier(LOG_SCHEMA), sql.Identifier(LOG_TABLE))
 
-    # 로그 저장 자체도 연결 실패 시 재시도(무한)
     while True:
         try:
             with psycopg2.connect(**DB_CONFIG) as conn:
@@ -316,15 +313,13 @@ def _save_log_to_db(info: str, contents: str):
                 conn.commit()
             return
         except Exception as e:
-            # 여기서는 재귀 로그 방지 위해 print만
             print(f"[DB][RETRY] save_log failed: {type(e).__name__}: {repr(e)}", flush=True)
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
 def log(msg: str, info: str = "info", save_db: bool = True):
     """
-    공통 로그 출력 + DB 저장
-    info는 반드시 소문자로 정규화
+    공통 로그 출력 + (선택) DB 저장
     """
     info_n = _normalize_info(info)
     print(msg, flush=True)
@@ -332,35 +327,79 @@ def log(msg: str, info: str = "info", save_db: bool = True):
         try:
             _save_log_to_db(info_n, msg)
         except Exception as e:
-            # 여기서는 print만(무한 재귀 방지)
             print(f"[WARN] log db write skipped: {type(e).__name__}: {repr(e)}", flush=True)
+
+
+# =========================
+# ✅ (변경) ALWAYS-ON 스케줄 계산/대기
+# =========================
+def _schedule_candidates_for_day(day: date) -> List[datetime]:
+    return [
+        datetime(day.year, day.month, day.day, RUN_TIME_1.hour, RUN_TIME_1.minute, RUN_TIME_1.second),
+        datetime(day.year, day.month, day.day, RUN_TIME_2.hour, RUN_TIME_2.minute, RUN_TIME_2.second),
+    ]
+
+
+def _next_run_datetime(now_dt: datetime) -> datetime:
+    """
+    now_dt 기준 "가장 가까운 다음 실행시각" 1개 반환.
+    - 오늘 08:22 아직이면 -> 오늘 08:22
+    - else 오늘 20:22 아직이면 -> 오늘 20:22
+    - else -> 내일 08:22
+    """
+    today = now_dt.date()
+    t1, t2 = _schedule_candidates_for_day(today)
+    if now_dt < t1:
+        return t1
+    if now_dt < t2:
+        return t2
+    tomorrow = today + timedelta(days=1)
+    return _schedule_candidates_for_day(tomorrow)[0]
 
 
 def _sleep_until(target_dt: datetime):
     """
-    target_dt까지 대기(초 단위 sleep). DB/파일 부하를 만들지 않도록 1~30초로 슬립.
+    target_dt까지 대기.
+
+    ✅ 요구사항 반영:
+    - 대기 중에도 로그 DB에 "대기중" 로그가 1분 간격으로 적재되게 함
+    - 너무 자주 쌓이지 않도록 DB 저장은 60초마다 1회로 제한
     """
+    last_db_log_ts = 0.0  # epoch seconds
+
     while True:
         now = datetime.now()
         if now >= target_dt:
             return
-        sec = (target_dt - now).total_seconds()
-        sleep_sec = min(max(sec, 1.0), 30.0)
-        log(f"[SLEEP] waiting {sleep_sec:.1f}s until {target_dt:%Y-%m-%d %H:%M:%S}", info="sleep")
+
+        remaining = (target_dt - now).total_seconds()
+
+        # 멀리 있으면 크게, 가까우면 촘촘히 (기존 정책 유지)
+        if remaining > 3600:
+            sleep_sec = 300.0   # 5분
+        elif remaining > 600:
+            sleep_sec = 60.0    # 1분
+        elif remaining > 120:
+            sleep_sec = 30.0
+        else:
+            sleep_sec = 5.0
+
+        # ✅ DB에는 1분에 1번만 적재
+        now_ts = time.time()
+        should_db_log = (now_ts - last_db_log_ts) >= 60.0
+
+        msg = (
+            f"[WAITING] until={target_dt:%Y-%m-%d %H:%M:%S} | "
+            f"remaining={int(remaining)}s | sleep={sleep_sec:.0f}s"
+        )
+
+        # 콘솔은 항상, DB는 1분 간격으로만
+        log(msg, info="wait", save_db=should_db_log)
+
+        if should_db_log:
+            last_db_log_ts = now_ts
+
         time.sleep(sleep_sec)
-
-
-def _next_run_datetimes(now_dt: datetime) -> List[datetime]:
-    """
-    오늘 기준으로 남아있는 실행 타임(08:22, 20:22)을 반환.
-    이미 지난 타임은 제외.
-    """
-    d = now_dt.date()
-    cands = [
-        datetime(d.year, d.month, d.day, RUN_TIME_1.hour, RUN_TIME_1.minute, RUN_TIME_1.second),
-        datetime(d.year, d.month, d.day, RUN_TIME_2.hour, RUN_TIME_2.minute, RUN_TIME_2.second),
-    ]
-    return [t for t in cands if t >= now_dt]
 
 
 # =========================
@@ -573,7 +612,6 @@ def load_month_df(engine, stations: List[str], run_month: str) -> pd.DataFrame:
 
     while True:
         try:
-            # ✅ 세션 설정 후 read_sql
             with engine.connect() as conn:
                 conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 df = pd.read_sql(
@@ -583,7 +621,6 @@ def load_month_df(engine, stations: List[str], run_month: str) -> pd.DataFrame:
                 )
             break
         except Exception as e:
-            # ✅ 실행 중 끊김 복구
             if _is_connection_error(e):
                 log(f"[DB][RETRY] load_month_df conn error -> rebuild: {type(e).__name__}: {repr(e)}", info="down")
                 _dispose_engine()
@@ -941,13 +978,12 @@ def upsert_hist_whole_daily(df: pd.DataFrame, snapshot_day: str):
 
 
 # =========================
-# 7) 작업 1회 실행(오늘 기준 월 전체) - 단일 프로세스
+# 7) 작업 1회 실행(월 전체) - 단일 프로세스
 # =========================
 def run_pipeline_once(label: str, run_month: str):
     snapshot_day = today_yyyymmdd()
     log(f"[RUN] {label} | snapshot_day={snapshot_day} | month={run_month} | START", info="info")
 
-    # ✅ 루프 실행 직전에 엔진 상태 점검/복구
     eng = get_engine_blocking(DB_CONFIG)
 
     df_raw = load_month_df(eng, ALL_STATIONS, run_month)
@@ -967,51 +1003,65 @@ def run_pipeline_once(label: str, run_month: str):
 
 
 # =========================
-# 8) main: 08:22 / 20:22에만 실행 후 종료
+# 8) main: ALWAYS-ON (매일 08:22 / 20:22 무한 반복)
 # =========================
 def main():
-    # 0) 로그 테이블 먼저 보장
     ensure_log_table()
 
     start_dt = datetime.now()
     log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}", info="start")
-    log("=== SCHEDULE MODE: run at 08:22 and 20:22, then exit ===", info="info")
+    log("=== ALWAYS-ON MODE: run at 08:22 and 20:22 EVERY DAY (no exit) ===", info="info")
     log(f"work_mem={WORK_MEM} | engine pool_size=1 max_overflow=0", info="info")
 
-    # 1) 대상 테이블/인덱스/시퀀스 보장 (DB 실패 시 무한 재시도)
     ensure_tables_and_indexes()
 
-    # 2) 오늘 남은 실행 타임 계산
-    now = datetime.now()
-    run_times = _next_run_datetimes(now)
-    if not run_times:
-        log("[INFO] all scheduled runs for today already passed. exit.", info="info")
-        return
+    # 날짜별 실행 완료 체크: {"yyyymmdd": {"08:22:00","20:22:00"}}
+    done_map: Dict[str, set] = {}
 
-    done = set()
-    for target_dt in run_times:
-        label = target_dt.strftime("%H:%M:%S")
-        log(f"[WAIT] next_run={target_dt:%Y-%m-%d %H:%M:%S}", info="wait")
-        _sleep_until(target_dt)
+    while True:
+        now = datetime.now()
+        next_dt = _next_run_datetime(now)
+
+        target_day = next_dt.strftime("%Y%m%d")
+        target_label = next_dt.strftime("%H:%M:%S")
+
+        done_set = done_map.setdefault(target_day, set())
+
+        # (안전) 이미 실행한 스케줄이면 스킵하고 다음 계산
+        if target_label in done_set:
+            time.sleep(1.0)
+            continue
+
+        # 오래된 날짜 정리(메모리 누수 방지)
+        if len(done_map) > 5:
+            for k in sorted(list(done_map.keys()))[:-3]:
+                done_map.pop(k, None)
+
+        log(f"[WAIT] next_run={next_dt:%Y-%m-%d %H:%M:%S} | done({target_day})={sorted(list(done_set))}", info="wait")
+
+        _sleep_until(next_dt)
 
         run_month = current_yyyymm()
 
         # ✅ 스케줄 1회는 "성공할 때까지" 재시도
         while True:
             try:
-                run_pipeline_once(label=label, run_month=run_month)
-                done.add(label)
+                run_pipeline_once(label=target_label, run_month=run_month)
+                done_map.setdefault(target_day, set()).add(target_label)
+                log(f"[OK] done day={target_day} time={target_label} -> {sorted(list(done_map[target_day]))}", info="info")
                 break
             except Exception as e:
                 if _is_connection_error(e):
-                    log(f"[RUN][RETRY] {label} conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", info="down")
+                    log(f"[RUN][RETRY] {target_label} conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", info="down")
                     _dispose_engine()
                     _ = get_engine_blocking(DB_CONFIG)
                 else:
-                    log(f"[RUN][RETRY] {label} failed: {type(e).__name__}: {repr(e)}", info="error")
+                    log(f"[RUN][RETRY] {target_label} failed: {type(e).__name__}: {repr(e)}", info="error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
 
-    log(f"[END] done={sorted(done)} | exit.", info="end")
+        # (선택) 하루 2회 모두 끝나면 요약만 남기고 계속(내일 08:22까지 대기)
+        if done_map.get(target_day) == {"08:22:00", "20:22:00"}:
+            log(f"[DAY-END] {target_day} both runs completed. keep alive for next day.", info="end")
 
 
 if __name__ == "__main__":

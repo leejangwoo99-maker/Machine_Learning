@@ -28,6 +28,12 @@
 # - ✅ 테이블: d2_log (없으면 생성)
 # - ✅ 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
 # - ✅ end_day, end_time, info, contents 순서로 DataFrame화 후 저장
+#
+# [중요 수정(멈춤 방지)]
+# - ✅ UNC/NAS 파일 stat/open/read 블로킹 대비:
+#     * ThreadPoolExecutor future 처리에 timeout 적용
+#     * timeout 발생 시 해당 파일은 스킵하고 다음 루프로 진행(프로세스 절대 멈추지 않음)
+# - ENV: D2_PARSE_TIMEOUT_SEC (default=5)
 # ============================================
 
 import re
@@ -39,7 +45,7 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import freeze_support
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError  # ✅ TimeoutError 추가
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -64,7 +70,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",#비번은 보완 사항
+    "password": "",  # 비번은 보완 사항
 }
 
 SCHEMA_NAME = "d1_machine_log"
@@ -76,6 +82,9 @@ TABLE_MAP = {
 THREAD_WORKERS = 2
 SLEEP_SEC = 5
 LOG_EVERY_LOOP = 10
+
+# ✅ UNC/NAS 블로킹 방지: 파일 파싱 future 전체 대기 상한(초)
+PARSE_FUTURE_TIMEOUT_SEC = int(os.getenv("D2_PARSE_TIMEOUT_SEC", "5"))
 
 # offset 캐시: path -> 마지막 읽은 파일 byte 위치
 PROCESSED_OFFSET = {}
@@ -196,7 +205,6 @@ def log(msg: str, info: str = "info", to_db: bool = True):
         try:
             _append_runtime_log(info=info, contents=msg)
         except Exception:
-            # 절대 메인 로직 영향 주지 않음
             pass
 
 
@@ -351,7 +359,6 @@ CREATE INDEX IF NOT EXISTS ix_{SCHEMA_NAME}_{CURSOR_TABLE}_day
 ON {SCHEMA_NAME}.{CURSOR_TABLE} (file_day);
 """
 
-# 신규: 헬스 로그 테이블
 CREATE_HEALTH_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {HEALTH_SCHEMA}.{HEALTH_TABLE} (
     end_day   VARCHAR(8)  NOT NULL,
@@ -399,7 +406,6 @@ def ensure_schema_tables(engine):
                 conn.execute(text(CREATE_CURSOR_TABLE_SQL))
                 conn.execute(text(CREATE_CURSOR_DAY_INDEX_SQL))
 
-                # 헬스 로그 스키마/테이블
                 conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {HEALTH_SCHEMA}"))
                 conn.execute(text(CREATE_HEALTH_TABLE_SQL))
                 conn.execute(text(CREATE_HEALTH_INDEX_SQL))
@@ -567,7 +573,6 @@ def flush_runtime_logs_to_db(engine, force=False):
     if not force and (now_ts - _last_runtime_log_save_ts) < RUNTIME_LOG_SAVE_INTERVAL_SEC:
         return
 
-    # 사양: 컬럼 순서 고정 DataFrame
     df = pd.DataFrame(_runtime_log_buffer, columns=["end_day", "end_time", "info", "contents"])
     if df.empty:
         _last_runtime_log_save_ts = now_ts
@@ -587,12 +592,10 @@ def flush_runtime_logs_to_db(engine, force=False):
             with engine.begin() as conn:
                 conn.execute(sql, records)
 
-            # 성공 시 버퍼 비우기
             saved_n = len(records)
             _runtime_log_buffer = []
             _last_runtime_log_save_ts = now_ts
 
-            # 재귀 방지: DB 로그 저장 알림은 DB버퍼 미적재
             log(f"[INFO] runtime logs saved to DB: {saved_n}", info="info", to_db=False)
             return
 
@@ -605,7 +608,6 @@ def flush_runtime_logs_to_db(engine, force=False):
                 engine = get_engine_blocking()
                 continue
 
-            # 비연결 오류: 이번 flush만 포기(버퍼는 유지해서 다음 주기 재시도 가능)
             _console_print(f"[DB][SKIP] runtime log flush non-conn error: {type(e).__name__}: {e}")
             _last_runtime_log_save_ts = now_ts
             return
@@ -780,6 +782,7 @@ def main():
     log("### BUILD: d2 Vision parser OPTION-A (TAIL-FOLLOW) + cursor-persist + db-blocking + pool-min + healthlog-db ###", info="info")
     log(f"[INFO] LOG_DIR={LOG_DIR}", info="info")
     log(f"[INFO] HEALTH_LOG_TABLE={HEALTH_SCHEMA}.{HEALTH_TABLE}", info="info")
+    log(f"[INFO] PARSE_FUTURE_TIMEOUT_SEC={PARSE_FUTURE_TIMEOUT_SEC}", info="info")
 
     engine = get_engine_blocking()
     ensure_schema_tables(engine)
@@ -857,17 +860,36 @@ def main():
             workers = min(THREAD_WORKERS, len(files))
             workers = max(1, workers)
 
+            # ✅ 핵심 수정: as_completed + timeout으로 UNC 블로킹 방지
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = []
+                fut_map = {}
                 for fp in files:
                     off = int(PROCESSED_OFFSET.get(fp, 0))
-                    futs.append(ex.submit(parse_machine_log_file_tail, fp, today_ymd, off))
+                    fut = ex.submit(parse_machine_log_file_tail, fp, today_ymd, off)
+                    fut_map[fut] = fp
 
-                for f in as_completed(futs):
-                    rows, new_off, _station, fp, _status = f.result()
-                    offset_updates[fp] = int(new_off)
-                    if rows:
-                        all_records.extend(rows)
+                done_futs = set()
+                try:
+                    for fut in as_completed(fut_map.keys(), timeout=PARSE_FUTURE_TIMEOUT_SEC):
+                        done_futs.add(fut)
+                        try:
+                            rows, new_off, _station, fp, _status = fut.result(timeout=0)
+                        except Exception as e:
+                            fp = fut_map.get(fut, "unknown")
+                            log(f"[WARN] parse future error -> skip file={fp} / {type(e).__name__}: {e}", info="warn")
+                            continue
+
+                        offset_updates[fp] = int(new_off)
+                        if rows:
+                            all_records.extend(rows)
+
+                except TimeoutError:
+                    pending = [fut_map[f] for f in fut_map.keys() if f not in done_futs]
+                    if pending:
+                        log(f"[WARN] parse timeout({PARSE_FUTURE_TIMEOUT_SEC}s) -> skip pending={len(pending)} file(s)", info="warn")
+                        # offset은 기존 유지(안전)
+                        for fp in pending:
+                            offset_updates[fp] = int(PROCESSED_OFFSET.get(fp, 0))
 
             # offset 갱신 + dirty mark
             for fp, new_off in offset_updates.items():
@@ -914,7 +936,6 @@ def main():
                 log("[ERROR] Loop error (continue)", info="error")
                 log_exc("[ERROR] Loop error", e, info="error")
 
-            # 예외 뒤에도 런타임 로그는 가능한 저장 시도
             try:
                 flush_runtime_logs_to_db(engine, force=False)
             except Exception as fe:
@@ -935,7 +956,6 @@ if __name__ == "__main__":
         log("\n[UNHANDLED] 치명 오류가 발생했습니다.", info="error")
         log_exc("[UNHANDLED]", e, info="error")
 
-        # 최종 flush 시도
         try:
             engine = get_engine_blocking()
             flush_runtime_logs_to_db(engine, force=True)

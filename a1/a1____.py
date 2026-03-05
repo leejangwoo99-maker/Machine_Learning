@@ -36,7 +36,7 @@ DB_CONFIG = {
 #     "port": 5432,
 #     "dbname": "postgres",
 #     "user": "postgres",
-#     "password": "leejangwoo1!",
+#     "password": "",
 # }
 
 # 요구사항 스키마/테이블 (History)

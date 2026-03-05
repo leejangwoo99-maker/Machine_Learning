@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 class Settings(BaseModel):
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-    ADMIN_PASS: str = os.getenv("APP_POPUP_PASSWORD", os.getenv("ADMIN_PASS", "leejangwoo1!"))
+    ADMIN_PASS: str = os.getenv("APP_POPUP_PASSWORD", os.getenv("ADMIN_PASS", ""))
     TZ: str = os.getenv("TZ", "Asia/Seoul")
     GPF_SCHEMA: str = os.getenv("GPF_SCHEMA", "g_production_film")
     IDR_SCHEMA: str = os.getenv("IDR_SCHEMA", "i_daily_report")

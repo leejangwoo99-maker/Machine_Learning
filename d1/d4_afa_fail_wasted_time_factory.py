@@ -6,7 +6,9 @@ AFA FAIL wasted time (NG -> ON) 실시간 계산/저장
 - MP=1, 5초 루프
 - DB 접속 실패/끊김 시 무한 재시도(5초마다 [RETRY])
 - 엔진 1개 고정(pool_size=1, max_overflow=0)
-- work_mem 폭증 방지(세션마다 SET)
+- ✅ (핵심 수정) 쿼리/락 블로킹으로 “멈춘 것처럼 보이는” 현상 방지:
+    * statement_timeout / lock_timeout / idle_in_transaction_session_timeout 을 connect_args options 로 강제
+    * work_mem 역시 options 로 강제 (SET work_mem 바인드 제거 가능)
 - NG는 오로지 contents ILIKE '%제품 감지 NG%' 만 인정
 - WINDOW(KST) 기준 자동 전환:
   day   : [D] 08:30:00 ~ 20:29:59
@@ -56,7 +58,7 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",#비번은 보완 사항
+    "password": "",  # 비번은 보완 사항
 }
 
 SCHEMA = "d1_machine_log"
@@ -90,6 +92,11 @@ DB_RETRY_INTERVAL_SEC = 5
 
 # work_mem cap
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
+
+# ✅ 쿼리/락 타임아웃(블로킹 방지) - ms
+STMT_TIMEOUT_MS = int(os.getenv("D4_STMT_TIMEOUT_MS", "5000"))   # statement_timeout 5s
+LOCK_TIMEOUT_MS = int(os.getenv("D4_LOCK_TIMEOUT_MS", "3000"))   # lock_timeout 3s
+IDLE_TX_TIMEOUT_MS = int(os.getenv("D4_IDLE_TX_TIMEOUT_MS", "5000"))  # idle tx 5s
 
 # Cursor overlap(초) - 증분에서 누락 방지용
 CURSOR_OVERLAP_SEC = int(os.getenv("AFA_CURSOR_OVERLAP_SEC", "3"))
@@ -174,7 +181,6 @@ def _write_log(level: str, msg: str) -> None:
 
     # db (best-effort)
     row = _to_health_row(level, msg, now_kst)
-    # 요구사항 6: end_day, end_time, info, contents 순서로 dataframe화 후 저장
     try:
         df = pd.DataFrame([row], columns=["end_day", "end_time", "info", "contents"])
         _db_log_try(df.to_dict("records"))
@@ -263,7 +269,7 @@ def calc_window(now_kst: datetime) -> Tuple[str, str, datetime, datetime]:
 
 
 # =========================
-# 4) DB 연결/재접속(엔진 1개 고정)
+# 4) DB 연결/재접속(엔진 1개 고정) + ✅ 타임아웃 강제
 # =========================
 def _masked_db() -> str:
     c = DB_CONFIG
@@ -311,6 +317,14 @@ def _build_engine():
     dbname = DB_CONFIG["dbname"]
     conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}?connect_timeout=5"
 
+    # ✅ 세션 레벨 강제 옵션: work_mem + timeouts
+    opt = (
+        f"-c work_mem={WORK_MEM} "
+        f"-c statement_timeout={STMT_TIMEOUT_MS} "
+        f"-c lock_timeout={LOCK_TIMEOUT_MS} "
+        f"-c idle_in_transaction_session_timeout={IDLE_TX_TIMEOUT_MS}"
+    )
+
     return create_engine(
         conn_str,
         pool_pre_ping=True,
@@ -326,6 +340,7 @@ def _build_engine():
             "keepalives_interval": PG_KEEPALIVES_INTERVAL,
             "keepalives_count": PG_KEEPALIVES_COUNT,
             "application_name": "afa_fail_wasted_time_realtime",
+            "options": opt,  # ✅ 핵심
         },
     )
 
@@ -337,7 +352,6 @@ def get_engine_blocking():
         while True:
             try:
                 with _ENGINE.connect() as conn:
-                    conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                     conn.execute(text("SELECT 1"))
                 return _ENGINE
             except Exception as e:
@@ -349,9 +363,14 @@ def get_engine_blocking():
         try:
             _ENGINE = _build_engine()
             with _ENGINE.connect() as conn:
-                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
-            log_info(f"db connected | {_masked_db()} | pool_size=1 max_overflow=0 work_mem={WORK_MEM}")
+
+            log_info(
+                "db connected | "
+                f"{_masked_db()} | "
+                f"pool_size=1 max_overflow=0 work_mem={WORK_MEM} "
+                f"stmt_timeout_ms={STMT_TIMEOUT_MS} lock_timeout_ms={LOCK_TIMEOUT_MS} idle_tx_timeout_ms={IDLE_TX_TIMEOUT_MS}"
+            )
             return _ENGINE
         except Exception as e:
             log_retry(f"db connect failed | {type(e).__name__}: {repr(e)}")
@@ -385,7 +404,6 @@ def init_save_table_blocking(engine):
     while True:
         try:
             with engine.begin() as conn:
-                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(ddl_create)
                 conn.execute(ddl_unique)
             log_info("bootstrap ok: save table + unique index(end_day,station,from_time,to_time) ensured")
@@ -422,16 +440,24 @@ def init_health_log_table_blocking(engine):
         try:
             with engine.begin() as conn:
                 conn.execute(ddl)
-            # 여기서는 _write_log를 부르지 않음(초기화 중 재귀 방지)
-            print(f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [INFO] health log table ensured: {HEALTH_SCHEMA}.{HEALTH_TABLE}", flush=True)
+            print(
+                f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [INFO] health log table ensured: {HEALTH_SCHEMA}.{HEALTH_TABLE}",
+                flush=True,
+            )
             return
         except Exception as e:
             if _is_connection_error(e):
-                print(f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log conn error -> rebuild | {type(e).__name__}: {repr(e)}", flush=True)
+                print(
+                    f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log conn error -> rebuild | {type(e).__name__}: {repr(e)}",
+                    flush=True,
+                )
                 _dispose_engine()
                 engine = get_engine_blocking()
             else:
-                print(f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log failed | {type(e).__name__}: {repr(e)}", flush=True)
+                print(
+                    f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log failed | {type(e).__name__}: {repr(e)}",
+                    flush=True,
+                )
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
@@ -452,7 +478,6 @@ def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
     while True:
         try:
             with engine.connect() as conn:
-                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 rows = conn.execute(sql).fetchall()
 
             seen = set()
@@ -542,6 +567,7 @@ def fetch_src_logs(engine, table: str, station: str, ws: datetime, we: datetime,
                 _dispose_engine()
                 engine = get_engine_blocking()
             else:
+                # ✅ statement_timeout/lock_timeout 걸리면 여기로 떨어짐 -> 다음 루프에서 다시 시도
                 log_retry(f"fetch_src_logs failed | {table}/{station} | {type(e).__name__}: {repr(e)}")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
@@ -629,7 +655,6 @@ def insert_rows(engine, df_pairs: pd.DataFrame) -> int:
     while True:
         try:
             with engine.begin() as conn:
-                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(ins, rows)
             return len(rows)
         except Exception as e:
@@ -665,11 +690,14 @@ def run_backfill_for_window(engine, ws: datetime, we: datetime, states: Dict[str
         pairs, states[station] = pair_events(df, states[station])
         pcount = len(pairs)
         total_pairs += pcount
-        log_info(f"[backfill][pair ] {station} pairs={pcount} (pending_ng={'y' if states[station].pending_ng_ts else 'n'}, in_manual={'y' if states[station].in_manual else 'n'})")
+        log_info(
+            f"[backfill][pair ] {station} pairs={pcount} "
+            f"(pending_ng={'y' if states[station].pending_ng_ts else 'n'}, in_manual={'y' if states[station].in_manual else 'n'})"
+        )
 
-        ins = insert_rows(engine, pairs) if pcount > 0 else 0
-        total_ins += ins
-        log_info(f"[backfill][ins  ] {station} attempted_insert={ins} (dedup by pk/unique)")
+        ins_n = insert_rows(engine, pairs) if pcount > 0 else 0
+        total_ins += ins_n
+        log_info(f"[backfill][ins  ] {station} attempted_insert={ins_n} (dedup by pk/unique)")
 
     log_info(f"[backfill] done | fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_ins}")
 
@@ -685,6 +713,7 @@ def main():
     log_info(f"log_file = {LOG_FILE}")
     log_info(f"db = {_masked_db()}")
     log_info(f"work_mem cap = {WORK_MEM}")
+    log_info(f"stmt_timeout_ms={STMT_TIMEOUT_MS} lock_timeout_ms={LOCK_TIMEOUT_MS} idle_tx_timeout_ms={IDLE_TX_TIMEOUT_MS}")
     log_info(f"src = {SCHEMA}.FCT1~4_machine_log | pk(end_day,end_time,contents) assumed")
     log_info(f"save = {SCHEMA}.{SAVE_TABLE} | pk/unique(end_day,station,from_time,to_time)")
     log_info(f"cursor_overlap_sec = {CURSOR_OVERLAP_SEC}")

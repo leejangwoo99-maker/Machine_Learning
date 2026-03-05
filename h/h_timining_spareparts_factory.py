@@ -3,11 +3,11 @@
 h_timing_spareparts_v9_3_backfill_then_realtime_logdb.py
 ============================================================
 목표
-- fct_non_operation_time(sparepart 교체 이력) 기반으로 구간을 나눠서
+- (REPL) i_daily_report.total_non_operation_time(to_ts) 기반으로 구간을 나눠서
   기존 데이터(과거)부터 처리(backfill)한 뒤, 실시간으로 계속 추적한다.
 
 핵심 규칙
-1) 교체 기준(reset 기준): fct_non_operation_time.to_time (교체 완료 시각)
+1) 교체 기준(reset 기준): total_non_operation_time.to_ts (교체 완료 시각)
 2) 구간: (current_repl_end_ts, next_repl_end_ts]  (다음 교체 완료시각이 리셋 포인트)
    - next가 없으면 upper_ts = now
 3) 각 구간 내에서 testlog end_ts를 오름차순으로 1건씩 누적하며
@@ -20,7 +20,7 @@ h_timing_spareparts_v9_3_backfill_then_realtime_logdb.py
 - backfill을 하면 alarm_record.end_day/end_time은 과거(TEST end_ts)가 들어가고,
   created_at은 현재(inspect 시각)가 들어간다.
 
-[중요 수정(v9.2 FIX)]
+[v9.2 FIX]
 - 교체(next_repl_end_ts)가 있는데 그 사이에 테스트가 없으면(ts_list empty)
   기존 로직은 ROLL이 영원히 안 되어 다음 사이클(교체 이후)을 집계하지 못함.
 - 해결:
@@ -35,12 +35,17 @@ h_timing_spareparts_v9_3_backfill_then_realtime_logdb.py
 - 실행 로그를 DB에도 저장:
   schema: k_demon_heath_check (없으면 생성)
   table : h_log (없으면 생성)
-  columns:
-    - end_day  : yyyymmdd
-    - end_time : hh:mi:ss
-    - info     : 소문자(error/down/sleep/info/...)
-    - contents : 상세 로그
-- end_day, end_time, info, contents 순서로 DataFrame화 후 저장
+
+[중요 변경]
+- REPL 소스:
+  g_production_film.fct_non_operation_time(end_day,to_time) -> i_daily_report.total_non_operation_time(to_ts)
+- to_ts는 timestamptz(오프셋-aware) 이므로, 코드 전체를 "aware datetime(KST)"로 통일
+
+[이번 요청 반영 - alarm_record 중복 방지]
+- alarm_record에서 (end_day, end_time, station, sparepart) 가 같으면 "중복 INSERT 불가"
+- 방법:
+  1) UNIQUE INDEX 생성(없으면 생성)
+  2) insert_alarm 을 ON CONFLICT(...) DO UPDATE로 변경 (즉, 행은 1개만 유지)
 """
 
 from __future__ import annotations
@@ -50,6 +55,7 @@ import pickle
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -65,11 +71,18 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",#비번은 보완 사항
+    "password": "",  # 비번은 보완 사항
 }
+
+KST = ZoneInfo("Asia/Seoul")
 
 STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]
 SPAREPARTS = ["usb_a", "usb_c", "mini_b"]
+
+# REPL(교체 이력) 소스 변경
+REPL_SCHEMA = "i_daily_report"
+REPL_TABLE = "total_non_operation_time"
+REPL_EXCLUDE_STATIONS = ("Vision1", "Vision2")
 
 LOOP_INTERVAL_SEC = 5
 BATCH_LIMIT_TEST_ROWS = 5000
@@ -86,9 +99,6 @@ SET temp_buffers = '16MB';
 
 MODEL_SCHEMA = "h_machine_learning"
 MODEL_TABLE = '3_machine_learning_model'
-
-REPL_SCHEMA = "g_production_film"
-REPL_TABLE = "fct_non_operation_time"
 
 TEST_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
 TEST_TABLE = "fct_vision_testlog_txt_processing_history"
@@ -111,7 +121,34 @@ PENDING_DB_LOGS: List[Tuple[str, str, str, str]] = []
 
 
 # =================================================
-# 1) UTIL
+# 1) TIME UTIL (aware 통일)
+# =================================================
+def now_kst() -> datetime:
+    return datetime.now(tz=KST)
+
+
+def ensure_aware_kst(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    - None => None
+    - naive => KST로 로컬라이즈(운영 DB가 KST 기준으로 기록된다는 가정)
+    - aware => KST로 변환
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=KST)
+    return dt.astimezone(KST)
+
+
+def round_dt_to_sec(dt: datetime) -> datetime:
+    dt = ensure_aware_kst(dt) or dt
+    if dt.microsecond >= 500_000:
+        dt = dt + timedelta(seconds=1)
+    return dt.replace(microsecond=0)
+
+
+# =================================================
+# 2) LOG UTIL
 # =================================================
 def _normalize_info(info: str) -> str:
     if not info:
@@ -120,19 +157,32 @@ def _normalize_info(info: str) -> str:
 
 
 def _make_log_row(info: str, contents: str, now: Optional[datetime] = None) -> Tuple[str, str, str, str]:
-    d = now or datetime.now()
-    end_day = d.strftime("%Y%m%d")      # yyyymmdd
-    end_time = d.strftime("%H:%M:%S")   # hh:mi:ss
+    d = now or now_kst()
+    end_day = d.strftime("%Y%m%d")  # yyyymmdd
+    end_time = d.strftime("%H:%M:%S")  # hh:mi:ss
     return end_day, end_time, _normalize_info(info), str(contents)
 
 
 def print_log(msg: str) -> None:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = now_kst().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
 
 def enqueue_db_log(info: str, contents: str) -> None:
     PENDING_DB_LOGS.append(_make_log_row(info, contents))
+
+
+def has_schema(conn, schema: str) -> bool:
+    sql = "SELECT 1 FROM information_schema.schemata WHERE schema_name=%s"
+    with conn.cursor() as cur:
+        cur.execute(sql, (schema,))
+        return cur.fetchone() is not None
+
+
+def ensure_schema(conn, schema: str) -> None:
+    if not has_schema(conn, schema):
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
 
 
 def ensure_log_table(conn) -> None:
@@ -196,10 +246,12 @@ def log(msg: str, info: str = "info", conn: Optional[psycopg2.extensions.connect
         try:
             flush_db_logs(conn)
         except Exception:
-            # flush 실패 시 버퍼 유지
             pass
 
 
+# =================================================
+# 3) DB UTIL
+# =================================================
 def connect_forever() -> psycopg2.extensions.connection:
     while True:
         try:
@@ -215,13 +267,10 @@ def connect_forever() -> psycopg2.extensions.connection:
             with conn.cursor() as cur:
                 cur.execute(SESSION_GUARDS_SQL)
 
-            # 로그 테이블도 최초 연결 시 보장
             ensure_log_table(conn)
-
             log("[OK] DB connected", info="info", conn=conn)
             return conn
         except Exception as e:
-            # DB 연결 전에는 콘솔 + 버퍼만
             log(f"[ERROR] DB connect failed: {type(e).__name__}: {e}", info="error", conn=None)
             time.sleep(2)
 
@@ -232,19 +281,6 @@ def safe_close(conn: Optional[psycopg2.extensions.connection]) -> None:
             conn.close()
     except Exception:
         pass
-
-
-def has_schema(conn, schema: str) -> bool:
-    sql = "SELECT 1 FROM information_schema.schemata WHERE schema_name=%s"
-    with conn.cursor() as cur:
-        cur.execute(sql, (schema,))
-        return cur.fetchone() is not None
-
-
-def ensure_schema(conn, schema: str) -> None:
-    if not has_schema(conn, schema):
-        with conn.cursor() as cur:
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
 
 
 def has_column(conn, schema: str, table: str, column: str) -> bool:
@@ -275,62 +311,13 @@ def get_column_udt(conn, schema: str, table: str, column: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def round_dt_to_sec(dt: datetime) -> datetime:
-    if dt.microsecond >= 500_000:
-        dt = dt + timedelta(seconds=1)
-    return dt.replace(microsecond=0)
-
-
 # =================================================
-# 2) SQL EXPRESSIONS (end_day + time -> timestamp)
-# =================================================
-def end_day_as_date_expr(col: str = "end_day") -> str:
-    return rf"""
-    (
-      CASE
-        WHEN pg_typeof({col})::text IN ('date','timestamp without time zone','timestamp with time zone')
-          THEN ({col})::date
-        ELSE
-          to_date(
-            lpad(
-              substring(regexp_replace({col}::text, '[^0-9]', '', 'g') from 1 for 8),
-              8, '0'
-            ),
-            'YYYYMMDD'
-          )
-      END
-    )
-    """
-
-
-def time_as_time_expr(col: str) -> str:
-    return rf"""
-    (
-      CASE
-        WHEN pg_typeof({col})::text IN ('time without time zone','time with time zone')
-          THEN ({col})::time
-        WHEN pg_typeof({col})::text IN ('timestamp without time zone','timestamp with time zone')
-          THEN ({col})::time
-        ELSE
-          NULLIF(({col})::text, '')::time
-      END
-    )
-    """
-
-
-def ts_expr(day_col: str, time_col: str) -> str:
-    d = end_day_as_date_expr(day_col)
-    t = time_as_time_expr(time_col)
-    return rf"(({d})::timestamp + ({t}))"
-
-
-# =================================================
-# 3) ONE-TIME DDL (NO DROP)
+# 4) ONE-TIME DDL (NO DROP)
 # =================================================
 def ensure_tables(conn) -> None:
     ensure_schema(conn, ALARM_SCHEMA)
     ensure_schema(conn, STATE_SCHEMA)
-    ensure_log_table(conn)  # 추가
+    ensure_log_table(conn)
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -338,10 +325,10 @@ def ensure_tables(conn) -> None:
             station   TEXT NOT NULL,
             sparepart TEXT NOT NULL,
 
-            current_repl_end_ts TIMESTAMP,
-            next_repl_end_ts    TIMESTAMP,
+            current_repl_end_ts TIMESTAMPTZ,
+            next_repl_end_ts    TIMESTAMPTZ,
 
-            last_test_ts    TIMESTAMP,
+            last_test_ts    TIMESTAMPTZ,
             amount          BIGINT NOT NULL DEFAULT 0,
             last_alarm_type TEXT,
 
@@ -366,7 +353,7 @@ def ensure_tables(conn) -> None:
             run_id TEXT NOT NULL DEFAULT '',
             algo_ver TEXT NOT NULL DEFAULT '',
             reset_reason TEXT NOT NULL DEFAULT '',
-            reset_repl_ts TIMESTAMP NULL
+            reset_repl_ts TIMESTAMPTZ NULL
         );
         """)
 
@@ -374,12 +361,23 @@ def ensure_tables(conn) -> None:
         ("run_id", "TEXT NOT NULL DEFAULT ''"),
         ("algo_ver", "TEXT NOT NULL DEFAULT ''"),
         ("reset_reason", "TEXT NOT NULL DEFAULT ''"),
-        ("reset_repl_ts", "TIMESTAMP NULL"),
+        ("reset_repl_ts", "TIMESTAMPTZ NULL"),
     ]
     for col, ddl in alarm_cols:
         if not has_column(conn, ALARM_SCHEMA, ALARM_TABLE, col):
             with conn.cursor() as cur:
                 cur.execute(f"ALTER TABLE {ALARM_SCHEMA}.{ALARM_TABLE} ADD COLUMN {col} {ddl};")
+
+    # ✅ (핵심) 중복 방지 UNIQUE INDEX: (end_day, end_time, station, sparepart)
+    # - 이미 데이터가 중복되어 있으면 생성이 실패할 수 있음.
+    #   그 경우 먼저 중복 정리(최신 id만 남기기) 후 재시도 필요.
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_alarm_record_dts
+            ON {ALARM_SCHEMA}.{ALARM_TABLE} (end_day, end_time, station, sparepart);
+            """
+        )
 
     with conn.cursor() as cur:
         cur.execute(
@@ -393,7 +391,7 @@ def ensure_tables(conn) -> None:
 
 
 # =================================================
-# 4) MODEL
+# 5) MODEL
 # =================================================
 def detect_model_blob_column(conn) -> Optional[str]:
     sql = """
@@ -489,7 +487,7 @@ def predict_proba_1(model: Any, X: List[List[float]]) -> float:
 
 
 # =================================================
-# 5) LIFE(p25)
+# 6) LIFE(p25)
 # =================================================
 def load_life_p25_map(conn) -> Dict[str, float]:
     sql = f"""
@@ -512,7 +510,7 @@ def load_life_p25_map(conn) -> Dict[str, float]:
 
 
 # =================================================
-# 6) POLICY
+# 7) POLICY
 # =================================================
 def policy_by_ratio(ratio: float) -> Tuple[Optional[str], float]:
     if ratio < 0.3:
@@ -534,7 +532,7 @@ def alarm_rank(t: Optional[str]) -> int:
 
 
 # =================================================
-# 7) INSERT ALARM (meta 포함)
+# 8) INSERT ALARM (중복 방지 UPSERT)
 # =================================================
 def insert_alarm(
     conn,
@@ -551,16 +549,30 @@ def insert_alarm(
     reset_repl_ts: Optional[datetime],
 ) -> None:
     evt = round_dt_to_sec(event_end_ts)
-    end_day_str = evt.strftime("%Y-%m-%d")
+    end_day_str = evt.strftime("%Y-%m-%d")   # 기존 유지 (alarm_record end_day 포맷)
     end_time_str = evt.strftime("%H:%M:%S")
 
+    # ✅ 핵심: (end_day, end_time, station, sparepart) 동일이면 INSERT가 아니라 UPDATE
+    # - “중복 insert 금지” 요건 충족(행은 1개만 유지)
+    # - 재시도/네트워크 단절에도 멱등(idempotent)
     sql = f"""
     INSERT INTO {ALARM_SCHEMA}.{ALARM_TABLE}
       (end_day, end_time, station, sparepart, type_alarm, amount, min_prob, created_at,
        run_id, algo_ver, reset_reason, reset_repl_ts)
     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
             %s,%s,%s,%s)
+    ON CONFLICT (end_day, end_time, station, sparepart)
+    DO UPDATE SET
+        type_alarm   = EXCLUDED.type_alarm,
+        amount       = EXCLUDED.amount,
+        min_prob     = EXCLUDED.min_prob,
+        created_at   = EXCLUDED.created_at,
+        run_id       = EXCLUDED.run_id,
+        algo_ver     = EXCLUDED.algo_ver,
+        reset_reason = EXCLUDED.reset_reason,
+        reset_repl_ts= EXCLUDED.reset_repl_ts
     """
+
     with conn.cursor() as cur:
         cur.execute(
             sql,
@@ -572,17 +584,17 @@ def insert_alarm(
                 alarm_type,
                 int(amount),
                 float(min_prob),
-                inspect_ts,
+                ensure_aware_kst(inspect_ts) or inspect_ts,
                 run_id,
                 algo_ver,
                 reset_reason,
-                reset_repl_ts,
+                ensure_aware_kst(reset_repl_ts),
             ),
         )
 
 
 # =================================================
-# 8) FEATURES
+# 9) FEATURES
 # =================================================
 def build_features_for_model(
     model: Any,
@@ -608,7 +620,7 @@ def build_features_for_model(
 
 
 # =================================================
-# 9) STATE
+# 10) STATE
 # =================================================
 @dataclass
 class State:
@@ -635,9 +647,9 @@ def load_state(conn, station: str, sparepart: str) -> State:
         return State(
             station=row[0],
             sparepart=row[1],
-            current_repl_end_ts=row[2],
-            next_repl_end_ts=row[3],
-            last_test_ts=row[4],
+            current_repl_end_ts=ensure_aware_kst(row[2]),
+            next_repl_end_ts=ensure_aware_kst(row[3]),
+            last_test_ts=ensure_aware_kst(row[4]),
             amount=int(row[5] or 0),
             last_alarm_type=row[6],
         )
@@ -671,65 +683,125 @@ def save_state(conn, st: State) -> None:
         cur.execute(
             sql,
             (
-                st.station, st.sparepart,
-                st.current_repl_end_ts, st.next_repl_end_ts,
-                st.last_test_ts, int(st.amount), st.last_alarm_type,
+                st.station,
+                st.sparepart,
+                ensure_aware_kst(st.current_repl_end_ts),
+                ensure_aware_kst(st.next_repl_end_ts),
+                ensure_aware_kst(st.last_test_ts),
+                int(st.amount),
+                st.last_alarm_type,
             ),
         )
 
 
 # =================================================
-# 10) QUERIES
+# 11) QUERIES
 # =================================================
 def preflight_required_columns(conn) -> None:
-    require_column(conn, REPL_SCHEMA, REPL_TABLE, "end_day")
-    require_column(conn, REPL_SCHEMA, REPL_TABLE, "to_time")
+    # REPL (i_daily_report.total_non_operation_time)
     require_column(conn, REPL_SCHEMA, REPL_TABLE, "station")
     require_column(conn, REPL_SCHEMA, REPL_TABLE, "sparepart")
+    require_column(conn, REPL_SCHEMA, REPL_TABLE, "to_ts")
 
+    # TEST
     require_column(conn, TEST_SCHEMA, TEST_TABLE, "end_day")
     require_column(conn, TEST_SCHEMA, TEST_TABLE, "end_time")
     require_column(conn, TEST_SCHEMA, TEST_TABLE, "station")
 
+    # LIFE
     require_column(conn, LIFE_SCHEMA, LIFE_TABLE, "sparepart")
     require_column(conn, LIFE_SCHEMA, LIFE_TABLE, "p25")
 
 
 def list_repl_end_ts(conn, station: str, sparepart: str) -> List[datetime]:
-    repl_end_ts = ts_expr("end_day", "to_time")
     sql = f"""
-    SELECT {repl_end_ts} AS e
+    SELECT to_ts AS e
     FROM {REPL_SCHEMA}.{REPL_TABLE}
     WHERE station=%s
+      AND station NOT IN %s
       AND sparepart::text=%s
-      AND {repl_end_ts} IS NOT NULL
-    ORDER BY {repl_end_ts} ASC
+      AND to_ts IS NOT NULL
+    ORDER BY to_ts ASC
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (station, sparepart))
+        cur.execute(sql, (station, REPL_EXCLUDE_STATIONS, sparepart))
         rows = cur.fetchall()
-    return [r[0] for r in rows] if rows else []
+    out = [ensure_aware_kst(r[0]) for r in rows] if rows else []
+    return [x for x in out if x is not None]
 
 
 def find_next_repl_end_after(conn, station: str, sparepart: str, current_end: datetime) -> Optional[datetime]:
-    repl_end_ts = ts_expr("end_day", "to_time")
+    current_end = ensure_aware_kst(current_end) or current_end
     sql = f"""
-    SELECT {repl_end_ts} AS e
+    SELECT to_ts AS e
     FROM {REPL_SCHEMA}.{REPL_TABLE}
     WHERE station=%s
+      AND station NOT IN %s
       AND sparepart::text=%s
-      AND {repl_end_ts} IS NOT NULL
-      AND {repl_end_ts} > %s
-    ORDER BY {repl_end_ts} ASC
+      AND to_ts IS NOT NULL
+      AND to_ts > %s
+    ORDER BY to_ts ASC
     LIMIT 1
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (station, sparepart, current_end))
+        cur.execute(sql, (station, REPL_EXCLUDE_STATIONS, sparepart, current_end))
         row = cur.fetchone()
-    return row[0] if row else None
+    return ensure_aware_kst(row[0]) if row else None
+
+
+def end_day_as_date_expr(col: str = "end_day") -> str:
+    return rf"""
+    (
+      CASE
+        WHEN pg_typeof({col})::text IN ('date','timestamp without time zone','timestamp with time zone')
+          THEN ({col})::date
+        ELSE
+          to_date(
+            lpad(
+              substring(regexp_replace({col}::text, '[^0-9]', '', 'g') from 1 for 8),
+              8, '0'
+            ),
+            'YYYYMMDD'
+          )
+      END
+    )
+    """
+
+
+def time_as_time_expr(col: str) -> str:
+    return rf"""
+    (
+      CASE
+        WHEN pg_typeof({col})::text IN ('time without time zone','time with time zone')
+          THEN ({col})::time
+        WHEN pg_typeof({col})::text IN ('timestamp without time zone','timestamp with time zone')
+          THEN ({col})::time
+        ELSE
+          NULLIF(({col})::text, '')::time
+      END
+    )
+    """
+
+
+def ts_expr(day_col: str, time_col: str) -> str:
+    d = end_day_as_date_expr(day_col)
+    t = time_as_time_expr(time_col)
+    return rf"(({d})::timestamp + ({t}))"
 
 
 def fetch_new_tests_ts_list(conn, station: str, after_ts: datetime, upper_ts: datetime, limit: int) -> List[datetime]:
+    """
+    TEST 테이블은 end_day/end_time 기반 -> ts_expr는 naive(timestamp)로 만들어질 수 있음.
+    비교/저장은 KST-aware로 통일해야 하므로,
+    - 쿼리는 naive로 비교 수행(동일 표현)
+    - 결과를 받아서 KST-aware로 변환해 반환
+    """
+    after_ts = ensure_aware_kst(after_ts) or after_ts
+    upper_ts = ensure_aware_kst(upper_ts) or upper_ts
+
+    after_naive = after_ts.replace(tzinfo=None)
+    upper_naive = upper_ts.replace(tzinfo=None)
+
     end_ts = ts_expr("end_day", "end_time")
     sql = f"""
     SELECT {end_ts} AS tts
@@ -742,18 +814,28 @@ def fetch_new_tests_ts_list(conn, station: str, after_ts: datetime, upper_ts: da
     LIMIT {int(limit)}
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (station, after_ts, upper_ts))
+        cur.execute(sql, (station, after_naive, upper_naive))
         rows = cur.fetchall()
-    return [r[0] for r in rows] if rows else []
+
+    out: List[datetime] = []
+    for r in rows or []:
+        dt = r[0]
+        dt = ensure_aware_kst(dt)
+        if dt is not None:
+            out.append(dt)
+    return out
 
 
 def roll_state_to_next(conn, st: State, station: str, sparepart: str) -> None:
     prev_current = st.current_repl_end_ts
-    st.current_repl_end_ts = st.next_repl_end_ts
+    st.current_repl_end_ts = ensure_aware_kst(st.next_repl_end_ts)
     st.last_test_ts = st.current_repl_end_ts
     st.amount = 0
     st.last_alarm_type = None
-    st.next_repl_end_ts = find_next_repl_end_after(conn, station, sparepart, st.current_repl_end_ts)
+    if st.current_repl_end_ts is not None:
+        st.next_repl_end_ts = find_next_repl_end_after(conn, station, sparepart, st.current_repl_end_ts)
+    else:
+        st.next_repl_end_ts = None
     save_state(conn, st)
     log(
         f"[ROLL] {station}/{sparepart} {prev_current} -> {st.current_repl_end_ts} next={st.next_repl_end_ts}",
@@ -762,11 +844,28 @@ def roll_state_to_next(conn, st: State, station: str, sparepart: str) -> None:
     )
 
 
+def repl_count_debug(conn, station: str, sparepart: str) -> Tuple[int, Optional[datetime], Optional[datetime]]:
+    sql = f"""
+    SELECT COUNT(*)::bigint AS n,
+           MIN(to_ts) AS first_to,
+           MAX(to_ts) AS last_to
+    FROM {REPL_SCHEMA}.{REPL_TABLE}
+    WHERE station=%s
+      AND station NOT IN %s
+      AND sparepart::text=%s
+      AND to_ts IS NOT NULL
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (station, REPL_EXCLUDE_STATIONS, sparepart))
+        n, first_to, last_to = cur.fetchone()
+    return int(n or 0), ensure_aware_kst(first_to), ensure_aware_kst(last_to)
+
+
 # =================================================
-# 11) MAIN
+# 12) MAIN
 # =================================================
 def main() -> None:
-    RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_v9_3_logdb"
+    RUN_ID = now_kst().strftime("%Y%m%d_%H%M%S") + "_v9_3_logdb"
     ALGO_VER = "v9_3_logdb"
 
     conn: Optional[psycopg2.extensions.connection] = None
@@ -785,14 +884,17 @@ def main() -> None:
                 conn = connect_forever()
                 ensure_tables(conn)
                 preflight_required_columns(conn)
-                flush_db_logs(conn)  # 재연결 시 버퍼 플러시
+                flush_db_logs(conn)
+
+                log(f"[SRC] REPL={REPL_SCHEMA}.{REPL_TABLE} reset_ts=to_ts exclude={list(REPL_EXCLUDE_STATIONS)}", info="info", conn=conn)
+                log(f"[SRC] STATE={STATE_SCHEMA}.{STATE_TABLE} (timestamptz aware; KST normalize)", info="info", conn=conn)
 
             now_ts = time.time()
-            now_dt = datetime.now()
+            now_dt = now_kst()
 
             if now_ts - last_hb >= 60:
                 log(
-                    f"[HEARTBEAT] now={now_dt.strftime('%Y-%m-%d %H:%M:%S')} run_id={RUN_ID}",
+                    f"[HEARTBEAT] now={now_dt.strftime('%Y-%m-%d %H:%M:%S %z')} run_id={RUN_ID}",
                     info="info",
                     conn=conn,
                 )
@@ -817,15 +919,20 @@ def main() -> None:
                     if max_tests <= 0:
                         continue
 
+                    try:
+                        repl_n, repl_first, repl_last = repl_count_debug(conn, station, sparepart)
+                        log(f"[REPL-CHECK] {station}/{sparepart} repl_n={repl_n} first={repl_first} last={repl_last}", info="info", conn=conn)
+                    except Exception as e:
+                        log(f"[REPL-CHECK-ERROR] {station}/{sparepart} {type(e).__name__}: {e}", info="error", conn=conn)
+
                     st = load_state(conn, station, sparepart)
 
-                    # (1) 초기화
                     if st.current_repl_end_ts is None:
                         repl_list = list_repl_end_ts(conn, station, sparepart)
                         if not repl_list:
                             continue
-                        st.current_repl_end_ts = repl_list[0]
-                        st.next_repl_end_ts = repl_list[1] if len(repl_list) >= 2 else None
+                        st.current_repl_end_ts = ensure_aware_kst(repl_list[0])
+                        st.next_repl_end_ts = ensure_aware_kst(repl_list[1]) if len(repl_list) >= 2 else None
                         st.last_test_ts = st.current_repl_end_ts
                         st.amount = 0
                         st.last_alarm_type = None
@@ -837,9 +944,7 @@ def main() -> None:
                             conn=conn,
                         )
 
-                    # 한 루프 내 연속 롤링 처리
                     for _guard in range(50):
-                        # (2) next 갱신
                         if st.current_repl_end_ts is not None:
                             nxt = find_next_repl_end_after(conn, station, sparepart, st.current_repl_end_ts)
                             if nxt is not None and (st.next_repl_end_ts is None or nxt != st.next_repl_end_ts):
@@ -852,21 +957,22 @@ def main() -> None:
                                     conn=conn,
                                 )
 
-                        # (3) 교체 후 next 없음 -> 집계 중단
                         if st.last_alarm_type == "교체" and st.next_repl_end_ts is None:
                             break
 
                         if st.current_repl_end_ts is None:
                             break
 
-                        # (4) upper_ts 결정 (FIX)
                         if st.next_repl_end_ts is not None and now_dt >= st.next_repl_end_ts:
                             upper_ts = st.next_repl_end_ts
                         else:
                             upper_ts = now_dt
 
                         after_ts = st.last_test_ts or st.current_repl_end_ts
-                        if after_ts is None:
+                        after_ts = ensure_aware_kst(after_ts)
+                        upper_ts = ensure_aware_kst(upper_ts)
+
+                        if after_ts is None or upper_ts is None:
                             break
 
                         if after_ts >= upper_ts:
@@ -876,10 +982,8 @@ def main() -> None:
                                 continue
                             break
 
-                        # (5) 테스트 fetch
                         ts_list = fetch_new_tests_ts_list(conn, station, after_ts, upper_ts, BATCH_LIMIT_TEST_ROWS)
 
-                        # (FIX) 테스트 없어도 next 도달 시 롤링
                         if not ts_list:
                             if st.next_repl_end_ts is not None and now_dt >= st.next_repl_end_ts and upper_ts == st.next_repl_end_ts:
                                 log(
@@ -894,8 +998,8 @@ def main() -> None:
 
                         need_immediate = True
 
-                        # (6) 1건씩 누적
                         for tts in ts_list:
+                            tts = ensure_aware_kst(tts) or tts
                             st.amount += 1
                             st.last_test_ts = tts
 
@@ -906,7 +1010,6 @@ def main() -> None:
                                 if alarm_rank(alarm_type) > alarm_rank(st.last_alarm_type):
                                     prob = 0.0
 
-                                    # 준비/권고: 확률 게이트
                                     if alarm_type in ("준비", "권고"):
                                         pass_prob = False
                                         try:
@@ -933,7 +1036,7 @@ def main() -> None:
                                                 amount=st.amount,
                                                 min_prob=float(min_prob),
                                                 event_end_ts=tts,
-                                                inspect_ts=datetime.now(),
+                                                inspect_ts=now_kst(),
                                                 run_id=RUN_ID,
                                                 algo_ver=ALGO_VER,
                                                 reset_reason="NORMAL_CROSS",
@@ -953,7 +1056,6 @@ def main() -> None:
                                             )
 
                                     else:
-                                        # 긴급/교체: 확률게이트 없이 저장
                                         try:
                                             X = build_features_for_model(
                                                 cached_model, station, sparepart, st.amount, max_tests, ratio
@@ -976,7 +1078,7 @@ def main() -> None:
                                             amount=st.amount,
                                             min_prob=float(min_prob),
                                             event_end_ts=tts,
-                                            inspect_ts=datetime.now(),
+                                            inspect_ts=now_kst(),
                                             run_id=RUN_ID,
                                             algo_ver=ALGO_VER,
                                             reset_reason="NORMAL_CROSS",
@@ -1002,7 +1104,6 @@ def main() -> None:
                 log(f"[LOOP] sleep {LOOP_INTERVAL_SEC}s", info="sleep", conn=conn)
                 time.sleep(LOOP_INTERVAL_SEC)
 
-            # 루프 말미 버퍼 flush
             flush_db_logs(conn)
 
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
