@@ -1,0 +1,12 @@
+{
+  "src": "f_database.fct_database",
+  "date_from": "2025-09-27",
+  "date_to": "2025-09-27",
+  "rows": 1506898,
+  "count_rows": null,
+  "fetch_sec": 1033.838,
+  "save_sec": 2.56,
+  "saved_at": "2026-01-14T18:29:10",
+  "include_contents": false,
+  "days_per_chunk": 1
+}

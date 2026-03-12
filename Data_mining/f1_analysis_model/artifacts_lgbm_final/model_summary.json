@@ -1,0 +1,14 @@
+{
+  "threshold": 0.5,
+  "best_iteration": 1,
+  "n_features": 7,
+  "zstats_path": "C:\\Users\\user\\Desktop\\AI PJT\\machin_learning_pjt\\f1_analysis_model\\artifacts_lgbm_final\\zstats_tag_level2.csv",
+  "hi_params": {
+    "a": 0.9,
+    "b": 1.2,
+    "c": 0.8,
+    "d": 0.9
+  },
+  "created_at": "2026-01-14T09:13:12",
+  "spec": "2026-01-13_LightGBM_설계_최종"
+}
