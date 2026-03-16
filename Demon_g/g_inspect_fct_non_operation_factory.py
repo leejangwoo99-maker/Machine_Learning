@@ -1,32 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Factory Realtime - FCT Non Operation Time Inspector (final)
+Factory Realtime - FCT Non Operation Time Inspector (fast final)
 
-[최종 정책]
-1) 기존 조건만 유지
-   - "TEST RESULT :: OK/NG" -> "TEST AUTO MODE START"
-   - prefix 매칭(startswith) 유지
-   - threshold 적용 유지
-   - from_time = RESULT row의 end_time
-   - to_time   = AUTO START row의 end_time
-
-2) incremental batch 경계 보완
-   - 서로 다른 loop/batch에 RESULT와 AUTO START가 나뉘어도 놓치지 않도록
-   - cursor table에 pending_result_time 저장/복원
-
-3) 재시작 안전
-   - 프로그램 시작 시 오늘 날짜 cursor 초기화
-   - 부팅 직후 첫 RUN은 DB cursor를 읽지 않고 all-None 상태로 full scan
-   - UPSERT라서 중복 적재 방지
-
-4) 성능
-   - DB 로그 적재 최소화
-   - heartbeat는 1분 1회만 DB 적재
-   - source는 필요한 로그만 SQL에서 조회
-   - cursor state는 batch upsert
-
-5) 0초/역전 이벤트는 저장 금지
+속도 개선 핵심
+1) FCT1~4 병렬 조회
+2) pandas 제거
+3) station별 MAX(id) 별도 조회 제거
+4) psycopg2 execute_values로 빠른 UPSERT
+5) engine pool 확대
+6) timestamp 파싱 경량화
+7) heartbeat DB 저장 최소화 유지
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -36,11 +22,13 @@ import socket
 import traceback
 import subprocess
 import multiprocessing as mp
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import urllib.parse
 
-import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
 
@@ -70,38 +58,26 @@ SAVE_TABLE = "fct_non_operation_time"
 CURSOR_SCHEMA = "g_production_film"
 CURSOR_TABLE = "fct_non_operation_time_cursor"
 
-# realtime
 LOOP_INTERVAL_SEC = 2.0
 STABLE_DATA_SEC = 1.0
 
-# reconnect
 DB_CONNECT_TIMEOUT_SEC = 5
 RETRY_SLEEP_SEC = 10
 
-# session
-WORK_MEM = "4MB"
+WORK_MEM = "32MB"
 STATEMENT_TIMEOUT_MS = 60000
 
-# startup
 STARTUP_FULL_RESCAN_TODAY = True
 STARTUP_FORCE_FIRST_RUN_FULLSCAN = True
 
-# DB heartbeat
 DB_HEARTBEAT_INTERVAL_SEC = 60.0
+LOAD_WORKERS = 4
 
-# timezone
 KST = ZoneInfo("Asia/Seoul")
 
 
 # =========================
-# 0-1) 기존 조건 텍스트
-# =========================
-RESULT_PREFIXES = ("TEST RESULT :: OK", "TEST RESULT :: NG")
-AUTO_START_PREFIX = "TEST AUTO MODE START"
-
-
-# =========================
-# 0-2) 로그 DB 설정
+# 0-1) 로그 DB 설정
 # =========================
 LOG_DB_SCHEMA = "k_demon_heath_check"
 LOG_DB_TABLE = "gf_log"
@@ -116,6 +92,25 @@ INFO_ALLOW = {
 }
 
 DB_LOG_ALLOWED = {"boot", "error", "recover", "save", "fatal", "exit", "heartbeat"}
+
+
+# =========================
+# 0-2) 이벤트 판정
+# =========================
+RE_RESULT = re.compile(r"^\s*TEST\s+RESULT\s*:+\s*(OK|NG)\b", re.IGNORECASE)
+RE_AUTO_START = re.compile(r"^\s*TEST\s+AUTO\s+MODE\s+START\b", re.IGNORECASE)
+MANUAL_MODE_TEXT = "Manual mode 전환"
+
+
+def classify_event(contents: str) -> str | None:
+    s = str(contents or "").strip()
+    if s == MANUAL_MODE_TEXT:
+        return "MANUAL"
+    if RE_RESULT.match(s):
+        return "RESULT"
+    if RE_AUTO_START.match(s):
+        return "AUTO_START"
+    return None
 
 
 def _infer_info(msg: str) -> str:
@@ -344,22 +339,23 @@ def _print_end_banner(tag: str, start_dt: datetime, end_dt: datetime):
     log("-" * 110, info="done")
 
 
-def _safe_ts_from_day_time(end_day: str, end_time: str):
-    try:
-        if end_day is None or end_time is None:
-            return None
-        ts = pd.to_datetime(str(end_day) + " " + str(end_time), errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts
-    except Exception:
+def parse_day_time(end_day: str, end_time: str) -> datetime | None:
+    if end_day is None or end_time is None:
         return None
+    s = f"{str(end_day).strip()} {str(end_time).strip()}"
+    for fmt in ("%Y%m%d %H:%M:%S.%f", "%Y%m%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    return None
 
 
 def _fresh_empty_state():
     return {
         "last_id": None,
         "pending_result_time": None,
+        "manual_block": 0,
     }
 
 
@@ -397,7 +393,7 @@ def is_db_disconnect_error(e: Exception) -> bool:
     return any(h in msg for h in hints)
 
 
-def _make_engine_one_pool():
+def _make_engine():
     db_url = build_db_url(DB_CONFIG)
 
     opt = "-c work_mem={0}".format(WORK_MEM)
@@ -406,7 +402,7 @@ def _make_engine_one_pool():
 
     connect_args = {
         "connect_timeout": int(DB_CONNECT_TIMEOUT_SEC),
-        "application_name": "fct_nonop_realtime",
+        "application_name": "fct_nonop_realtime_fast",
         "options": opt,
     }
 
@@ -414,10 +410,11 @@ def _make_engine_one_pool():
         db_url,
         pool_pre_ping=True,
         pool_recycle=300,
-        pool_size=1,
-        max_overflow=0,
+        pool_size=8,
+        max_overflow=8,
         pool_timeout=30,
         connect_args=connect_args,
+        future=True,
     )
     return eng
 
@@ -426,11 +423,11 @@ def init_engine_blocking():
     while True:
         eng = None
         try:
-            eng = _make_engine_one_pool()
+            eng = _make_engine()
             with eng.connect() as conn:
                 _session_guard(conn)
                 conn.execute(text("SELECT 1"))
-            log("[OK] engine connect test passed (single-pool fixed)", info="db")
+            log("[OK] engine connect test passed", info="db")
             return eng
         except Exception as e:
             log("[ERROR] DB connect failed: {0}: {1}".format(type(e).__name__, e), info="error")
@@ -473,7 +470,7 @@ def recover_engine_and_thresholds_blocking():
                 ), info="load")
             except Exception as e:
                 if is_db_disconnect_error(e):
-                    log("[WARN] thresholds load hit DB disconnect -> re-init engine (blocking)", info="down")
+                    log("[WARN] thresholds load hit DB disconnect -> re-init engine", info="down")
                     try:
                         engine.dispose()
                     except Exception:
@@ -501,6 +498,7 @@ def ensure_cursor_table(engine):
         station              TEXT NOT NULL,
         last_id              BIGINT NULL,
         pending_result_time  TEXT NULL,
+        manual_block         INTEGER NOT NULL DEFAULT 0,
         updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (end_day, station)
     );
@@ -508,40 +506,6 @@ def ensure_cursor_table(engine):
     with engine.begin() as conn:
         _session_guard(conn)
         conn.execute(ddl)
-
-    ddls = [
-        f"""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema='{CURSOR_SCHEMA}'
-                  AND table_name='{CURSOR_TABLE}'
-                  AND column_name='last_id'
-            ) THEN
-                ALTER TABLE {CURSOR_SCHEMA}.{CURSOR_TABLE} ADD COLUMN last_id BIGINT NULL;
-            END IF;
-        END $$;
-        """,
-        f"""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema='{CURSOR_SCHEMA}'
-                  AND table_name='{CURSOR_TABLE}'
-                  AND column_name='pending_result_time'
-            ) THEN
-                ALTER TABLE {CURSOR_SCHEMA}.{CURSOR_TABLE} ADD COLUMN pending_result_time TEXT NULL;
-            END IF;
-        END $$;
-        """,
-    ]
-
-    with engine.begin() as conn:
-        _session_guard(conn)
-        for ddlx in ddls:
-            conn.execute(text(ddlx))
 
 
 def reset_today_cursors(engine, end_day: str):
@@ -558,19 +522,22 @@ def reset_today_cursors(engine, end_day: str):
 def load_cursors(engine, end_day: str) -> dict:
     ensure_cursor_table(engine)
     q = text(f"""
-        SELECT station, last_id, pending_result_time
+        SELECT station, last_id, pending_result_time, manual_block
         FROM {CURSOR_SCHEMA}.{CURSOR_TABLE}
         WHERE end_day = :end_day
     """)
-    df = pd.read_sql(q, engine, params={"end_day": end_day})
-
     cur = _fresh_all_station_states()
 
-    for _, r in df.iterrows():
+    with engine.connect() as conn:
+        _session_guard(conn)
+        rows = conn.execute(q, {"end_day": end_day}).mappings().all()
+
+    for r in rows:
         st = str(r["station"])
         cur[st] = {
             "last_id": r["last_id"],
-            "pending_result_time": r["pending_result_time"] if pd.notna(r["pending_result_time"]) else None,
+            "pending_result_time": r["pending_result_time"],
+            "manual_block": int(r["manual_block"] or 0),
         }
     return cur
 
@@ -583,13 +550,14 @@ def upsert_cursor_states_batch(engine, end_day: str, state_updates: list[tuple[s
 
     q = text(f"""
         INSERT INTO {CURSOR_SCHEMA}.{CURSOR_TABLE}
-        (end_day, station, last_id, pending_result_time, updated_at)
+        (end_day, station, last_id, pending_result_time, manual_block, updated_at)
         VALUES
-        (:end_day, :station, :last_id, :pending_result_time, now())
+        (:end_day, :station, :last_id, :pending_result_time, :manual_block, now())
         ON CONFLICT (end_day, station)
         DO UPDATE SET
             last_id = EXCLUDED.last_id,
             pending_result_time = EXCLUDED.pending_result_time,
+            manual_block = EXCLUDED.manual_block,
             updated_at = now()
     """)
 
@@ -600,6 +568,7 @@ def upsert_cursor_states_batch(engine, end_day: str, state_updates: list[tuple[s
             "station": station,
             "last_id": int(state["last_id"]) if state.get("last_id") is not None else None,
             "pending_result_time": state.get("pending_result_time"),
+            "manual_block": int(state.get("manual_block") or 0),
         })
 
     with engine.begin() as conn:
@@ -637,21 +606,31 @@ def load_thresholds(engine):
         FROM g_production_film.fct_op_criteria
         WHERE month = :month
     """)
-    df = pd.read_sql(q_max, engine, params={"month": target_month})
-    mx = df.loc[0, "mx"] if (df is not None and not df.empty) else None
-    if mx is not None and pd.notna(mx):
+
+    with engine.connect() as conn:
+        _session_guard(conn)
+        row = conn.execute(q_max, {"month": target_month}).mappings().first()
+
+    mx = row["mx"] if row else None
+    if mx is not None:
         return {"ALL": float(mx), "month": str(target_month), "fallback": False}
 
     q_latest_month = text("""SELECT MAX(month) AS latest_month FROM g_production_film.fct_op_criteria""")
-    dfm = pd.read_sql(q_latest_month, engine)
-    latest_month = dfm.loc[0, "latest_month"] if (dfm is not None and not dfm.empty) else None
+    with engine.connect() as conn:
+        _session_guard(conn)
+        row2 = conn.execute(q_latest_month).mappings().first()
+
+    latest_month = row2["latest_month"] if row2 else None
     if latest_month is None or str(latest_month).strip() == "":
         raise RuntimeError("[ERROR] g_production_film.fct_op_criteria 테이블에 month 데이터가 없습니다.")
 
     latest_month = str(latest_month).strip()
-    df2 = pd.read_sql(q_max, engine, params={"month": latest_month})
-    mx2 = df2.loc[0, "mx"] if (df2 is not None and not df2.empty) else None
-    if mx2 is None or pd.isna(mx2):
+    with engine.connect() as conn:
+        _session_guard(conn)
+        row3 = conn.execute(q_max, {"month": latest_month}).mappings().first()
+
+    mx2 = row3["mx"] if row3 else None
+    if mx2 is None:
         raise RuntimeError(f"[ERROR] fct_op_criteria month={latest_month} 행은 있으나 upper_outlier MAX가 NULL 입니다.")
 
     return {"ALL": float(mx2), "month": latest_month, "fallback": True}
@@ -664,98 +643,96 @@ def threshold_for_station(th_map: dict, station: str) -> float:
 # =========================
 # 4) source load
 # =========================
-def _load_station_max_id(engine, end_day: str, station: str, last_id):
-    tbl = FCT_TABLES[station]
-
-    if last_id is None or (isinstance(last_id, float) and pd.isna(last_id)):
-        q = text(f"""
-            SELECT MAX(id) AS mx
-            FROM {SRC_SCHEMA}."{tbl}"
-            WHERE end_day = :end_day
-        """)
-        params = {"end_day": end_day}
-    else:
-        q = text(f"""
-            SELECT MAX(id) AS mx
-            FROM {SRC_SCHEMA}."{tbl}"
-            WHERE end_day = :end_day
-              AND id > :last_id
-        """)
-        params = {"end_day": end_day, "last_id": int(last_id)}
-
-    df = pd.read_sql(q, engine, params=params)
-    if df is None or df.empty:
-        return None
-    mx = df.loc[0, "mx"]
-    return int(mx) if pd.notna(mx) else None
-
-
 def load_fct_incremental(engine, end_day: str, station: str, last_id):
     """
-    기존 조건만 조회:
-    - TEST RESULT :: OK%
-    - TEST RESULT :: NG%
-    - TEST AUTO MODE START%
+    별도 MAX(id) 조회 없이 본조회 한 번으로 처리
     """
     tbl = FCT_TABLES[station]
-    stable_cut = datetime.now() - pd.Timedelta(seconds=STABLE_DATA_SEC)
-
-    fetched_max_id = _load_station_max_id(engine, end_day=end_day, station=station, last_id=last_id)
-
-    base_where = f"""
-        end_day = :end_day
-        AND (
-            contents LIKE :result_ok_prefix
-            OR contents LIKE :result_ng_prefix
-            OR contents LIKE :auto_start_prefix
-        )
-    """
+    stable_cut = datetime.now() - timedelta(seconds=STABLE_DATA_SEC)
 
     params = {
         "end_day": end_day,
-        "result_ok_prefix": RESULT_PREFIXES[0] + "%",
-        "result_ng_prefix": RESULT_PREFIXES[1] + "%",
-        "auto_start_prefix": AUTO_START_PREFIX + "%",
+        "result_prefix": "TEST RESULT%",
+        "auto_start_prefix": "TEST AUTO MODE START%",
+        "manual_text": MANUAL_MODE_TEXT,
     }
 
-    if last_id is None or (isinstance(last_id, float) and pd.isna(last_id)):
+    if last_id is None:
         q = text(f"""
             SELECT id, end_day, station, end_time, contents
             FROM {SRC_SCHEMA}."{tbl}"
-            WHERE {base_where}
+            WHERE end_day = :end_day
+              AND (
+                    contents ILIKE :result_prefix
+                 OR contents ILIKE :auto_start_prefix
+                 OR contents = :manual_text
+              )
             ORDER BY id ASC
         """)
     else:
         q = text(f"""
             SELECT id, end_day, station, end_time, contents
             FROM {SRC_SCHEMA}."{tbl}"
-            WHERE {base_where}
+            WHERE end_day = :end_day
               AND id > :last_id
+              AND (
+                    contents ILIKE :result_prefix
+                 OR contents ILIKE :auto_start_prefix
+                 OR contents = :manual_text
+              )
             ORDER BY id ASC
         """)
         params["last_id"] = int(last_id)
 
-    df = pd.read_sql(q, engine, params=params)
+    with engine.connect() as conn:
+        _session_guard(conn)
+        rows = conn.execute(q, params).mappings().all()
 
-    if df.empty:
-        return df, fetched_max_id
+    if not rows:
+        return [], last_id
 
-    df["contents"] = df["contents"].astype(str)
-    ts = pd.to_datetime(df["end_day"].astype(str) + " " + df["end_time"].astype(str), errors="coerce")
-    df["_ts"] = ts
-    df = df[df["_ts"].notna()].copy()
-    df = df[df["_ts"] <= stable_cut].copy()
+    out = []
+    fetched_max_id = last_id
 
-    return df.reset_index(drop=True), fetched_max_id
+    for r in rows:
+        rid = int(r["id"])
+        if fetched_max_id is None or rid > fetched_max_id:
+            fetched_max_id = rid
+
+        ts = parse_day_time(r["end_day"], r["end_time"])
+        if ts is None:
+            continue
+        if ts > stable_cut:
+            continue
+
+        contents = str(r["contents"] or "")
+        evt = classify_event(contents)
+        if evt is None:
+            continue
+
+        out.append({
+            "id": rid,
+            "end_day": str(r["end_day"]),
+            "station": str(r["station"]),
+            "end_time": str(r["end_time"]),
+            "contents": contents,
+            "_ts": ts,
+            "_event_type": evt,
+        })
+
+    return out, fetched_max_id
+
+
+def load_station_job(engine, end_day: str, station: str, last_id):
+    t0 = time_mod.time()
+    rows, fetched_max_id = load_fct_incremental(engine, end_day, station, last_id)
+    elapsed = time_mod.time() - t0
+    return station, rows, fetched_max_id, elapsed
 
 
 # =========================
 # 5) event calc
 # =========================
-def _empty_event_df():
-    return pd.DataFrame(columns=["end_day", "station", "from_time", "to_time", "no_operation_time"])
-
-
 def _append_event(events: list, end_day: str, station: str, from_time: str, to_time: str, diff_sec: float):
     if diff_sec is None:
         return
@@ -777,7 +754,7 @@ def _append_event(events: list, end_day: str, station: str, from_time: str, to_t
 def compute_events_for_station(
     station: str,
     end_day: str,
-    df_station: pd.DataFrame,
+    rows: list[dict],
     th_map: dict,
     prev_state: dict,
     fetched_max_id,
@@ -785,33 +762,41 @@ def compute_events_for_station(
     max_id = fetched_max_id if fetched_max_id is not None else prev_state.get("last_id")
 
     pending_result_time = prev_state.get("pending_result_time")
-    pending_result_ts = _safe_ts_from_day_time(end_day, pending_result_time)
+    pending_result_ts = parse_day_time(end_day, pending_result_time) if pending_result_time else None
+    manual_block = int(prev_state.get("manual_block") or 0)
 
-    if df_station is None or df_station.empty:
+    if not rows:
         new_state = {
             "last_id": max_id,
             "pending_result_time": pending_result_time,
+            "manual_block": manual_block,
         }
-        return station, new_state, _empty_event_df()
-
-    df = df_station.copy()
-    df = df.sort_values(["_ts", "id"], ascending=True).reset_index(drop=True)
+        return station, new_state, []
 
     th_val = threshold_for_station(th_map, station)
     events = []
 
-    for i in range(len(df)):
-        c = str(df.at[i, "contents"])
-        cur_ts = df.at[i, "_ts"]
-        cur_end_time = str(df.at[i, "end_time"])
+    for row in rows:
+        event_type = row["_event_type"]
+        cur_ts = row["_ts"]
+        cur_end_time = row["end_time"]
 
-        if c.startswith(RESULT_PREFIXES):
-            pending_result_time = cur_end_time
-            pending_result_ts = cur_ts
+        if event_type == "MANUAL":
+            manual_block = 1
             continue
 
-        if c.startswith(AUTO_START_PREFIX):
-            if pending_result_ts is not None and pd.notna(pending_result_ts) and pd.notna(cur_ts) and (cur_ts > pending_result_ts):
+        if event_type == "RESULT":
+            if pending_result_ts is None:
+                pending_result_time = cur_end_time
+                pending_result_ts = cur_ts
+            else:
+                if manual_block == 0:
+                    pending_result_time = cur_end_time
+                    pending_result_ts = cur_ts
+            continue
+
+        if event_type == "AUTO_START":
+            if pending_result_ts is not None and cur_ts > pending_result_ts:
                 diff = (cur_ts - pending_result_ts).total_seconds()
                 if diff > 0 and diff > th_val:
                     _append_event(
@@ -825,27 +810,21 @@ def compute_events_for_station(
 
             pending_result_time = None
             pending_result_ts = None
+            manual_block = 0
             continue
 
-    out = pd.DataFrame(events) if len(events) > 0 else _empty_event_df()
+    dedup = {}
+    for ev in events:
+        key = (ev["end_day"], ev["station"], ev["from_time"], ev["to_time"])
+        if key not in dedup:
+            dedup[key] = ev
 
-    if not out.empty:
-        out["no_operation_time"] = pd.to_numeric(out["no_operation_time"], errors="coerce")
-        out = out[out["no_operation_time"].notna() & (out["no_operation_time"] > 0)].copy()
-
-        if not out.empty:
-            out["end_day"] = out["end_day"].astype(str)
-            out["station"] = out["station"].astype(str)
-            out["from_time"] = out["from_time"].astype(str)
-            out["to_time"] = out["to_time"].astype(str)
-            out = out.drop_duplicates(
-                subset=["end_day", "station", "from_time", "to_time"],
-                keep="first",
-            ).reset_index(drop=True)
+    out = list(dedup.values())
 
     new_state = {
         "last_id": max_id,
         "pending_result_time": pending_result_time,
+        "manual_block": manual_block,
     }
 
     return station, new_state, out
@@ -872,32 +851,58 @@ def ensure_target_table(engine):
         conn.execute(ddl)
 
 
-def upsert_events(engine, df_events: pd.DataFrame) -> int:
-    if df_events is None or df_events.empty:
-        return 0
-
-    df_events = df_events.copy()
-    df_events["no_operation_time"] = pd.to_numeric(df_events["no_operation_time"], errors="coerce")
-    df_events = df_events[df_events["no_operation_time"].notna() & (df_events["no_operation_time"] > 0)].copy()
-    if df_events.empty:
+def upsert_events(engine, events: list[dict]) -> int:
+    if not events:
         return 0
 
     ensure_target_table(engine)
 
-    upsert_sql = text(f"""
+    values = []
+    for ev in events:
+        try:
+            val = float(ev["no_operation_time"])
+        except Exception:
+            continue
+        if val <= 0:
+            continue
+        values.append((
+            str(ev["end_day"]),
+            str(ev["station"]),
+            str(ev["from_time"]),
+            str(ev["to_time"]),
+            round(val, 2),
+        ))
+
+    if not values:
+        return 0
+
+    sql = f"""
         INSERT INTO {SAVE_SCHEMA}.{SAVE_TABLE}
         (end_day, station, from_time, to_time, no_operation_time)
-        VALUES (:end_day, :station, :from_time, :to_time, :no_operation_time)
+        VALUES %s
         ON CONFLICT (end_day, station, from_time, to_time)
-        DO UPDATE SET no_operation_time = EXCLUDED.no_operation_time;
-    """)
+        DO UPDATE SET no_operation_time = EXCLUDED.no_operation_time
+    """
 
-    rows = df_events.to_dict(orient="records")
-    with engine.begin() as conn:
-        _session_guard(conn)
-        conn.execute(upsert_sql, rows)
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(f"SET work_mem TO '{WORK_MEM}'")
+        if STATEMENT_TIMEOUT_MS is not None:
+            cur.execute(f"SET statement_timeout TO {int(STATEMENT_TIMEOUT_MS)}")
+        execute_values(cur, sql, values, page_size=1000)
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        raw.close()
 
-    return len(rows)
+    return len(values)
 
 
 # =========================
@@ -915,47 +920,50 @@ def main_once(engine, th_map, force_first_fullscan: bool = False):
     else:
         cursors = load_cursors(engine, end_day=end_day)
 
-    station_payloads = {}
-
     log("[HEARTBEAT] loop begin end_day={0}".format(end_day), info="heartbeat")
 
-    for st, state in cursors.items():
-        last_id = state.get("last_id")
-        log("[LOAD-START] {0} {1} last_id={2}".format(end_day, st, last_id), info="load")
-        df_st, fetched_max_id = load_fct_incremental(engine, end_day=end_day, station=st, last_id=last_id)
-        station_payloads[st] = (df_st, fetched_max_id)
-        log("[LOAD-END] {0} {1} rows={2} max_id={3}".format(end_day, st, len(df_st), fetched_max_id), info="load")
+    station_payloads = {}
+    with ThreadPoolExecutor(max_workers=LOAD_WORKERS) as ex:
+        fut_map = {}
+        for st, state in cursors.items():
+            last_id = state.get("last_id")
+            log("[LOAD-START] {0} {1} last_id={2}".format(end_day, st, last_id), info="load")
+            fut = ex.submit(load_station_job, engine, end_day, st, last_id)
+            fut_map[fut] = st
+
+        for fut in as_completed(fut_map):
+            st, rows, fetched_max_id, elapsed = fut.result()
+            station_payloads[st] = (rows, fetched_max_id)
+            log("[LOAD-END] {0} {1} rows={2} max_id={3} elapsed={4:.3f}s".format(
+                end_day, st, len(rows), fetched_max_id, elapsed
+            ), info="load")
 
     all_events = []
     state_updates = []
 
-    for st, payload in station_payloads.items():
-        st_df, fetched_max_id = payload
+    for st in ("FCT1", "FCT2", "FCT3", "FCT4"):
+        rows, fetched_max_id = station_payloads.get(st, ([], cursors[st].get("last_id")))
         prev_state = cursors.get(st, _fresh_empty_state())
 
         st_name, new_state, ev = compute_events_for_station(
             station=st,
             end_day=end_day,
-            df_station=st_df,
+            rows=rows,
             th_map=th_map,
             prev_state=prev_state,
             fetched_max_id=fetched_max_id,
         )
 
-        if ev is not None and not ev.empty:
-            all_events.append(ev)
+        if ev:
+            all_events.extend(ev)
             log("[EVT] {0}: events={1}".format(st_name, len(ev)), info="evt")
         else:
             log("[EVT] {0}: events=0".format(st_name), info="evt")
 
         state_updates.append((st_name, new_state))
 
-    if len(all_events) > 0:
-        df_save = pd.concat(all_events, ignore_index=True)
-        df_save["no_operation_time"] = pd.to_numeric(df_save["no_operation_time"], errors="coerce")
-        df_save = df_save[df_save["no_operation_time"].notna() & (df_save["no_operation_time"] > 0)].copy()
-
-        inserted = upsert_events(engine, df_save)
+    inserted = upsert_events(engine, all_events)
+    if inserted > 0:
         log("[SAVE] {0}.{1}: upsert rows={2}".format(SAVE_SCHEMA, SAVE_TABLE, inserted), info="save")
     else:
         log("[SAVE] {0}.{1}: no events -> skip".format(SAVE_SCHEMA, SAVE_TABLE), info="save")
@@ -963,11 +971,12 @@ def main_once(engine, th_map, force_first_fullscan: bool = False):
     upsert_cursor_states_batch(engine, end_day=end_day, state_updates=state_updates)
     for st, state in state_updates:
         log(
-            "[CURSOR] {0} {1} -> last_id={2} pending_result_time={3}".format(
+            "[CURSOR] {0} {1} -> last_id={2} pending_result_time={3} manual_block={4}".format(
                 end_day,
                 st,
                 state.get("last_id"),
                 state.get("pending_result_time"),
+                state.get("manual_block"),
             ),
             info="cursor"
         )
