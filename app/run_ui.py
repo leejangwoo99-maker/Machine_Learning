@@ -4,86 +4,184 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 from pathlib import Path
+from datetime import datetime
+
+# ------------------------------------------------------------------
+# ✅ 매우 중요:
+# matplotlib가 TkAgg 같은 GUI backend를 잡기 전에 먼저 Agg로 고정
+# exe/streamlit 환경에서 tkinter init.tcl 오류 방지
+# ------------------------------------------------------------------
+os.environ["MPLBACKEND"] = "Agg"
 
 from streamlit.web import cli as stcli
 
 
 def _is_frozen() -> bool:
-    return bool(getattr(sys, "frozen", False))
+    return bool(getattr(sys, "frozen", False)) or ("__compiled__" in globals())
 
 
-def _is_pkg_dir(p: Path) -> bool:
-    return p.is_dir() and (p / "__init__.py").is_file()
+def _exe_dir() -> Path:
+    return Path(sys.executable).resolve().parent if _is_frozen() else Path(__file__).resolve().parent
 
 
-def _find_root_dir(start: Path) -> Path:
-    """
-    start부터 위로 올라가며 <root>/app/__init__.py 를 찾는다.
-    run_ui.exe가 run_ui.dist 안에 있어도 정상적으로 <배포루트>를 찾도록.
-    """
-    cur = start.resolve()
-    for _ in range(20):
-        app_dir = cur / "app"
-        if _is_pkg_dir(app_dir):
-            return cur
-        if cur.parent == cur:
+def _log_path() -> Path:
+    return _exe_dir() / "run_ui_boot.log"
+
+
+def _log(msg: str) -> None:
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_log_path(), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _deploy_root_candidates() -> list[Path]:
+    exe_dir = _exe_dir()
+    cands: list[Path] = [exe_dir, exe_dir.parent]
+
+    env_root = os.getenv("APTIV_ROOT", "").strip()
+    if env_root:
+        try:
+            cands.insert(0, Path(env_root).resolve())
+        except Exception:
+            pass
+
+    out: list[Path] = []
+    for p in cands:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if rp not in out:
+            out.append(rp)
+    return out
+
+
+def _load_env_fallback() -> None:
+    env_files: list[Path] = []
+    for base in _deploy_root_candidates():
+        env_files.append(base / "app" / ".env")
+        env_files.append(base / ".env")
+
+    target = None
+    for f in env_files:
+        if f.is_file():
+            target = f
             break
-        cur = cur.parent
-    return start.resolve().parent
+
+    _log(f"ENV selected: {target}")
+
+    if target is None:
+        return
+
+    try:
+        for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and (k not in os.environ):
+                os.environ[k] = v
+    except Exception as e:
+        _log(f"ENV load error: {e}")
 
 
-def _root_dir() -> Path:
-    if _is_frozen():
-        # exe가 있는 dist 폴더에서 출발해서 배포 루트를 탐색
-        return _find_root_dir(Path(sys.executable).resolve().parent)
-    return Path(__file__).resolve().parent.parent
+def _apply_sys_path() -> None:
+    for base in _deploy_root_candidates():
+        s = str(base)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+
+
+def _find_streamlit_entry() -> Path:
+    for base in _deploy_root_candidates():
+        p = base / "app" / "streamlit_app" / "app.py"
+        if p.is_file():
+            _log(f"streamlit entry found: {p}")
+            return p
+
+    tried = "\n".join(
+        [f"  - {base / 'app' / 'streamlit_app' / 'app.py'}" for base in _deploy_root_candidates()]
+    )
+    raise FileNotFoundError(
+        "Streamlit entry not found. Tried:\n"
+        f"{tried}\n\n"
+        "해결 방법(필수): run_ui 빌드 후 app/streamlit_app 폴더가 dist 안에 복사되어야 합니다.\n"
+    )
+
+
+def _sanitize_streamlit_env() -> None:
+    # 포트/주소는 .env 기본값 사용
+    os.environ.pop("STREAMLIT_SERVER_ADDRESS", None)
+    os.environ.pop("STREAMLIT_SERVER_PORT", None)
+
+    # 개발 모드 OFF
+    os.environ["STREAMLIT_GLOBAL_DEVELOPMENT_MODE"] = "false"
+
+    # launcher가 브라우저를 열어주므로 여기서는 headless 유지
+    os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+    os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+
+    # matplotlib backend도 환경변수로 재확인
+    os.environ["MPLBACKEND"] = "Agg"
+
+    _log(f"STREAMLIT_GLOBAL_DEVELOPMENT_MODE={os.environ.get('STREAMLIT_GLOBAL_DEVELOPMENT_MODE')}")
+    _log(f"STREAMLIT_SERVER_ADDRESS={os.environ.get('STREAMLIT_SERVER_ADDRESS')}")
+    _log(f"STREAMLIT_SERVER_PORT={os.environ.get('STREAMLIT_SERVER_PORT')}")
+    _log(f"MPLBACKEND={os.environ.get('MPLBACKEND')}")
+
+
+def _force_matplotlib_agg() -> None:
+    """
+    exe 환경에서 matplotlib가 Tk backend를 잡지 않도록
+    한 번 더 안전하게 Agg로 강제.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        try:
+            backend = matplotlib.get_backend()
+        except Exception:
+            backend = "(unknown)"
+        _log(f"matplotlib backend forced: {backend}")
+    except Exception as e:
+        _log(f"matplotlib force backend skipped/error: {e}")
 
 
 def main() -> None:
-    root = _root_dir()
+    _log("run_ui start")
+    _load_env_fallback()
+    _apply_sys_path()
 
-    # Streamlit entry: <root>/app/streamlit_app/app.py
-    app_path = root / "app" / "streamlit_app" / "app.py"
-
-    # 혹시 사용자가 app 폴더를 dist 안에 넣는 구조로 배치했을 때도 대비(보조 경로)
-    if not app_path.exists():
-        alt = Path(sys.executable).resolve().parent / "app" / "streamlit_app" / "app.py"
-        if alt.exists():
-            app_path = alt
-
-    if not app_path.exists():
-        raise FileNotFoundError(
-            f"Streamlit entry not found: {app_path}\n"
-            f"현재 root 추정값: {root}\n"
-            f"해결: 배포 루트에 app/streamlit_app/app.py 가 존재해야 합니다.\n"
-            f"(Nuitka standalone이면 app/streamlit_app 폴더를 include-data-dir로 포함하거나,\n"
-            f" 배포 폴더에 app 폴더를 함께 복사해 두세요.)"
-        )
-
-    # sys.path에 root 추가(상대 import 안정)
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-
-    host = os.getenv("UI_HOST", "127.0.0.1")
-    port = os.getenv("UI_PORT", "8501")
+    app_path = _find_streamlit_entry()
+    _sanitize_streamlit_env()
+    _force_matplotlib_agg()
 
     sys.argv = [
         "streamlit",
         "run",
         str(app_path),
-        "--server.address",
-        str(host),
-        "--server.port",
-        str(port),
-        "--server.headless",
-        "true",
-        "--browser.gatherUsageStats",
-        "false",
+        "--server.headless", "true",
+        "--browser.gatherUsageStats", "false",
+        "--global.developmentMode", "false",
     ]
+    _log(f"sys.argv={sys.argv}")
 
-    stcli.main()
+    raise SystemExit(stcli.main())
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        _log("FATAL")
+        _log(traceback.format_exc())
+        print("[FATAL] run_ui crashed")
+        print(traceback.format_exc())
+        raise
