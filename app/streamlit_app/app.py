@@ -4,7 +4,24 @@ from __future__ import annotations
 import streamlit as st
 
 # ✅ scheduler/status (snap 모드에서는 실행 안 함)
-from app.job.snapshot_mailer import start_snapshot_scheduler_once, get_snapshot_scheduler_status
+#    UI에서 snapshot_mailer import가 실패해도 앱 전체는 뜨도록 보호
+try:
+    from app.job.snapshot_mailer import start_snapshot_scheduler_once, get_snapshot_scheduler_status
+    _SNAP_IMPORT_OK = True
+    _SNAP_IMPORT_ERR = ""
+except Exception as e:
+    _SNAP_IMPORT_OK = False
+    _SNAP_IMPORT_ERR = str(e)
+
+    def start_snapshot_scheduler_once():
+        return None
+
+    def get_snapshot_scheduler_status():
+        return {
+            "state": "unavailable",
+            "ts": None,
+            "note": _SNAP_IMPORT_ERR,
+        }
 
 
 def _qp_get(name: str) -> str:
@@ -92,6 +109,7 @@ def _render_scheduler_badge() -> None:
         "success": "🟢 success",
         "error": "🔴 error",
         "idle": "⚪ idle",
+        "unavailable": "⚫ unavailable",
     }.get(state, f"⚪ {state}")
 
     st.sidebar.write(badge)
@@ -124,8 +142,10 @@ def main() -> None:
     _apply_snapshot_query_params()
 
     # ✅ 스케줄러는 "UI 모드에서만" 시작 (snap=1에서는 절대 시작하지 않음)
+    # ✅ import 성공한 경우에만 시작 시도
     if not snap:
-        start_snapshot_scheduler_once()
+        if _SNAP_IMPORT_OK:
+            start_snapshot_scheduler_once()
         _render_scheduler_badge()
 
     target_key = _page_key()

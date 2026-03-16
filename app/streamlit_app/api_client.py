@@ -14,7 +14,7 @@ import requests
 # ---------------------------------------------------------
 API = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").strip().rstrip("/")
 TIMEOUT = float(os.getenv("API_TIMEOUT_SEC", "90"))
-ADMIN_PASS = os.getenv("ADMIN_PASS", "") #비밀번호는 보안사항
+ADMIN_PASS = os.getenv("ADMIN_PASS", "leejangwoo1!") #비밀번호는 보안사항
 
 _session = requests.Session()
 
