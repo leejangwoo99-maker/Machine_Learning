@@ -15,6 +15,14 @@ import contextlib
 import traceback
 
 import matplotlib
+
+# =========================================================
+# ✅ 매우 중요:
+# exe + streamlit 환경에서 matplotlib가 TkAgg/Tk backend를 잡지 않도록
+# pyplot import 전에 반드시 Agg 강제
+# =========================================================
+matplotlib.use("Agg", force=True)
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import pandas as pd
@@ -66,7 +74,60 @@ SNAPSHOT_BTN_KEY = "btn_prod_abnormal_stop"
 
 
 # =========================================================
-# ✅ "희미해짐(디밍)" 제거 + 클릭 블로킹 방지 (강화본)
+# ✅ page config 중복 호출 방어
+# =========================================================
+def safe_set_page_config(**kwargs):
+    try:
+        st.set_page_config(**kwargs)
+    except Exception:
+        pass
+
+
+# =========================================================
+# ✅ dataframe/pyarrow 실패 시 안전 표시용 helper
+# =========================================================
+def safe_show_df(
+    df_or_obj: Any,
+    *,
+    raw_df: Optional[pd.DataFrame] = None,
+    use_container_width: bool = True,
+    hide_index: bool = False,
+    height: Optional[int] = None,
+):
+    try:
+        kwargs = {"use_container_width": use_container_width}
+        if height is not None:
+            kwargs["height"] = height
+        if hide_index:
+            kwargs["hide_index"] = hide_index
+        st.dataframe(df_or_obj, **kwargs)
+        return
+    except Exception:
+        pass
+
+    base_df = raw_df
+    if base_df is None and isinstance(df_or_obj, pd.DataFrame):
+        base_df = df_or_obj
+
+    if base_df is not None:
+        try:
+            st.table(base_df)
+            return
+        except Exception:
+            pass
+
+        try:
+            html = base_df.to_html(index=not hide_index)
+            st.markdown(html, unsafe_allow_html=True)
+            return
+        except Exception:
+            pass
+
+    st.warning("표 렌더링 중 오류가 발생했습니다.")
+
+
+# =========================================================
+# ✅ "희미해짐(디밍)" 제거 + 클릭 블로킹 방지
 # =========================================================
 def inject_no_dim_fade_keep_loading():
     components.html(
@@ -209,12 +270,11 @@ def _qparam_bool(name: str) -> bool:
 
 
 def _is_snap() -> bool:
-    # print-to-pdf 모드: URL에 snap=1
     return _qparam_bool("snap")
 
 
 # =========================================================
-# ✅ ENV helpers (운영에서 .env로 조절)
+# ✅ ENV helpers
 # =========================================================
 def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
     raw = os.getenv(name, "")
@@ -224,7 +284,7 @@ def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
     if not s:
         return default
     try:
-        v = int(float(s))  # "5.0" 같은 값도 허용
+        v = int(float(s))
     except Exception:
         return default
     if v < min_v:
@@ -252,22 +312,27 @@ def _env_float(name: str, default: float, min_v: float, max_v: float) -> float:
     return v
 
 
-# ✅ 주기 분리 (기본 5초, 운영에서 ST_*로 조절)
 SYNC_EVERY_SEC = _env_int("ST_SYNC_SEC", default=5, min_v=1, max_v=60)
 CHART_EVERY_SEC = _env_int("ST_CHART_SEC", default=5, min_v=1, max_v=60)
 NONOP_EVERY_SEC = _env_int("ST_NONOP_SEC", default=5, min_v=1, max_v=60)
 
-# ✅ changes API 호출 상한 (기본 2000)
 NONOP_CHANGES_LIMIT = _env_int("ST_NONOP_CHANGES_LIMIT", default=2000, min_v=100, max_v=20000)
 
-# ✅ API timeout
 SECTIONS_LATEST_TIMEOUT = _env_float("ST_SECTIONS_LATEST_TIMEOUT", default=8.0, min_v=1.0, max_v=30.0)
 NONOP_WINDOW_TIMEOUT = _env_float("ST_NONOP_WINDOW_TIMEOUT", default=8.0, min_v=1.0, max_v=30.0)
 NONOP_CHANGES_TIMEOUT = _env_float("ST_NONOP_CHANGES_TIMEOUT", default=4.0, min_v=1.0, max_v=30.0)
 NONOP_UPDATE_TIMEOUT = _env_float("ST_NONOP_UPDATE_TIMEOUT", default=10.0, min_v=1.0, max_v=60.0)
 
-# ✅ 편집 중 lock(초) - 요청: 15초 고정 (env 무시)
-NONOP_EDIT_LOCK_SEC = 15.0
+# ✅ 기존 15초 → 축소
+NONOP_EDIT_LOCK_SEC = 5.0
+
+# ✅ stuck watchdog
+NONOP_LOCK_STUCK_SEC = 60.0
+NONOP_SAVE_STUCK_SEC = 60.0
+NONOP_STALE_RELOAD_SEC = 180.0
+
+# ✅ 비가동 상세 높이 고정 + 내부 스크롤
+NONOP_TABLE_HEIGHT = _env_int("ST_NONOP_TABLE_HEIGHT", default=440, min_v=260, max_v=1200)
 
 
 # =========================================================
@@ -278,6 +343,10 @@ def _rerun_fragment_safe():
         st.rerun(scope="fragment")
     except TypeError:
         st.rerun()
+
+
+def _rerun_full_app():
+    st.rerun()
 
 
 def now_kst() -> datetime:
@@ -294,19 +363,55 @@ def detect_shift(dt: datetime) -> str:
     return "night"
 
 
-def get_window(dt: datetime, shift: str) -> Tuple[datetime, datetime]:
+def scope_from_datetime(dt: datetime) -> Tuple[str, str]:
+    """
+    현재 시각(dt) 기준으로 생산일(prod_day) + shift를 계산한다.
+
+    규칙
+    - 주간: 해당 날짜 08:30 ~ 20:29:59  -> prod_day = 당일
+    - 야간: 해당 날짜 20:30 ~ 익일 08:29:59
+      * 20:30 이후       -> prod_day = 당일
+      * 00:00 ~ 08:29:59 -> prod_day = 전일
+    """
+    shift = detect_shift(dt)
+
     if shift == "day":
-        start = dt.replace(hour=8, minute=30, second=0, microsecond=0)
-        end = dt.replace(hour=20, minute=30, second=0, microsecond=0)
+        return dt.strftime("%Y%m%d"), "day"
+
+    if dt.hour < 8 or (dt.hour == 8 and dt.minute < 30):
+        prod_day = (dt - timedelta(days=1)).strftime("%Y%m%d")
+        return prod_day, "night"
+
+    return dt.strftime("%Y%m%d"), "night"
+
+
+def current_live_scope_kst() -> Tuple[str, str]:
+    return scope_from_datetime(now_kst())
+
+
+def get_scope_window(prod_day: str, shift: str) -> Tuple[datetime, datetime]:
+    """
+    prod_day + shift 기준의 실제 시간 window 반환
+    """
+    base_date = datetime.strptime(str(prod_day), "%Y%m%d").replace(tzinfo=KST)
+
+    if shift == "day":
+        start = base_date.replace(hour=8, minute=30, second=0, microsecond=0)
+        end = base_date.replace(hour=20, minute=30, second=0, microsecond=0)
         return start, end
 
-    if dt.time() >= dt.replace(hour=20, minute=30, second=0, microsecond=0).time():
-        start = dt.replace(hour=20, minute=30, second=0, microsecond=0)
-        end = (start + timedelta(days=1)).replace(hour=8, minute=30, second=0, microsecond=0)
-    else:
-        start = (dt - timedelta(days=1)).replace(hour=20, minute=30, second=0, microsecond=0)
-        end = dt.replace(hour=8, minute=30, second=0, microsecond=0)
+    start = base_date.replace(hour=20, minute=30, second=0, microsecond=0)
+    end = (base_date + timedelta(days=1)).replace(hour=8, minute=30, second=0, microsecond=0)
     return start, end
+
+
+def get_window(dt: datetime, shift: str) -> Tuple[datetime, datetime]:
+    """
+    기존 호출부 호환용 wrapper
+    dt 자체의 달력 날짜가 아니라, dt로부터 계산한 prod_day를 기준으로 window를 반환한다.
+    """
+    prod_day, _ = scope_from_datetime(dt)
+    return get_scope_window(prod_day, shift)
 
 
 def parse_hms(base_start: datetime, s: Any) -> Optional[datetime]:
@@ -343,7 +448,6 @@ def parse_hms(base_start: datetime, s: Any) -> Optional[datetime]:
 
     dt = base_start.replace(hour=hh, minute=mm, second=sec_i, microsecond=micro)
 
-    # 야간: 00~11시는 다음날로
     if base_start.hour == 20 and hh < 12:
         dt = dt + timedelta(days=1)
     return dt
@@ -408,8 +512,61 @@ def normalize_day_yyyymmdd(v: Any) -> str:
     return digits[:8] if len(digits) >= 8 else ""
 
 
+def _handle_scope_rollover_if_needed(current_end_day: str, current_shift: str) -> bool:
+    if _is_snap():
+        return False
+
+    new_end_day, new_shift = current_live_scope_kst()
+    old_scope = f"{current_end_day}:{current_shift}"
+    new_scope = f"{new_end_day}:{new_shift}"
+
+    if old_scope == new_scope:
+        return False
+
+    _perf_push(
+        "scope_rollover_detected",
+        0.0,
+        {
+            "old_scope": old_scope,
+            "new_scope": new_scope,
+        },
+    )
+
+    st.session_state["section_tokens"] = {}
+    st.session_state["alarm_token_effective"] = ""
+    st.session_state["pending_alarm_pk"] = ""
+    st.session_state["pending_alarm_msg"] = ""
+
+    st.session_state["active_modal"] = ""
+    st.session_state["modal_email"] = False
+    st.session_state["modal_barcode"] = False
+    st.session_state["modal_planned"] = False
+    st.session_state["modal_email_need_load"] = True
+    st.session_state["modal_barcode_need_load"] = True
+    st.session_state["modal_planned_need_load"] = True
+
+    st.session_state["nonop_lock_until_ts"] = 0.0
+    st.session_state["nonop_is_saving"] = False
+    st.session_state["nonop_save_started_ts"] = 0.0
+    st.session_state["nonop_editor_snap"] = ""
+    st.session_state["nonop_last_poll_ts"] = 0.0
+    st.session_state["nonop_last_success_poll_ts"] = 0.0
+    st.session_state["nonop_last_sync_ts"] = 0.0
+
+    _nonop_reset_if_needed(new_end_day, new_shift)
+    _planned_reset_if_needed(new_end_day, new_shift)
+
+    st.session_state.worker_rows_cache = None
+    st.session_state.master_rows_cache = None
+    st.session_state["last_scope"] = new_scope
+    st.session_state["last_shift"] = new_shift
+
+    _rerun_full_app()
+    return True
+
+
 # =========================================================
-# ✅ Alarm scope (client-side / fallback filter용)
+# ✅ Alarm scope
 # =========================================================
 def _parse_day_to_date(v: Any) -> Optional[date]:
     s = str(v or "").strip()
@@ -455,14 +612,6 @@ def _parse_time_hms(v: Any) -> Optional[Tuple[int, int, int]]:
 
 
 def alarm_scope_from_row(row: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    return: (prod_day_yyyymmdd, shift_type)
-    shift rule:
-      - day   : 08:30 ~ 20:30
-      - night : otherwise
-        * night & time < 08:30 => prod_day = (end_day - 1)
-        * night & time >= 20:30 => prod_day = end_day
-    """
     d = _parse_day_to_date(row.get("end_day") or row.get("prod_day") or "")
     if d is None:
         dd = normalize_day_yyyymmdd(row.get("end_day") or row.get("prod_day") or "")
@@ -494,12 +643,12 @@ def _perf_push(name: str, ms: float, extra: Optional[Dict[str, Any]] = None):
     if extra:
         item.update(extra)
     st.session_state.perf_logs.append(item)
-    if len(st.session_state.perf_logs) > 120:
-        st.session_state.perf_logs = st.session_state.perf_logs[-120:]
+    if len(st.session_state.perf_logs) > 160:
+        st.session_state.perf_logs = st.session_state.perf_logs[-160:]
 
 
 # =========================================================
-# Alarm helpers (pk/message)
+# Alarm helpers
 # =========================================================
 def alarm_message(station: str, sparepart: str, type_alarm: str) -> str:
     stn = station or "Unknown"
@@ -526,11 +675,7 @@ def alarm_pk_from_token(row: Dict[str, Any]) -> str:
 
 
 # =========================================================
-# ✅ 생산 비정상 STOP 실행 (snapshot_mailer.run_snapshot_and_mail)
-# - 요청 커맨드:
-#   cd C:\Users\user\PycharmProjects\PythonProject
-#   python -c "from app.job.snapshot_mailer import run_snapshot_and_mail; run_snapshot_and_mail()"
-# - Streamlit 내부에서는 동일 동작을 "직접 import 호출"로 수행(쉘/경로 의존 최소화)
+# ✅ 생산 비정상 STOP 실행
 # =========================================================
 def _run_production_abnormal_stop() -> Dict[str, Any]:
     t0 = time_mod.perf_counter()
@@ -539,17 +684,14 @@ def _run_production_abnormal_stop() -> Dict[str, Any]:
 
     try:
         with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-            # ✅ [FIX] Windows + Python 3.13 + Streamlit 환경에서 Playwright subprocess NotImplementedError 방지
-            # - Playwright(sync) 내부가 asyncio subprocess를 사용 → Windows는 Proactor loop 정책이 필요할 수 있음
             if sys.platform.startswith("win"):
                 try:
-                    import asyncio  # noqa: WPS433
+                    import asyncio
                     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
                 except Exception:
                     pass
 
-            # 동일 프로세스 내 실행 (가장 안정적)
-            from app.job.snapshot_mailer import run_snapshot_and_mail  # noqa: WPS433
+            from app.job.snapshot_mailer import run_snapshot_and_mail
 
             run_snapshot_and_mail()
 
@@ -574,7 +716,7 @@ def _run_production_abnormal_stop() -> Dict[str, Any]:
 
 
 # =========================================================
-# ✅ SSE alarm (01페이지에도 적용)
+# ✅ SSE alarm
 # =========================================================
 def _api_base_url() -> str:
     for attr in ("API_BASE_URL", "BASE_URL", "API_URL", "API"):
@@ -585,15 +727,6 @@ def _api_base_url() -> str:
 
 
 def _mount_alarm_sse(cur_day: str, cur_shift: str):
-    """
-    ✅ SSE 알람 구독 (01페이지)
-    - Python f-string 안에서 JS 템플릿리터럴 `${...}` 충돌(NameError) 방지:
-      -> f-string 금지, json.dumps로만 값 주입
-    - scope 필터: (prod_day, shift_type) 일치하는 알람만 표시
-    - allowed type: 권고/긴급/교체
-    - ack: sessionStorage로 pk별 확인(재표시 방지)
-    - modal: 비차단(pointer-events: none overlay / box는 auto)
-    """
     base = _api_base_url().rstrip("/")
 
     admin_pass = (getattr(api, "ADMIN_PASS", "") or "").strip() or (os.getenv("ADMIN_PASS", "") or "").strip()
@@ -601,7 +734,6 @@ def _mount_alarm_sse(cur_day: str, cur_shift: str):
 
     sse_url = f"{base}/events/stream?end_day={cur_day}&shift_type={cur_shift}&sections=alarm{token_qs}"
 
-    # ✅ JS에 안전하게 값 주입
     js_url = json.dumps(sse_url)
     js_day = json.dumps(str(cur_day))
     js_shift = json.dumps(str(cur_shift))
@@ -640,7 +772,6 @@ def _mount_alarm_sse(cur_day: str, cur_shift: str):
         const s = String(v || "").trim();
         if (!s) return null;
 
-        // ISO
         if (s.includes("T")) {
           try {
             const dt = new Date(s);
@@ -677,7 +808,6 @@ def _mount_alarm_sse(cur_day: str, cur_shift: str):
         return String(y) + m + d;
       }
 
-      // ✅ Python의 alarm_scope_from_row와 동일 규칙
       function computeScopeFromRow(row) {
         const endDay = normDay(row.end_day || row.prod_day || "");
         const t = parseHms(row.end_time || row.time || "");
@@ -689,7 +819,6 @@ def _mount_alarm_sse(cur_day: str, cur_shift: str):
         const isDay = (hh > 8 && hh < 20) || (hh === 8 && mm >= 30) || (hh === 20 && mm < 30);
         if (isDay) return { prod_day: endDay, shift: "day" };
 
-        // night & time < 08:30 => prod_day = (end_day - 1)
         if (hh < 8 || (hh === 8 && mm < 30)) {
           const dt = yyyymmddToDate(endDay);
           if (!dt) return { prod_day: endDay, shift: "night" };
@@ -697,7 +826,6 @@ def _mount_alarm_sse(cur_day: str, cur_shift: str):
           return { prod_day: dateToYyyymmdd(dt), shift: "night" };
         }
 
-        // night & time >= 20:30 => prod_day = end_day
         return { prod_day: endDay, shift: "night" };
       }
 
@@ -911,14 +1039,12 @@ def _mount_alarm_sse(cur_day: str, cur_shift: str):
     </script>
     """
 
-    # ✅ placeholder 치환(파이썬 f-string 사용 X)
     js = js.replace("__URL__", js_url).replace("__DAY__", js_day).replace("__SHIFT__", js_shift)
-
     components.html(js, height=0)
 
 
 # =========================================================
-# Alarm modal (기존 유지 - fallback)
+# Alarm modal fallback
 # =========================================================
 def show_alarm_modal_no_rerun(message: str, pk: str):
     safe_msg = (
@@ -1101,7 +1227,7 @@ def _inject_modal_dom_watchdog():
 
 
 # =========================================================
-# (안전망) query param 기반 close_modal 핸들러
+# close_modal param handler
 # =========================================================
 def _qparam_has(name: str) -> bool:
     try:
@@ -1170,6 +1296,22 @@ def nonop_key(row: Dict[str, Any]) -> str:
     )
 
 
+def _nonop_row_uid(row: Dict[str, Any]) -> str:
+    rid = str(row.get("id", "") or "").strip()
+    if rid:
+        return f"id_{rid}"
+    raw = nonop_key(row)
+    return "k_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _nonop_reason_state_key(end_day: str, shift: str, row_uid: str) -> str:
+    return f"nonop_reason_{end_day}_{shift}_{row_uid}"
+
+
+def _nonop_spare_state_key(end_day: str, shift: str, row_uid: str) -> str:
+    return f"nonop_spare_{end_day}_{shift}_{row_uid}"
+
+
 def nonop_sort_ts(prod_day: str, shift: str, row: Dict[str, Any], win_start: datetime) -> float:
     ft = parse_any_ts(win_start, row.get("from_ts", row.get("from_time")))
     if ft is None:
@@ -1196,6 +1338,10 @@ def _nonop_reset_if_needed(prod_day: str, shift: str):
         st.session_state.nonop_cursor = {"max_id": 0, "max_updated_at": "1970-01-01T00:00:00+09:00"}
 
         st.session_state.nonop_last_poll_ts = 0.0
+        st.session_state.nonop_last_success_poll_ts = 0.0
+        st.session_state.nonop_last_sync_ts = 0.0
+        st.session_state.nonop_save_started_ts = 0.0
+        st.session_state.nonop_render_rev = 0
 
         st.session_state["nonop_is_saving"] = False
         st.session_state["nonop_editor_snap"] = ""
@@ -1242,7 +1388,7 @@ def _merge_nonop_changes(prod_day: str, shift: str, changes: List[Dict[str, Any]
             keyset.add(k)
             buf.insert(0, r)
 
-    win_start, _ = get_window(now_kst(), shift)
+    win_start, _ = get_scope_window(prod_day, shift)
     buf.sort(key=lambda rr: nonop_sort_ts(prod_day, shift, rr, win_start), reverse=True)
     if len(buf) > NONOP_MAX_BUFFER:
         buf = buf[:NONOP_MAX_BUFFER]
@@ -1269,7 +1415,7 @@ def _merge_nonop_changes(prod_day: str, shift: str, changes: List[Dict[str, Any]
         else:
             chart_rows.append(r)
 
-    win_start, _ = get_window(now_kst(), shift)
+    win_start, _ = get_scope_window(prod_day, shift)
 
     def _chart_sort_key(x: Dict[str, Any]) -> float:
         dt = parse_any_ts(win_start, x.get("from_ts", x.get("from_time")))
@@ -1278,6 +1424,28 @@ def _merge_nonop_changes(prod_day: str, shift: str, changes: List[Dict[str, Any]
     chart_rows.sort(key=_chart_sort_key)
     st.session_state.nonop_chart_rows = chart_rows
     st.session_state.nonop_chart_loaded_once = True
+    st.session_state.nonop_render_rev = int(st.session_state.get("nonop_render_rev", 0) or 0) + 1
+
+
+def _nonop_watchdog_unstick():
+    now_ts = float(time_mod.time())
+
+    lock_until = float(st.session_state.get("nonop_lock_until_ts", 0.0) or 0.0)
+    if lock_until > 0 and (lock_until - now_ts) > NONOP_LOCK_STUCK_SEC:
+        st.session_state["nonop_lock_until_ts"] = 0.0
+        _perf_push("nonop_watchdog_clear_future_lock", 0.0, {"old_lock_until": lock_until})
+
+    save_started_ts = float(st.session_state.get("nonop_save_started_ts", 0.0) or 0.0)
+    if bool(st.session_state.get("nonop_is_saving", False)):
+        age = now_ts - save_started_ts if save_started_ts > 0 else 999999.0
+        if age >= NONOP_SAVE_STUCK_SEC:
+            st.session_state["nonop_is_saving"] = False
+            st.session_state["nonop_lock_until_ts"] = 0.0
+            st.session_state["nonop_save_started_ts"] = 0.0
+            _perf_push("nonop_watchdog_clear_stuck_save", 0.0, {"save_age_sec": round(age, 1)})
+
+    if lock_until > 0 and now_ts >= lock_until:
+        st.session_state["nonop_lock_until_ts"] = 0.0
 
 
 def _nonop_load_window_once(prod_day: str, shift: str) -> Dict[str, Any]:
@@ -1294,7 +1462,7 @@ def _nonop_load_window_once(prod_day: str, shift: str) -> Dict[str, Any]:
         if not isinstance(items, list):
             items = []
 
-        win_start, _ = get_window(now_kst(), shift)
+        win_start, _ = get_scope_window(prod_day, shift)
 
         def _chart_sort_key(x: Dict[str, Any]) -> float:
             dt = parse_any_ts(win_start, x.get("from_ts", x.get("from_time")))
@@ -1330,6 +1498,8 @@ def _nonop_load_window_once(prod_day: str, shift: str) -> Dict[str, Any]:
             if mu:
                 cur["max_updated_at"] = mu
         st.session_state.nonop_cursor = cur
+        st.session_state.nonop_last_success_poll_ts = float(time_mod.time())
+        st.session_state.nonop_render_rev = int(st.session_state.get("nonop_render_rev", 0) or 0) + 1
 
         return {"ok": True, "count": len(items)}
     except Exception as e:
@@ -1350,7 +1520,15 @@ def _nonop_apply_changes_if_needed(prod_day: str, shift: str, new_cursor: Dict[s
 
     lock_until = float(st.session_state.get("nonop_lock_until_ts", 0.0) or 0.0)
     if time_mod.time() < lock_until:
-        st.session_state.nonop_cursor = new_cursor
+        _perf_push(
+            "nonop_apply_skip_lock",
+            0.0,
+            {
+                "cur_max_id": int(cur.get("max_id", 0) or 0),
+                "new_max_id": int(new_cursor.get("max_id", 0) or 0),
+                "lock_until": lock_until,
+            },
+        )
         return {"ok": True, "changed": True, "skipped_by_lock": True}
 
     since_id = int(cur.get("max_id", 0) or 0)
@@ -1380,6 +1558,7 @@ def _nonop_apply_changes_if_needed(prod_day: str, shift: str, new_cursor: Dict[s
         _perf_push("merge_nonop_changes(token)", merge_ms, {"fetched": len(rows)})
 
         st.session_state.nonop_cursor = new_cursor
+        st.session_state.nonop_last_success_poll_ts = float(time_mod.time())
         return {"ok": True, "changed": True, "fetched": len(rows)}
     except Exception as e:
         api_ms = (time_mod.perf_counter() - t0) * 1000.0
@@ -1388,8 +1567,11 @@ def _nonop_apply_changes_if_needed(prod_day: str, shift: str, new_cursor: Dict[s
 
 
 def _nonop_poll_changes(prod_day: str, shift: str) -> Dict[str, Any]:
+    _nonop_watchdog_unstick()
+
     lock_until = float(st.session_state.get("nonop_lock_until_ts", 0.0) or 0.0)
     if time_mod.time() < lock_until:
+        _perf_push("nonop_poll_skip_lock", 0.0, {"lock_until": lock_until})
         return {"ok": True, "skipped_by_lock": True}
 
     cur = st.session_state.get("nonop_cursor", {"max_id": 0, "max_updated_at": "1970-01-01T00:00:00+09:00"})
@@ -1398,6 +1580,8 @@ def _nonop_poll_changes(prod_day: str, shift: str) -> Dict[str, Any]:
 
     since_id = int(cur.get("max_id", 0) or 0)
     since_u = str(cur.get("max_updated_at", "1970-01-01T00:00:00+09:00") or "")
+
+    _perf_push("nonop_poll_try", 0.0, {"since_id": since_id, "since_updated_at": since_u[-19:]})
 
     t0 = time_mod.perf_counter()
     try:
@@ -1428,6 +1612,7 @@ def _nonop_poll_changes(prod_day: str, shift: str) -> Dict[str, Any]:
             if mu:
                 cur["max_updated_at"] = mu
         st.session_state.nonop_cursor = cur
+        st.session_state.nonop_last_success_poll_ts = float(time_mod.time())
 
         _perf_push("api_nonop_changes(poll)", api_ms, {"fetched": len(rows), "since_id": since_id})
         _perf_push("merge_nonop_changes(poll)", merge_ms, {"fetched": len(rows)})
@@ -1479,7 +1664,7 @@ def _planned_refresh_for_chart(end_day: str, shift: str) -> Dict[str, Any]:
 
 
 # =========================================================
-# ✅ Fragment decorator: snap=1이면 run_every 비활성
+# ✅ Fragment decorator
 # =========================================================
 def _frag_deco(run_every: Optional[int] = None):
     if _is_snap() or (run_every is None):
@@ -1495,7 +1680,11 @@ def frag_sync_data(end_day: str, shift: str):
     if is_any_modal_open():
         return
 
+    if _handle_scope_rollover_if_needed(end_day, shift):
+        return
+
     prev_tokens = dict(st.session_state.get("section_tokens", {}) or {})
+    st.session_state["nonop_last_sync_ts"] = float(time_mod.time())
 
     t0 = time_mod.perf_counter()
     try:
@@ -1505,6 +1694,7 @@ def frag_sync_data(end_day: str, shift: str):
         latest_tokens = (latest or {}).get("tokens", {}) if isinstance(latest, dict) else {}
     except Exception as e:
         st.session_state["sync_err"] = f"sections_latest: {e}"
+        _perf_push("api_sections_latest_err", 0.0, {"err": str(e)[:120]})
         return
 
     if not latest_tokens:
@@ -1519,15 +1709,16 @@ def frag_sync_data(end_day: str, shift: str):
     st.session_state.alarm_token_effective = alarm_tok
 
     if nonop_changed:
-        _nonop_reset_if_needed(end_day, shift)
         new_cursor = _cursor_from_token(str(latest_tokens.get("nonop_detail", "") or ""))
-        _nonop_apply_changes_if_needed(end_day, shift, new_cursor)
+        res_nonop = _nonop_apply_changes_if_needed(end_day, shift, new_cursor)
+        if res_nonop.get("ok") and int(res_nonop.get("fetched", 0) or 0) > 0:
+            _perf_push("nonop_sync_rerun", 0.0, {"fetched": int(res_nonop.get("fetched", 0) or 0)})
+            _rerun_fragment_safe()
 
     if planned_changed:
         _planned_reset_if_needed(end_day, shift)
         _planned_refresh_for_chart(end_day, shift)
 
-    # ✅ alarm fallback: 토큰 pk 기준 + ✅ scope 필터
     if alarm_tok and (not alarm_tok.startswith("__ERR__")):
         try:
             alarm_row = json.loads(alarm_tok)
@@ -1574,28 +1765,9 @@ def frag_alarm_once():
 
 @_frag_deco(NONOP_EVERY_SEC)
 def frag_nonop_table(end_day: str, shift: str):
-    c_title, c_unl = st.columns([3.2, 1.0])
-    with c_title:
-        st.subheader("비가동 시간 상세(sparepart 교체시 반드시 입력)")
-    with c_unl:
-        if st.button("수동 update", use_container_width=True, key="btn_nonop_unlock"):
-            for k in [
-                "nonop_lock_until_ts",
-                "nonop_is_saving",
-                "nonop_editor_snap",
-                "nonop_busy",
-                "nonop_edit_lock",
-                "nonop_refresh_lock",
-            ]:
-                st.session_state.pop(k, None)
-            st.session_state["nonop_lock_until_ts"] = 0.0
-            st.session_state["nonop_is_saving"] = False
-            try:
-                st.session_state.nonop_last_poll_ts = time_mod.time()
-                _nonop_poll_changes(end_day, shift)
-            except Exception:
-                pass
-            _rerun_fragment_safe()
+    _nonop_watchdog_unstick()
+
+    st.subheader("비가동 시간 상세(sparepart 교체시 반드시 입력)")
 
     if is_any_modal_open():
         st.info("모달 편집 중에는 자동 갱신을 잠시 멈춥니다.")
@@ -1610,9 +1782,35 @@ def frag_nonop_table(end_day: str, shift: str):
     nonop_disabled = is_saving or (now_ts < lock_until)
 
     last_poll = float(st.session_state.get("nonop_last_poll_ts", 0.0) or 0.0)
-    if (not nonop_disabled) and ((now_ts - last_poll) >= max(1.0, float(NONOP_EVERY_SEC) * 0.8)):
+    last_success = float(st.session_state.get("nonop_last_success_poll_ts", 0.0) or 0.0)
+    last_sync = float(st.session_state.get("nonop_last_sync_ts", 0.0) or 0.0)
+
+    stale_base = max(last_success, last_sync, 0.0)
+    if (not nonop_disabled) and stale_base > 0 and ((now_ts - stale_base) >= NONOP_STALE_RELOAD_SEC):
+        _perf_push(
+            "nonop_stale_reload",
+            0.0,
+            {
+                "age_sec": round(now_ts - stale_base, 1),
+                "last_success_poll_ts": last_success,
+                "last_sync_ts": last_sync,
+            },
+        )
+        st.session_state.nonop_chart_loaded_once = False
+        st.session_state.nonop_loaded_once = False
+        _nonop_load_window_once(end_day, shift)
         st.session_state.nonop_last_poll_ts = now_ts
-        _nonop_poll_changes(end_day, shift)
+        _rerun_fragment_safe()
+
+    if (not nonop_disabled) and ((now_ts - last_poll) >= float(NONOP_EVERY_SEC)):
+        res = _nonop_poll_changes(end_day, shift)
+        if res.get("ok"):
+            st.session_state.nonop_last_poll_ts = now_ts
+            if int(res.get("fetched", 0) or 0) > 0:
+                _perf_push("nonop_poll_rerun", 0.0, {"fetched": int(res.get("fetched", 0) or 0)})
+                _rerun_fragment_safe()
+        else:
+            _perf_push("nonop_poll_failed_no_ts_update", 0.0, {"err": str(res.get("error", ""))[:120]})
 
     view_limit = int(st.session_state.get("nonop_view_limit", NONOP_VIEW_DEFAULT) or NONOP_VIEW_DEFAULT)
 
@@ -1628,60 +1826,129 @@ def frag_nonop_table(end_day: str, shift: str):
 
     nonop_view_rows = (st.session_state.get("nonop_all_buf", []) or [])[: int(st.session_state.nonop_view_limit)]
 
-    display_cols = ["prod_day", "station", "from_ts", "to_ts", "reason", "sparepart"]
-    ndf = pd.DataFrame(nonop_view_rows)
-    if ndf.empty:
-        ndf = pd.DataFrame(columns=display_cols)
-    else:
-        for c in display_cols:
-            if c not in ndf.columns:
-                if c == "prod_day":
-                    ndf[c] = ndf.get("end_day", "")
-                elif c == "from_ts":
-                    ndf[c] = ndf.get("from_time", "")
-                elif c == "to_ts":
-                    ndf[c] = ndf.get("to_time", "")
-                else:
-                    ndf[c] = ""
-        ndf = ndf[display_cols].copy()
+    prepared_rows: List[Dict[str, Any]] = []
+    for src_row in nonop_view_rows:
+        row_uid = _nonop_row_uid(src_row)
 
-    ndf["from_ts_raw"] = ndf["from_ts"].astype(str)
-    ndf["to_ts_raw"] = ndf["to_ts"].astype(str)
-    ndf_raw = ndf.copy()
+        prod_day_v = normalize_day_yyyymmdd(src_row.get("prod_day", src_row.get("end_day", ""))) or end_day
+        station_v = str(src_row.get("station", "") or "").strip()
 
-    ndf["from_ts"] = ndf["from_ts"].apply(fmt_hms)
-    ndf["to_ts"] = ndf["to_ts"].apply(fmt_hms)
+        raw_from = str(src_row.get("from_ts", src_row.get("from_time", "")) or "").strip()
+        raw_to = str(src_row.get("to_ts", src_row.get("to_time", "")) or "").strip()
 
-    def _snapshot_reason_spare(df: pd.DataFrame) -> str:
-        if df.empty:
+        cur_reason = "" if src_row.get("reason") is None else str(src_row.get("reason") or "")
+        cur_spare = "" if src_row.get("sparepart") is None else str(src_row.get("sparepart") or "")
+
+        prepared_rows.append(
+            {
+                "row_uid": row_uid,
+                "prod_day": prod_day_v,
+                "station": station_v,
+                "from_ts_raw": raw_from,
+                "to_ts_raw": raw_to,
+                "from_ts": fmt_hms(raw_from),
+                "to_ts": fmt_hms(raw_to),
+                "reason": cur_reason,
+                "sparepart": cur_spare,
+            }
+        )
+
+    def _snapshot_reason_spare_from_rows(rows: List[Dict[str, Any]]) -> str:
+        if not rows:
             return ""
-        sub = df[["reason", "sparepart"]].fillna("").astype(str)
+        snap_rows = []
+        for rr in rows:
+            row_uid = str(rr.get("row_uid", "") or "")
+            k_reason = _nonop_reason_state_key(end_day, shift, row_uid)
+            k_spare = _nonop_spare_state_key(end_day, shift, row_uid)
+            snap_rows.append(
+                {
+                    "row_uid": row_uid,
+                    "reason": str(st.session_state.get(k_reason, rr.get("reason", "") or "") or ""),
+                    "sparepart": str(st.session_state.get(k_spare, rr.get("sparepart", "") or "") or ""),
+                }
+            )
+        sub = pd.DataFrame(snap_rows).fillna("").astype(str)
         return hashlib.sha256(sub.to_csv(index=False).encode("utf-8")).hexdigest()
 
     prev_snap = str(st.session_state.get("nonop_editor_snap", "") or "")
+    msg_slot = st.empty()
 
-    with st.form("nonop_form", clear_on_submit=False):
-        edited_nonop = st.data_editor(
-            ndf[display_cols].copy(),
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            key="nonop_editor_single",
-            column_order=display_cols,
-            disabled=nonop_disabled,
-            column_config={
-                "prod_day": st.column_config.TextColumn("prod_day", disabled=True),
-                "station": st.column_config.SelectboxColumn("station", options=STATIONS, disabled=True),
-                "from_ts": st.column_config.TextColumn("from_ts", disabled=True),
-                "to_ts": st.column_config.TextColumn("to_ts", disabled=True),
-                "reason": st.column_config.SelectboxColumn("reason", options=REASON_OPTIONS),
-                "sparepart": st.column_config.SelectboxColumn("sparepart", options=SPAREPART_OPTIONS),
-            },
-        )
-        save_nonop = st.form_submit_button("비가동 상세 저장", use_container_width=True, disabled=nonop_disabled)
+    with st.container(border=True):
+        hcols = st.columns([1.0, 0.9, 1.0, 1.0, 1.3, 1.3])
+        hcols[0].markdown("**prod_day**")
+        hcols[1].markdown("**station**")
+        hcols[2].markdown("**from_ts**")
+        hcols[3].markdown("**to_ts**")
+        hcols[4].markdown("**reason**")
+        hcols[5].markdown("**sparepart**")
+
+        form_key = f"nonop_form_manual_{end_day}_{shift}"
+        with st.form(form_key, clear_on_submit=False):
+            for i, rr in enumerate(prepared_rows):
+                row_uid = str(rr.get("row_uid", "") or "")
+                cols = st.columns([1.0, 0.9, 1.0, 1.0, 1.3, 1.3])
+
+                k_reason = _nonop_reason_state_key(end_day, shift, row_uid)
+                k_spare = _nonop_spare_state_key(end_day, shift, row_uid)
+
+                cur_reason = str(rr.get("reason", "") or "")
+                cur_spare = str(rr.get("sparepart", "") or "")
+
+                if k_reason not in st.session_state:
+                    st.session_state[k_reason] = cur_reason if cur_reason in REASON_OPTIONS else ""
+                if k_spare not in st.session_state:
+                    st.session_state[k_spare] = cur_spare if cur_spare in SPAREPART_OPTIONS else ""
+
+                cols[0].text_input(
+                    label=f"prod_day_{i}",
+                    value=str(rr.get("prod_day", "") or ""),
+                    key=f"nonop_prod_day_view_{end_day}_{shift}_{row_uid}",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+                cols[1].text_input(
+                    label=f"station_{i}",
+                    value=str(rr.get("station", "") or ""),
+                    key=f"nonop_station_view_{end_day}_{shift}_{row_uid}",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+                cols[2].text_input(
+                    label=f"from_ts_{i}",
+                    value=str(rr.get("from_ts", "") or ""),
+                    key=f"nonop_from_view_{end_day}_{shift}_{row_uid}",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+                cols[3].text_input(
+                    label=f"to_ts_{i}",
+                    value=str(rr.get("to_ts", "") or ""),
+                    key=f"nonop_to_view_{end_day}_{shift}_{row_uid}",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+
+                cols[4].selectbox(
+                    label=f"reason_{i}",
+                    options=REASON_OPTIONS,
+                    key=k_reason,
+                    disabled=nonop_disabled,
+                    label_visibility="collapsed",
+                )
+
+                cols[5].selectbox(
+                    label=f"sparepart_{i}",
+                    options=SPAREPART_OPTIONS,
+                    key=k_spare,
+                    disabled=nonop_disabled,
+                    label_visibility="collapsed",
+                )
+
+            save_nonop = st.form_submit_button("비가동 상세 저장", use_container_width=True, disabled=nonop_disabled)
 
     try:
-        cur_snap = _snapshot_reason_spare(edited_nonop)
+        cur_snap = _snapshot_reason_spare_from_rows(prepared_rows)
     except Exception:
         cur_snap = ""
 
@@ -1691,24 +1958,23 @@ def frag_nonop_table(end_day: str, shift: str):
     elif cur_snap and not prev_snap:
         st.session_state["nonop_editor_snap"] = cur_snap
 
-    msg_slot = st.empty()
-
     if save_nonop:
         st.session_state["nonop_is_saving"] = True
+        st.session_state["nonop_save_started_ts"] = time_mod.time()
         st.session_state["nonop_lock_until_ts"] = time_mod.time() + 0.6
 
         try:
-            rows = edited_nonop.to_dict("records")
-
             payload = []
-            for i, rr in enumerate(rows):
-                reason = str(rr.get("reason", "")).strip()
-                spare = str(rr.get("sparepart", "")).strip()
+            for rr in prepared_rows:
+                row_uid = str(rr.get("row_uid", "") or "")
+                reason = str(st.session_state.get(_nonop_reason_state_key(end_day, shift, row_uid), "") or "").strip()
+                spare = str(st.session_state.get(_nonop_spare_state_key(end_day, shift, row_uid), "") or "").strip()
+
                 if reason != "sparepart 교체":
                     spare = ""
 
-                raw_from = str(ndf_raw.iloc[i].get("from_ts_raw", "")).strip()
-                raw_to = str(ndf_raw.iloc[i].get("to_ts_raw", "")).strip()
+                raw_from = str(rr.get("from_ts_raw", "") or "").strip()
+                raw_to = str(rr.get("to_ts_raw", "") or "").strip()
 
                 payload.append(
                     {
@@ -1735,9 +2001,11 @@ def frag_nonop_table(end_day: str, shift: str):
 
             st.session_state["nonop_lock_until_ts"] = 0.0
             st.session_state["nonop_is_saving"] = False
+            st.session_state["nonop_save_started_ts"] = 0.0
 
-            st.session_state.nonop_last_poll_ts = 0.0
-            _nonop_poll_changes(end_day, shift)
+            res = _nonop_poll_changes(end_day, shift)
+            if res.get("ok"):
+                st.session_state.nonop_last_poll_ts = time_mod.time()
 
             _rerun_fragment_safe()
 
@@ -1750,6 +2018,7 @@ def frag_nonop_table(end_day: str, shift: str):
         finally:
             st.session_state["nonop_is_saving"] = False
             st.session_state["nonop_lock_until_ts"] = 0.0
+            st.session_state["nonop_save_started_ts"] = 0.0
 
 
 @_frag_deco(CHART_EVERY_SEC)
@@ -1761,19 +2030,13 @@ def frag_chart(end_day: str, shift: str):
     _nonop_reset_if_needed(end_day, shift)
     _nonop_load_window_once(end_day, shift)
 
-    now_ts = float(time_mod.time())
-    lock_until = float(st.session_state.get("nonop_lock_until_ts", 0.0) or 0.0)
-    is_saving = bool(st.session_state.get("nonop_is_saving", False))
-    if (not is_saving) and (now_ts >= lock_until):
-        last_poll = float(st.session_state.get("nonop_last_poll_ts", 0.0) or 0.0)
-        target_gap = max(1.0, float(min(CHART_EVERY_SEC, NONOP_EVERY_SEC)) * 0.8)
-        if (now_ts - last_poll) >= target_gap:
-            st.session_state.nonop_last_poll_ts = now_ts
-            _nonop_poll_changes(end_day, shift)
+    win_start, win_end = get_scope_window(end_day, shift)
 
-    dt_now = now_kst()
-    win_start, win_end = get_window(dt_now, shift)
-    progressed_end = min(max(dt_now, win_start), win_end)
+    if _is_snap():
+        progressed_end = win_end
+    else:
+        dt_now = now_kst()
+        progressed_end = min(max(dt_now, win_start), win_end)
 
     fig, ax = plt.subplots(figsize=(10, 7))
 
@@ -1850,6 +2113,11 @@ def frag_chart(end_day: str, shift: str):
     plt.tight_layout(rect=[0, 0, 1, 0.90])
     st.pyplot(fig, clear_figure=True)
 
+    try:
+        plt.close(fig)
+    except Exception:
+        pass
+
 
 @_frag_deco(None)
 def frag_worker_manual(end_day: str, shift: str):
@@ -1883,6 +2151,16 @@ def frag_worker_manual(end_day: str, shift: str):
 
     _render_flash("worker_flash")
 
+    scope_key = f"{end_day}:{shift}"
+    if st.session_state.get("worker_scope") != scope_key:
+        st.session_state["worker_scope"] = scope_key
+        st.session_state["worker_rows_cache"] = None
+        st.session_state["worker_row_count"] = 1
+        for i in range(20):
+            st.session_state.pop(f"worker_name_{scope_key}_{i}", None)
+            st.session_state.pop(f"worker_order_{scope_key}_{i}", None)
+            st.session_state.pop(f"worker_del_{scope_key}_{i}", None)
+
     if "worker_rows_cache" not in st.session_state:
         st.session_state.worker_rows_cache = None
 
@@ -1897,49 +2175,105 @@ def frag_worker_manual(end_day: str, shift: str):
     wdf = pd.DataFrame(rows) if rows else pd.DataFrame()
 
     if wdf.empty:
-        wdf = pd.DataFrame([{"end_day": end_day, "shift_type": shift, "worker_name": "", "order_number": ""}])
+        wdf = pd.DataFrame(columns=["end_day", "shift_type", "worker_name", "order_number"])
 
     for c in ["end_day", "shift_type", "worker_name", "order_number"]:
         if c not in wdf.columns:
             wdf[c] = ""
 
     wdf = wdf[["end_day", "shift_type", "worker_name", "order_number"]].copy()
-    wdf["end_day"] = str(end_day)
-    wdf["shift_type"] = str(shift)
 
-    edited_wdf = st.data_editor(
-        wdf,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key="worker_editor_main",
-        column_config={
-            "end_day": st.column_config.TextColumn("end_day", disabled=True),
-            "shift_type": st.column_config.TextColumn("shift_type", disabled=True),
-            "worker_name": st.column_config.TextColumn("worker_name"),
-            "order_number": st.column_config.TextColumn("order_number"),
-        },
-    )
+    row_count = max(int(st.session_state.get("worker_row_count", 3) or 3), len(wdf), 1)
+    row_count = min(row_count, 10)
+    st.session_state["worker_row_count"] = row_count
 
-    if st.button("worker_info 저장", use_container_width=True, key="worker_save_btn"):
+    c_add, _ = st.columns([1.2, 4])
+    with c_add:
+        if st.button("행 추가", use_container_width=True, key="worker_add_row_btn"):
+            st.session_state["worker_row_count"] = min(int(st.session_state.get("worker_row_count", 3) or 3) + 1, 10)
+            st.rerun()
+
+    with st.form("worker_manual_form", clear_on_submit=False):
+        h = st.columns([1.1, 1.0, 1.4, 1.4, 0.55])
+        h[0].markdown("**end_day**")
+        h[1].markdown("**shift_type**")
+        h[2].markdown("**worker_name**")
+        h[3].markdown("**order_number**")
+        h[4].markdown("**삭제**")
+
+        for i in range(row_count):
+            row = wdf.iloc[i] if i < len(wdf) else pd.Series(
+                {"end_day": end_day, "shift_type": shift, "worker_name": "", "order_number": ""}
+            )
+
+            k_name = f"worker_name_{scope_key}_{i}"
+            k_order = f"worker_order_{scope_key}_{i}"
+            k_del = f"worker_del_{scope_key}_{i}"
+
+            if k_name not in st.session_state:
+                st.session_state[k_name] = "" if pd.isna(row.get("worker_name")) else str(row.get("worker_name") or "")
+            if k_order not in st.session_state:
+                st.session_state[k_order] = "" if pd.isna(row.get("order_number")) else str(row.get("order_number") or "")
+            if k_del not in st.session_state:
+                st.session_state[k_del] = False
+
+            c = st.columns([1.1, 1.0, 1.4, 1.4, 0.55])
+
+            c[0].text_input(
+                label=f"worker_end_day_{i}",
+                value=str(end_day),
+                key=f"worker_end_day_view_{scope_key}_{i}",
+                disabled=True,
+                label_visibility="collapsed",
+            )
+            c[1].text_input(
+                label=f"worker_shift_{i}",
+                value=str(shift),
+                key=f"worker_shift_view_{scope_key}_{i}",
+                disabled=True,
+                label_visibility="collapsed",
+            )
+            c[2].text_input(
+                label=f"worker_name_input_{i}",
+                key=k_name,
+                label_visibility="collapsed",
+                placeholder="작업자명",
+            )
+            c[3].text_input(
+                label=f"worker_order_input_{i}",
+                key=k_order,
+                label_visibility="collapsed",
+                placeholder="오더번호",
+            )
+            c[4].checkbox(
+                label=f"worker_del_{i}",
+                key=k_del,
+                label_visibility="collapsed",
+            )
+
+        save_worker = st.form_submit_button("worker_info 저장", use_container_width=True)
+
+    if save_worker:
         try:
-            edited_wdf = edited_wdf.copy()
-            edited_wdf["end_day"] = str(end_day)
-            edited_wdf["shift_type"] = str(shift)
-
-            rows2 = edited_wdf.to_dict("records")
             payload = []
-            for rr in rows2:
+            for i in range(row_count):
+                if bool(st.session_state.get(f"worker_del_{scope_key}_{i}", False)):
+                    continue
+
+                worker_name = str(st.session_state.get(f"worker_name_{scope_key}_{i}", "") or "").strip()
+                order_number = str(st.session_state.get(f"worker_order_{scope_key}_{i}", "") or "").strip()
+
+                if not worker_name and not order_number:
+                    continue
+
                 payload.append(
                     {
-                        "end_day": normalize_day_yyyymmdd(rr.get("end_day", "")) or end_day,
-                        "shift_type": str(rr.get("shift_type", "")).strip() or shift,
-                        "worker_name": str(rr.get("worker_name", "")).strip(),
-                        "order_number": str(rr.get("order_number", "")).strip(),
+                        "end_day": normalize_day_yyyymmdd(end_day) or end_day,
+                        "shift_type": str(shift).strip() or shift,
+                        "worker_name": worker_name,
+                        "order_number": order_number,
                     }
                 )
-
-            payload = [x for x in payload if (x["worker_name"] or x["order_number"])]
 
             post_worker_info_sync(end_day, shift, payload)
 
@@ -1984,6 +2318,11 @@ def frag_master_manual(end_day: str, shift: str):
 
     _render_flash("master_flash")
 
+    master_scope = f"{end_day}:{shift}"
+    if st.session_state.get("master_scope") != master_scope:
+        st.session_state["master_scope"] = master_scope
+        st.session_state["master_rows_cache"] = None
+
     if "master_rows_cache" not in st.session_state:
         st.session_state.master_rows_cache = None
 
@@ -2009,14 +2348,13 @@ def frag_master_manual(end_day: str, shift: str):
     mdf = pd.DataFrame(rows) if rows else pd.DataFrame()
     if not mdf.empty:
         mdf = mdf.head(2)
-    st.dataframe(mdf, use_container_width=True, hide_index=True)
+    safe_show_df(mdf, raw_df=mdf, use_container_width=True, hide_index=True)
 
 
 # =========================================================
 # Header buttons
 # =========================================================
 def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
-    # ✅ "계획정지시간" 옆에 "생산 비정상 STOP" 추가 (요청사항)
     b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 1.25])
 
     def _open_modal(which: str):
@@ -2032,6 +2370,7 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
 
         st.session_state["nonop_lock_until_ts"] = 0.0
         st.session_state["nonop_is_saving"] = False
+        st.session_state["nonop_save_started_ts"] = 0.0
         st.rerun()
 
     if b1.button("새로고침", use_container_width=True, key="btn_header_refresh"):
@@ -2041,8 +2380,9 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
             _nonop_reset_if_needed(end_day, shift)
             _nonop_load_window_once(end_day, shift)
 
-            st.session_state.nonop_last_poll_ts = time_mod.time()
-            _nonop_poll_changes(end_day, shift)
+            res = _nonop_poll_changes(end_day, shift)
+            if res.get("ok"):
+                st.session_state.nonop_last_poll_ts = time_mod.time()
 
             latest = get_sections_latest(end_day, shift, timeout=float(SECTIONS_LATEST_TIMEOUT))
             tok = (latest or {}).get("tokens", {}).get("nonop_detail", "") if isinstance(latest, dict) else ""
@@ -2061,7 +2401,6 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
     if b4.button("계획정지시간", use_container_width=True, key="btn_header_planned"):
         _open_modal("planned")
 
-    # ✅ (요청 2) 버튼 위 문구 제거 + (요청 1) 실행/대기/완료 표시
     with b5:
         if "prod_abnormal_stop_last" not in st.session_state:
             st.session_state.prod_abnormal_stop_last = {"done": False, "ok": None, "ts": "", "ms": 0.0, "msg": ""}
@@ -2070,7 +2409,7 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
         done = bool(last.get("done", False))
         ok = last.get("ok", None)
 
-        disabled = bool(snap_mode)  # snap=1(인쇄 캡처)에서는 재귀 실행/DOM 변동 방지
+        disabled = bool(snap_mode)
         if disabled:
             st.button("생산 비정상 STOP", use_container_width=True, disabled=True, key=SNAPSHOT_BTN_KEY + "_disabled")
             st.info("snap=1(PDF) 모드에서는 비활성입니다.")
@@ -2078,7 +2417,6 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
 
         status_slot = st.empty()
 
-        # 상태 표시(직전 결과)
         if done and ok is True:
             status_slot.success("완료")
         elif done and ok is False:
@@ -2087,15 +2425,11 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
             status_slot.caption("")
 
         if st.button("생산 비정상 STOP", use_container_width=True, key=SNAPSHOT_BTN_KEY):
-            # 즉시 상태 갱신
             status_slot.warning("완료되기 전까지 대기하세요")
 
             with st.spinner("생산 비정상 STOP 실행 중..."):
                 res = _run_production_abnormal_stop()
 
-            # ✅ ok 판정 강화:
-            # - ok=True면 성공
-            # - ok가 없더라도 error/trace 없고 stderr에 "Traceback" 없으면 성공으로 간주(실제 발송은 됐는데 ok가 비어있는 경우 방지)
             stderr_txt = str(res.get("stderr", "") or "")
             trace_txt = str(res.get("trace", "") or "")
             err_txt = str(res.get("error", "") or "")
@@ -2107,7 +2441,6 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
                 has_tb = ("Traceback" in stderr_txt) or ("Traceback" in trace_txt)
                 ok2 = (not err_txt) and (not has_tb)
 
-            # 결과 저장 + 표시
             ts = now_kst().strftime("%Y-%m-%d %H:%M:%S")
             msg = f"ok={ok2} / {float(res.get('ms', 0.0) or 0.0):.0f}ms"
 
@@ -2134,6 +2467,7 @@ def render_header_buttons(end_day: str, shift: str, snap_mode: bool = False):
                         st.code(stderr_txt[-8000:], language="text")
                     if trace_txt:
                         st.code(trace_txt[-8000:], language="text")
+
 
 # =========================================================
 # Modals (st.dialog)
@@ -2250,6 +2584,7 @@ def render_modals(end_day: str, shift: str):
                     st.session_state["modal_email_need_load"] = True
                     st.session_state["nonop_lock_until_ts"] = 0.0
                     st.session_state["nonop_is_saving"] = False
+                    st.session_state["nonop_save_started_ts"] = 0.0
                     st.rerun()
 
                 except Exception as e:
@@ -2262,6 +2597,7 @@ def render_modals(end_day: str, shift: str):
                 st.session_state["modal_email_need_load"] = True
                 st.session_state["nonop_lock_until_ts"] = 0.0
                 st.session_state["nonop_is_saving"] = False
+                st.session_state["nonop_save_started_ts"] = 0.0
                 st.rerun()
 
         email_modal()
@@ -2371,6 +2707,7 @@ def render_modals(end_day: str, shift: str):
                     st.session_state["modal_barcode_need_load"] = True
                     st.session_state["nonop_lock_until_ts"] = 0.0
                     st.session_state["nonop_is_saving"] = False
+                    st.session_state["nonop_save_started_ts"] = 0.0
                     st.rerun()
                 except Exception as e:
                     st.session_state["barcode_flash"] = ("error", f"remark_info 저장 실패: {e}")
@@ -2382,6 +2719,7 @@ def render_modals(end_day: str, shift: str):
                 st.session_state["modal_barcode_need_load"] = True
                 st.session_state["nonop_lock_until_ts"] = 0.0
                 st.session_state["nonop_is_saving"] = False
+                st.session_state["nonop_save_started_ts"] = 0.0
                 st.rerun()
 
         barcode_modal()
@@ -2507,6 +2845,7 @@ def render_modals(end_day: str, shift: str):
                     st.session_state["modal_planned_need_load"] = True
                     st.session_state["nonop_lock_until_ts"] = 0.0
                     st.session_state["nonop_is_saving"] = False
+                    st.session_state["nonop_save_started_ts"] = 0.0
                     st.rerun()
                 except Exception as e:
                     st.session_state["planned_flash"] = ("error", f"planned_time 저장 실패: {e}")
@@ -2518,15 +2857,16 @@ def render_modals(end_day: str, shift: str):
                 st.session_state["modal_planned_need_load"] = True
                 st.session_state["nonop_lock_until_ts"] = 0.0
                 st.session_state["nonop_is_saving"] = False
+                st.session_state["nonop_save_started_ts"] = 0.0
                 st.rerun()
 
         planned_modal()
 
 
 # =========================================================
-# App start (✅ snap=1: query-param 기준 고정 + SSE/close_modal rerun 차단)
+# App start
 # =========================================================
-st.set_page_config(page_title="실시간 Dash board", layout="wide")
+safe_set_page_config(page_title="실시간 Dash board", layout="wide")
 inject_no_dim_fade_keep_loading()
 inject_no_dim_fade_keep_loading()
 
@@ -2537,23 +2877,31 @@ if "seen_alarm_pks" not in st.session_state:
 if "section_tokens" not in st.session_state:
     st.session_state.section_tokens = {}
 if "alarm_token_effective" not in st.session_state:
-    st.session_state.alarm_token_effective = ""
+    st.session_state["alarm_token_effective"] = ""
 if "pending_alarm_pk" not in st.session_state:
-    st.session_state.pending_alarm_pk = ""
+    st.session_state["pending_alarm_pk"] = ""
 if "pending_alarm_msg" not in st.session_state:
-    st.session_state.pending_alarm_msg = ""
+    st.session_state["pending_alarm_msg"] = ""
 
 if "nonop_lock_until_ts" not in st.session_state:
     st.session_state.nonop_lock_until_ts = 0.0
 if "nonop_editor_snap" not in st.session_state:
-    st.session_state.nonop_editor_snap = ""
+    st.session_state["nonop_editor_snap"] = ""
 if "nonop_is_saving" not in st.session_state:
-    st.session_state.nonop_is_saving = False
+    st.session_state["nonop_is_saving"] = False
+if "nonop_save_started_ts" not in st.session_state:
+    st.session_state["nonop_save_started_ts"] = 0.0
 if "active_modal" not in st.session_state:
     st.session_state["active_modal"] = ""
 
 if "nonop_last_poll_ts" not in st.session_state:
     st.session_state["nonop_last_poll_ts"] = 0.0
+if "nonop_last_success_poll_ts" not in st.session_state:
+    st.session_state["nonop_last_success_poll_ts"] = 0.0
+if "nonop_last_sync_ts" not in st.session_state:
+    st.session_state["nonop_last_sync_ts"] = 0.0
+if "nonop_render_rev" not in st.session_state:
+    st.session_state["nonop_render_rev"] = 0
 
 for mk in ("modal_email", "modal_barcode", "modal_planned"):
     if mk not in st.session_state:
@@ -2562,7 +2910,6 @@ for mk in ("modal_email_need_load", "modal_barcode_need_load", "modal_planned_ne
     if mk not in st.session_state:
         st.session_state[mk] = True
 
-# ✅ snap=1이면 “모달/락/저장중” 상태를 렌더 시작 전에 강제 정리
 if SNAP:
     st.session_state["active_modal"] = ""
     st.session_state["modal_email"] = False
@@ -2573,9 +2920,9 @@ if SNAP:
     st.session_state["modal_planned_need_load"] = False
     st.session_state["nonop_lock_until_ts"] = 0.0
     st.session_state["nonop_is_saving"] = False
+    st.session_state["nonop_save_started_ts"] = 0.0
     st.session_state["nonop_view_limit"] = NONOP_VIEW_DEFAULT
 
-# ✅ close_modal: 운영 모드만 rerun, snap=1은 파라미터만 제거
 if SNAP:
     try:
         if _qparam_has("close_modal"):
@@ -2604,37 +2951,39 @@ if SNAP:
 else:
     _handle_close_modal_param()
 
-# ✅ 날짜/교대 결정:
-# - 운영: 현재시각 기반
-# - snap=1: query param(prod_day, shift_type) 기준 고정
 dt_now = now_kst()
 if SNAP:
-    end_day = normalize_day_yyyymmdd(_qparam_get("prod_day", "")) or dt_now.strftime("%Y%m%d")
+    end_day = normalize_day_yyyymmdd(_qparam_get("prod_day", "")) or scope_from_datetime(dt_now)[0]
     shift = str(_qparam_get("shift_type", "day") or "day").strip().lower()
     if shift not in ("day", "night"):
         shift = "day"
 else:
-    shift = detect_shift(dt_now)
-    end_day = dt_now.strftime("%Y%m%d")
+    end_day, shift = current_live_scope_kst()
 
-weekday_kr = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"][dt_now.weekday()]
+try:
+    title_dt = datetime.strptime(end_day, "%Y%m%d")
+    title_weekday_kr = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"][title_dt.weekday()]
+except Exception:
+    title_dt = dt_now.replace(tzinfo=None)
+    title_weekday_kr = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"][dt_now.weekday()]
+
 shift_kr = "주간" if shift == "day" else "야간"
 
-# ✅ SSE 알람 구독은 운영 모드만
 if not SNAP:
     _mount_alarm_sse(end_day, shift)
 
 _nonop_reset_if_needed(end_day, shift)
 _planned_reset_if_needed(end_day, shift)
 
-if st.session_state.get("last_shift") != shift:
+current_scope = f"{end_day}:{shift}"
+if st.session_state.get("last_scope") != current_scope:
+    st.session_state["last_scope"] = current_scope
     st.session_state["last_shift"] = shift
     _nonop_reset_if_needed(end_day, shift)
     _planned_reset_if_needed(end_day, shift)
     st.session_state.worker_rows_cache = None
     st.session_state.master_rows_cache = None
 
-# ✅ ack param은 운영 모드만 처리
 if not SNAP:
     try:
         q = st.query_params
@@ -2651,18 +3000,15 @@ if not SNAP:
 
 h1, h2 = st.columns([3, 2])
 with h1:
-    st.markdown(f"## {dt_now:%Y-%m-%d} {weekday_kr} {shift_kr} 생산 현황")
+    st.markdown(f"## {title_dt:%Y-%m-%d} {title_weekday_kr} {shift_kr} 생산 현황")
 with h2:
-    # ✅ "계획정지시간" 옆에 "생산 비정상 STOP" 버튼 추가
     render_header_buttons(end_day, shift, snap_mode=SNAP)
 
 st.divider()
 
-# ✅ 데이터 동기화/알람(운영 모드: 주기 동작 / snap=1: 1회 렌더)
 frag_sync_data(end_day, shift)
 frag_alarm_once()
 
-# ✅ 모달/워치독
 render_modals(end_day, shift)
 _inject_modal_dom_watchdog()
 
@@ -2682,19 +3028,17 @@ with c2:
 with st.expander("PERF LOG (최근)", expanded=False):
     logs = st.session_state.get("perf_logs", []) or []
     if logs:
-        st.dataframe(pd.DataFrame(logs).tail(40), use_container_width=True, hide_index=True)
+        df_logs = pd.DataFrame(logs).tail(60)
+        safe_show_df(df_logs, raw_df=df_logs, use_container_width=True, hide_index=True)
     else:
         st.caption("로그 없음")
 
-# ✅ print-to-pdf 안정화용 ready 마커 (snapshot_mailer에서 기다릴 수 있음)
 if SNAP:
     st.markdown('<div id="snap-ready" data-snap-ready="1"></div>', unsafe_allow_html=True)
 
-import streamlit.components.v1 as components
 
 def _snap_mark_ready():
-    # 스냅샷이든 아니든 넣어도 문제없음 (height=0)
     components.html('<div id="__snap_ready__" style="display:none">READY</div>', height=0)
 
-# ... 모든 차트/데이터프레임 렌더링이 끝난 다음:
+
 _snap_mark_ready()

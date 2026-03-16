@@ -13,6 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import api_client as api
@@ -107,7 +108,6 @@ def _get_api_fn(*names: str):
 
 
 def _api_base_url() -> str:
-    # api_client.py에서 API / API_BASE_URL 등 다양한 이름을 쓸 수 있어서 폭넓게 탐색
     for attr in ("API_BASE_URL", "BASE_URL", "API_URL", "API"):
         v = getattr(api, attr, None)
         if isinstance(v, str) and v.strip().startswith("http"):
@@ -150,6 +150,46 @@ def _parse_alarm_dt(end_day_yyyy_mm_dd: str, end_time_hms: str) -> Optional[date
         return dt.replace(tzinfo=KST)
     except Exception:
         return None
+
+
+def safe_show_df(
+    df_or_obj: Any,
+    *,
+    raw_df: Optional[pd.DataFrame] = None,
+    use_container_width: bool = True,
+    hide_index: bool = False,
+    height: Optional[int] = None,
+):
+    try:
+        kwargs = {"use_container_width": use_container_width}
+        if height is not None:
+            kwargs["height"] = height
+        if hide_index:
+            kwargs["hide_index"] = hide_index
+        st.dataframe(df_or_obj, **kwargs)
+        return
+    except Exception:
+        pass
+
+    base_df = raw_df
+    if base_df is None and isinstance(df_or_obj, pd.DataFrame):
+        base_df = df_or_obj
+
+    if base_df is not None:
+        try:
+            st.table(base_df)
+            return
+        except Exception:
+            pass
+
+        try:
+            html = base_df.to_html(index=not hide_index)
+            st.markdown(html, unsafe_allow_html=True)
+            return
+        except Exception:
+            pass
+
+    st.warning("표 렌더링 중 오류가 발생했습니다.")
 
 
 # -----------------------------
@@ -474,7 +514,7 @@ def _mount_alarm_sse(now_day: str, now_shift: str, view_day: str, view_shift: st
 
 
 # -----------------------------
-# UI (02와 동일)
+# UI
 # -----------------------------
 st.set_page_config(page_title="생산 분석", layout="wide")
 
@@ -563,7 +603,7 @@ if not _is_empty_df(alarm_df):
 
     alarm_df = alarm_df[alarm_df.apply(_in_window, axis=1)].copy()
 
-    alarm_df["type_alarm"] = alarm_df["type_alarm"].astype(str).str.strip().str.replace(" ", "")
+    alarm_df["type_alarm"] = alarm_df["type_alarm"].astype(str).str.strip().str.replace(" ", "", regex=False)
     alarm_df = alarm_df[alarm_df["type_alarm"].isin(list(ALARM_ALLOWED_TYPES))].copy()
 
     alarm_df["__k"] = alarm_df["station"].apply(_station_sort_key)
@@ -572,7 +612,7 @@ if not _is_empty_df(alarm_df):
 if _is_empty_df(alarm_df):
     st.info("현재 조건에서 표시할 알람이 없습니다.")
 else:
-    st.dataframe(alarm_df, use_container_width=True, hide_index=True)
+    safe_show_df(alarm_df, raw_df=alarm_df, use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -625,8 +665,9 @@ if not _is_empty_df(pd_df):
                 return "background-color: #ffa8a8; color: #5c0000; font-weight: 800;"
             return ""
 
-        st.dataframe(
+        safe_show_df(
             pd_table.style.applymap(_style_status, subset=["last_status"]),
+            raw_df=pd_table,
             use_container_width=True,
             hide_index=True,
         )
@@ -673,7 +714,12 @@ if not _is_empty_df(pd_df):
                         xdt.append(None)
                 else:
                     try:
-                        xdt.append(datetime.fromisoformat(s).replace(tzinfo=KST))
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=KST)
+                        else:
+                            dt = dt.astimezone(KST)
+                        xdt.append(dt)
                     except Exception:
                         xdt.append(None)
 
@@ -715,6 +761,7 @@ if not _is_empty_df(pd_df):
             ax.legend(loc="upper left", ncol=5, frameon=False)
             plt.tight_layout()
             st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
 else:
     st.info("PD-BOARD 모니터링 데이터가 없습니다.")
 
@@ -736,7 +783,7 @@ else:
         if c not in df_f.columns:
             df_f[c] = ""
     df_f = df_f[keep].copy()
-    st.dataframe(df_f, use_container_width=True, hide_index=True)
+    safe_show_df(df_f, raw_df=df_f, use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -754,9 +801,9 @@ else:
     candidates = ["Total 조립 불량 손실 시간", "Total", "total"]
     col = next((c for c in candidates if c in df_g.columns), None)
     if col is None:
-        st.dataframe(df_g, use_container_width=True, hide_index=True)
+        safe_show_df(df_g, raw_df=df_g, use_container_width=True, hide_index=True)
     else:
-        st.dataframe(df_g[[col]].copy(), use_container_width=True, hide_index=True)
+        safe_show_df(df_g[[col]].copy(), raw_df=df_g[[col]].copy(), use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -772,13 +819,11 @@ if _is_empty_df(df_h):
     st.info("MES 불량 낭비시간 데이터가 없습니다.")
 else:
     df_h = _drop_cols(df_h, ["updated_at"])
-    st.dataframe(df_h, use_container_width=True, hide_index=True)
+    safe_show_df(df_h, raw_df=df_h, use_container_width=True, hide_index=True)
 
-import streamlit.components.v1 as components
 
 def _snap_mark_ready():
-    # 스냅샷이든 아니든 넣어도 문제없음 (height=0)
     components.html('<div id="__snap_ready__" style="display:none">READY</div>', height=0)
 
-# ... 모든 차트/데이터프레임 렌더링이 끝난 다음:
+
 _snap_mark_ready()

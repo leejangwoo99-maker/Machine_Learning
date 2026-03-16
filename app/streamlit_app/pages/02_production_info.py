@@ -30,6 +30,7 @@ KST = ZoneInfo("Asia/Seoul")
 
 ALARM_ALLOWED_TYPES = {"권고", "긴급", "교체"}
 
+
 # -----------------------------
 # ENV
 # -----------------------------
@@ -52,6 +53,7 @@ def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
 
 
 P02_FETCH_WORKERS = _env_int("P02_FETCH_WORKERS", default=8, min_v=2, max_v=32)
+
 
 # -----------------------------
 # UI hardening: dim/fade 제거
@@ -179,6 +181,49 @@ def is_snapshot_mode() -> bool:
 
 
 SNAP_MODE = is_snapshot_mode()
+
+
+# -----------------------------
+# dataframe safe helpers
+# -----------------------------
+def safe_show_df(
+    df_or_obj: Any,
+    *,
+    raw_df: Optional[pd.DataFrame] = None,
+    use_container_width: bool = True,
+    hide_index: bool = False,
+    height: Optional[int] = None,
+):
+    try:
+        kwargs = {"use_container_width": use_container_width}
+        if height is not None:
+            kwargs["height"] = height
+        if hide_index:
+            kwargs["hide_index"] = hide_index
+        st.dataframe(df_or_obj, **kwargs)
+        return
+    except Exception:
+        pass
+
+    base_df = raw_df
+    if base_df is None and isinstance(df_or_obj, pd.DataFrame):
+        base_df = df_or_obj
+
+    if base_df is not None:
+        try:
+            st.table(base_df)
+            return
+        except Exception:
+            pass
+
+        try:
+            html = base_df.to_html(index=not hide_index)
+            st.markdown(html, unsafe_allow_html=True)
+            return
+        except Exception:
+            pass
+
+    st.warning("표 렌더링 중 오류가 발생했습니다.")
 
 
 # -----------------------------
@@ -448,7 +493,6 @@ def _mount_alarm_sse(now_day: str, now_shift: str, view_day: str, view_shift: st
           }}
 
           function computeScopeFromRow(row) {{
-            // return {{prod_day, shift}}
             const endDay = normDay(row.end_day || row.prod_day || "");
             const t = parseHms(row.end_time || row.time || "");
             if (!endDay || !t) {{
@@ -461,7 +505,6 @@ def _mount_alarm_sse(now_day: str, now_shift: str, view_day: str, view_shift: st
               return {{prod_day: endDay, shift: "day"}};
             }}
 
-            // night
             if (hh < 8 || (hh === 8 && mm < 30)) {{
               const dt = yyyymmddToDate(endDay);
               if (!dt) return {{prod_day: endDay, shift: "night"}};
@@ -618,7 +661,6 @@ def _mount_alarm_sse(now_day: str, now_shift: str, view_day: str, view_shift: st
               return;
             }}
 
-            // ✅ scope filter (prod_day/shift)
             if (!isRowInTargetScope(row)) {{
               const sc = computeScopeFromRow(row);
               log("skip by scope mismatch", {{target: {{day:TARGET_DAY, shift:TARGET_SHIFT}}, rowScope: sc, row}});
@@ -833,43 +875,42 @@ if has_oee:
     with col1:
         if not _is_empty_df(df_oee_total):
             st.markdown("**전체 OEE**")
-            st.dataframe(df_oee_total, use_container_width=True, height=210)
+            safe_show_df(df_oee_total, raw_df=df_oee_total, use_container_width=True, height=210)
 
     with col2:
         if not _is_empty_df(df_oee_line):
             st.markdown("**Line별 OEE**")
-            st.dataframe(df_oee_line, use_container_width=True, height=210)
+            safe_show_df(df_oee_line, raw_df=df_oee_line, use_container_width=True, height=210)
 
     with col3:
         if not _is_empty_df(df_oee_station):
             st.markdown("**Station별 OEE**")
-            # ✅ Station OEE는 행이 많을 수 있어 약간 더 크게
-            st.dataframe(df_oee_station, use_container_width=True, height=320)
+            safe_show_df(df_oee_station, raw_df=df_oee_station, use_container_width=True, height=320)
 
     st.divider()
 
 df_planned = reports.get("planned", pd.DataFrame())
 if not _is_empty_df(df_planned):
     st.markdown("### 📌 계획 정지 시간")
-    st.dataframe(df_planned, use_container_width=True, height=260)
+    safe_show_df(df_planned, raw_df=df_planned, use_container_width=True, height=260)
     st.divider()
 
 df_non = reports.get("nonop", pd.DataFrame())
 if not _is_empty_df(df_non):
     st.markdown("### 📌 비가동 시간")
-    st.dataframe(df_non, use_container_width=True, height=260)
+    safe_show_df(df_non, raw_df=df_non, use_container_width=True, height=260)
     st.divider()
 
 df_amt = reports.get("amt", pd.DataFrame())
 if not _is_empty_df(df_amt):
     st.markdown("### 📌 품번별 총 생산량")
-    st.dataframe(df_amt, use_container_width=True, height=320)
+    safe_show_df(df_amt, raw_df=df_amt, use_container_width=True, height=320)
     st.divider()
 
 df_pct = reports.get("pct", pd.DataFrame())
 if not _is_empty_df(df_pct):
     st.markdown("### 📌 TEST 합격률")
-    st.dataframe(df_pct, use_container_width=True, height=240)
+    safe_show_df(df_pct, raw_df=df_pct, use_container_width=True, height=240)
     st.divider()
 
 fail_sections = [
@@ -890,18 +931,17 @@ for title, key in fail_sections:
         st.markdown("### 📌 FAIL LIST")
         shown_any = True
     st.markdown(f"**{title}**")
-    st.dataframe(df, use_container_width=True, height=260)
+    safe_show_df(df, raw_df=df, use_container_width=True, height=260)
     st.markdown("")
 
 # ✅ SSE는 마지막 (현재 시각 구독 + 조회 scope 필터)
 now_day, now_shift = _now_prod_day_shift()
 _mount_alarm_sse(now_day, now_shift, active_day, active_shift)
 
-import streamlit.components.v1 as components
 
 def _snap_mark_ready():
-    # 스냅샷이든 아니든 넣어도 문제없음 (height=0)
     components.html('<div id="__snap_ready__" style="display:none">READY</div>', height=0)
+
 
 # ... 모든 차트/데이터프레임 렌더링이 끝난 다음:
 _snap_mark_ready()

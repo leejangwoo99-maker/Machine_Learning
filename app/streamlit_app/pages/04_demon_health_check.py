@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import api_client as api
 
@@ -18,6 +19,7 @@ st.info(
     "log 컬럼의 번호 또는 문자로 시작되는 프로그램이 각각 apply_machine의 작업 관리자 프로세스에 2개 씩 작동하고 있을 것 "
     "(예시) 3_.....exe > FCT1 작업 관리자 프로세스에 2개 작동 중)"
 )
+
 
 # =========================================================
 # ENV (운영에서 .env로 조절 가능)
@@ -52,13 +54,61 @@ API_LIMIT = _env_int("ST_DEMON_LIMIT", default=200, min_v=10, max_v=5000)
 API_RETRY = _env_int("ST_DEMON_RETRY", default=1, min_v=0, max_v=5)
 API_RETRY_WAIT_SEC = _env_float("ST_DEMON_RETRY_WAIT", default=0.25, min_v=0.0, max_v=5.0)
 
+
+# =========================================================
+# Safe dataframe render
+# =========================================================
+def safe_show_df(
+    df_or_obj: Any,
+    *,
+    raw_df: Optional[pd.DataFrame] = None,
+    use_container_width: bool = True,
+    hide_index: bool = False,
+    height: Optional[int] = None,
+):
+    try:
+        kwargs = {"use_container_width": use_container_width}
+        if height is not None:
+            kwargs["height"] = height
+        if hide_index:
+            kwargs["hide_index"] = hide_index
+        st.dataframe(df_or_obj, **kwargs)
+        return
+    except Exception:
+        pass
+
+    base_df = raw_df
+    if base_df is None and isinstance(df_or_obj, pd.DataFrame):
+        base_df = df_or_obj
+
+    if base_df is not None:
+        try:
+            st.table(base_df)
+            return
+        except Exception:
+            pass
+
+        try:
+            html = base_df.to_html(index=not hide_index)
+            st.markdown(html, unsafe_allow_html=True)
+            return
+        except Exception:
+            pass
+
+    st.warning("표 렌더링 중 오류가 발생했습니다.")
+
+
 c1, c2 = st.columns([8, 2])
 with c2:
     if st.button("전체 새로고침", use_container_width=True):
-        st.cache_data.clear()
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
         st.rerun()
 
 st.divider()
+
 
 # =========================================================
 # Safe load (cache 내부에서 예외 절대 밖으로 던지지 않기)
@@ -123,30 +173,49 @@ else:
             df[c] = None
     df = df[cols].copy()
 
+    # 표 fallback용 raw df
+    df_plain = df.copy()
+
     # =========================
     # 3) status 색상 표시 (정상/비정상/주의/비운행)
     # =========================
     def _status_cell_style(v: Any) -> str:
         s = str(v or "").strip()
         if s == "정상":
-            return "background-color: #d1fae5; color: #065f46; font-weight: 700;"  # green
+            return "background-color: #d1fae5; color: #065f46; font-weight: 700;"
         if s == "비정상":
-            return "background-color: #fee2e2; color: #991b1b; font-weight: 700;"  # red
+            return "background-color: #fee2e2; color: #991b1b; font-weight: 700;"
         if s == "주의":
-            return "background-color: #fef9c3; color: #854d0e; font-weight: 700;"  # yellow
+            return "background-color: #fef9c3; color: #854d0e; font-weight: 700;"
         if s == "비운행":
-            return "background-color: #111827; color: #ffffff; font-weight: 700;"  # black
+            return "background-color: #111827; color: #ffffff; font-weight: 700;"
         return ""
 
-    styler = df.style.applymap(_status_cell_style, subset=["status"])
+    try:
+        styler = df.style.applymap(_status_cell_style, subset=["status"])
+    except Exception:
+        styler = df_plain
 
     # =========================
     # 4) 스크롤 없이 전체표 출력 (행 수 기반 height 크게 잡기)
     # =========================
-    n = int(len(df))
+    n = int(len(df_plain))
     row_h = 35
     base_h = 80
     height = base_h + n * row_h
     height = max(240, min(3000, height))
 
-    st.dataframe(styler, use_container_width=True, hide_index=True, height=height)
+    safe_show_df(
+        styler,
+        raw_df=df_plain,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+    )
+
+
+def _snap_mark_ready():
+    components.html('<div id="__snap_ready__" style="display:none">READY</div>', height=0)
+
+
+_snap_mark_ready()
