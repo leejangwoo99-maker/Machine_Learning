@@ -1,53 +1,47 @@
 # -*- coding: utf-8 -*-
 """
-d4_afa_fail_wasted_time_factory.py  (Warm-start Backfill 포함 + DB Health Log)
+d4_afa_fail_wasted_time_factory.py
 
 AFA FAIL wasted time (NG -> ON) 실시간 계산/저장
-- MP=1, 5초 루프
-- DB 접속 실패/끊김 시 무한 재시도(5초마다 [RETRY])
-- 엔진 1개 고정(pool_size=1, max_overflow=0)
-- ✅ (핵심 수정) 쿼리/락 블로킹으로 “멈춘 것처럼 보이는” 현상 방지:
-    * statement_timeout / lock_timeout / idle_in_transaction_session_timeout 을 connect_args options 로 강제
-    * work_mem 역시 options 로 강제 (SET work_mem 바인드 제거 가능)
-- NG는 오로지 contents ILIKE '%제품 감지 NG%' 만 인정
-- WINDOW(KST) 기준 자동 전환:
-  day   : [D] 08:30:00 ~ 20:29:59
-  night : [D] 20:30:00 ~ [D+1] 08:29:59
-- save PK/UNIQUE: (end_day, station, from_time, to_time)
-- 증분 fetch는 cursor(end_ts) 기반
-- Warm-start Backfill:
-  - 프로그램 시작 직후, 그리고 shift/window가 바뀔 때마다
-    현재 window(ws ~ now) 구간을 station별로 한번 "전체 스캔"하여 누락분을 채움
-  - 이후 루프에서는 기존처럼 last_pk 기반 증분 처리
-
-로그:
-- 콘솔 + 파일 동시 기록
-- 파일 경로: C:\\AptivAgent\\d4_afa_fail_wasted_time_factory.log
-- 추가 DB 로그 저장:
-  schema: k_demon_heath_check (없으면 생성)
-  table : d4_log (없으면 생성)
-  columns: end_day, end_time, info, contents
+- 5초 루프
+- DB 접속 실패/끊김 시 무한 재시도
+- 메인 엔진 / 헬스 로그 엔진 분리
+- health log는 queue + worker thread 로 비동기 적재
+- txt 파일 로그 없음
+- 콘솔 + DB health log만 사용
+- pandas 제거
+- warm-start backfill 유지
+- 증분 fetch는 station별 마지막 저장 to_ts 기준
 """
 
 from __future__ import annotations
 
 import os
 import re
-import time
-import unicodedata
+import time as time_mod
+import threading
+import queue
+import traceback
 import urllib.parse
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 
-import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
 from zoneinfo import ZoneInfo
 
-# =========================
-# 0) 환경/상수
-# =========================
+try:
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
+except Exception:
+    psycopg2 = None  # type: ignore
+
+
+# =========================================================
+# 환경 / 상수
+# =========================================================
 KST = ZoneInfo("Asia/Seoul")
 
 os.environ.setdefault("PGCLIENTENCODING", "UTF8")
@@ -58,10 +52,14 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",  # 비번은 보완 사항
+    "password": "",  # 비밀번호 입력
 }
 
 SCHEMA = "d1_machine_log"
+SAVE_TABLE = "afa_fail_wasted_time"
+
+HEALTH_SCHEMA = "k_demon_heath_check"
+HEALTH_TABLE = "d4_log"
 
 SRC_TABLES = [
     ("FCT1_machine_log", "FCT1"),
@@ -70,143 +68,101 @@ SRC_TABLES = [
     ("FCT4_machine_log", "FCT4"),
 ]
 
-SAVE_TABLE = "afa_fail_wasted_time"
-
-# 데몬 헬스 로그 테이블
-HEALTH_SCHEMA = "k_demon_heath_check"
-HEALTH_TABLE = "d4_log"
-
-# 타겟 문구(소문자 기준 비교)
 NG_PHRASE = "제품 감지 ng"
 OFF_PHRASE = "제품 검사 투입요구 on"
 MANUAL_PHRASE = "manual mode 전환"
 AUTO_PHRASE = "auto mode 전환"
 
-# DB 저장용 표기(원문 형식)
 NG_PHRASE_RAW = "제품 감지 NG"
 OFF_PHRASE_RAW = "제품 검사 투입요구 ON"
 
-# Loop / Retry
-LOOP_INTERVAL_SEC = 5
-DB_RETRY_INTERVAL_SEC = 5
-
-# work_mem cap
-WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
-
-# ✅ 쿼리/락 타임아웃(블로킹 방지) - ms
-STMT_TIMEOUT_MS = int(os.getenv("D4_STMT_TIMEOUT_MS", "5000"))   # statement_timeout 5s
-LOCK_TIMEOUT_MS = int(os.getenv("D4_LOCK_TIMEOUT_MS", "3000"))   # lock_timeout 3s
-IDLE_TX_TIMEOUT_MS = int(os.getenv("D4_IDLE_TX_TIMEOUT_MS", "5000"))  # idle tx 5s
-
-# Cursor overlap(초) - 증분에서 누락 방지용
+LOOP_INTERVAL_SEC = int(os.getenv("D4_LOOP_INTERVAL_SEC", "5"))
+DB_RETRY_INTERVAL_SEC = int(os.getenv("DB_RETRY_INTERVAL_SEC", "5"))
 CURSOR_OVERLAP_SEC = int(os.getenv("AFA_CURSOR_OVERLAP_SEC", "3"))
 
-# keepalive (선택)
+WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
+
+STMT_TIMEOUT_MS = int(os.getenv("D4_STMT_TIMEOUT_MS", "10000"))
+LOCK_TIMEOUT_MS = int(os.getenv("D4_LOCK_TIMEOUT_MS", "3000"))
+IDLE_TX_TIMEOUT_MS = int(os.getenv("D4_IDLE_TX_TIMEOUT_MS", "5000"))
+
 PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
 PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
 PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
-# 로그 파일
-LOG_DIR = r"C:\AptivAgent"
-LOG_FILE = os.path.join(LOG_DIR, "d4_afa_fail_wasted_time_factory.log")
+DB_LOG_QUEUE_MAX = int(os.getenv("DB_LOG_QUEUE_MAX", "10000"))
+DB_LOG_BATCH_SIZE = int(os.getenv("DB_LOG_BATCH_SIZE", "300"))
+DB_LOG_FLUSH_INTERVAL_SEC = float(os.getenv("DB_LOG_FLUSH_INTERVAL_SEC", "2.0"))
+DB_LOG_CONTENTS_MAXLEN = int(os.getenv("DB_LOG_CONTENTS_MAXLEN", "2000"))
 
-_ENGINE = None
+_ENGINE_MAIN = None
+_ENGINE_HEALTH = None
 
-
-# =========================
-# 1) 로깅 (콘솔 + 파일 + DB)
-# =========================
-def _ensure_log_dir() -> None:
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-    except Exception:
-        pass
+db_log_queue: queue.Queue = queue.Queue(maxsize=max(1000, DB_LOG_QUEUE_MAX))
+_db_log_enabled = True
 
 
-def _to_health_row(level: str, msg: str, now_kst: datetime) -> Dict[str, str]:
-    """
-    level -> info(소문자) 매핑
-    예: ERROR/RETRY/INFO/BOOT -> error/retry/info/boot
-    """
-    info = (level or "").strip().lower()
+# =========================================================
+# 유틸
+# =========================================================
+def _masked_db_info(cfg=DB_CONFIG) -> str:
+    return f"postgresql://{cfg['user']}:***@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
+
+
+def _normalize_info(info: str) -> str:
     if not info:
-        info = "info"
-    return {
-        "end_day": now_kst.strftime("%Y%m%d"),      # yyyymmdd
-        "end_time": now_kst.strftime("%H:%M:%S"),   # hh:mi:ss
-        "info": info,                               # 반드시 소문자
-        "contents": str(msg),
-    }
+        return "info"
+    s = re.sub(r"[^a-z0-9_]+", "_", info.strip().lower())
+    s = s.strip("_")
+    return s or "info"
 
 
-def _db_log_try(rows: List[Dict[str, str]]) -> None:
-    """
-    DB 로그는 best-effort로만 저장.
-    - 절대 블로킹 재시도하지 않음
-    - DB 불가 시 조용히 스킵 (파일/콘솔 로그는 계속)
-    """
-    global _ENGINE
-    if _ENGINE is None or not rows:
-        return
-
-    ins = text(Demon_f"""
-        INSERT INTO {HEALTH_SCHEMA}.{HEALTH_TABLE}
-        (end_day, end_time, info, contents)
-        VALUES (:end_day, :end_time, :info, :contents)
-    """)
-    try:
-        with _ENGINE.begin() as conn:
-            conn.execute(ins, rows)
-    except Exception:
-        # health log insert 실패는 무시 (무한루프 방지)
-        pass
+def _infer_info_from_msg(msg: str) -> str:
+    m = (msg or "").lower()
+    if "[error]" in m or "trace" in m or "fatal" in m or "[unhandled]" in m:
+        return "error"
+    if "[retry]" in m or "failed" in m or "conn error" in m or "down" in m:
+        return "down"
+    if "[boot]" in m or "[ok]" in m:
+        return "boot"
+    if "[stop]" in m:
+        return "stop"
+    if "sleep" in m:
+        return "sleep"
+    if "[perf]" in m:
+        return "perf"
+    if "[warn]" in m:
+        return "warn"
+    return "info"
 
 
-def _write_log(level: str, msg: str) -> None:
-    now_kst = datetime.now(tz=KST)
-    ts = now_kst.strftime("%Y-%m-%d %H:%M:%S")
-    line = Demon_f"[{ts}] [{level}] {msg}"
+def _is_connection_error(e: Exception) -> bool:
+    if isinstance(e, OperationalError):
+        return True
+    if isinstance(e, DBAPIError):
+        if getattr(e, "connection_invalidated", False):
+            return True
 
-    # console
-    print(line, flush=True)
-
-    # file
-    try:
-        _ensure_log_dir()
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-
-    # db (best-effort)
-    row = _to_health_row(level, msg, now_kst)
-    try:
-        df = pd.DataFrame([row], columns=["end_day", "end_time", "info", "contents"])
-        _db_log_try(df.to_dict("records"))
-    except Exception:
-        pass
-
-
-def log_boot(msg: str) -> None:
-    _write_log("BOOT", msg)
+    msg = (str(e) or "").lower()
+    keywords = [
+        "server closed the connection",
+        "connection not open",
+        "terminating connection",
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+        "ssl connection has been closed",
+        "broken pipe",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+        "'nonetype' object has no attribute 'connect'",
+    ]
+    return any(k in msg for k in keywords)
 
 
-def log_info(msg: str) -> None:
-    _write_log("INFO", msg)
-
-
-def log_retry(msg: str) -> None:
-    _write_log("RETRY", msg)
-
-
-def log_error(msg: str) -> None:
-    _write_log("ERROR", msg)
-
-
-# =========================
-# 2) 텍스트 정규화/매칭
-# =========================
 _ZWSP_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
 
 
@@ -222,7 +178,7 @@ def norm_text(s: object) -> str:
 
 
 def is_ng(c: str) -> bool:
-    return NG_PHRASE in c  # 오로지 이 문구 포함만 NG
+    return NG_PHRASE in c
 
 
 def is_off(c: str) -> bool:
@@ -237,95 +193,80 @@ def is_auto(c: str) -> bool:
     return AUTO_PHRASE in c
 
 
-# =========================
-# 3) WINDOW 계산(KST 자동 전환)
-# =========================
-def calc_window(now_kst: datetime) -> Tuple[str, str, datetime, datetime]:
-    """
-    window_end는 항상 now(현재 시각).
-    shift 정의:
-      day   : 08:30:00 ~ 20:29:59
-      night : 20:30:00 ~ D+1 08:29:59
-    """
-    t = now_kst.time()
-    day_start = dtime(8, 30, 0)
-    day_end = dtime(20, 29, 59)
-    night_start = dtime(20, 30, 0)
-
-    # day
-    if day_start <= t <= day_end:
-        ws = now_kst.replace(hour=8, minute=30, second=0, microsecond=0)
-        return "day", ws.strftime("%Y%m%d"), ws, now_kst
-
-    # night (20:30~23:59)
-    if t >= night_start:
-        ws = now_kst.replace(hour=20, minute=30, second=0, microsecond=0)
-        return "night", ws.strftime("%Y%m%d"), ws, now_kst
-
-    # night (00:00~08:29:59): 전날 20:30부터
-    yday = (now_kst - timedelta(days=1)).date()
-    ws = datetime(yday.year, yday.month, yday.day, 20, 30, 0, tzinfo=KST)
-    return "night", ws.strftime("%Y%m%d"), ws, now_kst
-
-
-# =========================
-# 4) DB 연결/재접속(엔진 1개 고정) + ✅ 타임아웃 강제
-# =========================
-def _masked_db() -> str:
-    c = DB_CONFIG
-    return Demon_f"postgresql://{c['user']}:***@{c['host']}:{c['port']}/{c['dbname']}"
-
-
-def _is_connection_error(e: Exception) -> bool:
-    if isinstance(e, OperationalError):
-        return True
-    if isinstance(e, DBAPIError):
-        if getattr(e, "connection_invalidated", False):
-            return True
-    msg = (str(e) or "").lower()
-    keys = [
-        "server closed the connection",
-        "connection not open",
-        "terminating connection",
-        "could not connect",
-        "connection refused",
-        "connection timed out",
-        "timeout expired",
-        "broken pipe",
-        "connection reset",
-        "network is unreachable",
-        "no route to host",
-    ]
-    return any(k in msg for k in keys)
-
-
-def _dispose_engine():
-    global _ENGINE
+def to_ts_kst(end_day: str, hhmmss_like: str) -> Optional[datetime]:
     try:
-        if _ENGINE is not None:
-            _ENGINE.dispose()
+        base = str(hhmmss_like).split(".")[0]
+        dt = datetime.strptime(f"{end_day} {base}", "%Y%m%d %H:%M:%S")
+        return dt.replace(tzinfo=KST)
+    except Exception:
+        return None
+
+
+def format_hhmmss_ff(dt: datetime) -> str:
+    return dt.astimezone(KST).strftime("%H:%M:%S.%f")[:11]
+
+
+# =========================================================
+# 로그
+# =========================================================
+def _enqueue_db_log(info: str, contents: str):
+    global _db_log_enabled
+    if not _db_log_enabled:
+        return
+
+    now = datetime.now(tz=KST)
+    row = {
+        "end_day": now.strftime("%Y%m%d"),
+        "end_time": now.strftime("%H:%M:%S"),
+        "info": _normalize_info(info),
+        "contents": (contents or "")[:DB_LOG_CONTENTS_MAXLEN],
+    }
+
+    try:
+        db_log_queue.put_nowait(row)
+    except queue.Full:
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] [WARN] db_log_queue full. health log dropped.", flush=True)
+
+
+def log(msg: str, info: str | None = None):
+    ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+
+    try:
+        tag = _normalize_info(info) if info else _infer_info_from_msg(msg)
+        _enqueue_db_log(tag, msg)
     except Exception:
         pass
-    _ENGINE = None
 
 
-def _build_engine():
-    user = DB_CONFIG["user"]
-    password = urllib.parse.quote_plus(DB_CONFIG["password"])
-    host = DB_CONFIG["host"]
-    port = DB_CONFIG["port"]
-    dbname = DB_CONFIG["dbname"]
-    conn_str = Demon_f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}?connect_timeout=5"
+def log_exc(prefix: str, e: Exception):
+    log(f"{prefix}: {type(e).__name__}: {repr(e)}", info="error")
+    tb = traceback.format_exc()
+    for line in tb.rstrip().splitlines():
+        log(f"{prefix} TRACE: {line}", info="error")
 
-    # ✅ 세션 레벨 강제 옵션: work_mem + timeouts
-    opt = (
-        Demon_f"-c work_mem={WORK_MEM} "
-        Demon_f"-c statement_timeout={STMT_TIMEOUT_MS} "
-        Demon_f"-c lock_timeout={LOCK_TIMEOUT_MS} "
-        Demon_f"-c idle_in_transaction_session_timeout={IDLE_TX_TIMEOUT_MS}"
+
+# =========================================================
+# Engine 생성 / 관리
+# =========================================================
+def _build_engine(cfg=DB_CONFIG, application_name: str = "d4_afa_fail"):
+    user = cfg["user"]
+    password = urllib.parse.quote_plus(cfg["password"])
+    host = cfg["host"]
+    port = cfg["port"]
+    dbname = cfg["dbname"]
+
+    conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}?connect_timeout=5"
+    options = (
+        f"-c work_mem={WORK_MEM} "
+        f"-c statement_timeout={STMT_TIMEOUT_MS} "
+        f"-c lock_timeout={LOCK_TIMEOUT_MS} "
+        f"-c idle_in_transaction_session_timeout={IDLE_TX_TIMEOUT_MS}"
     )
 
-    return create_engine(
+    eng = create_engine(
         conn_str,
         pool_pre_ping=True,
         pool_size=1,
@@ -339,141 +280,329 @@ def _build_engine():
             "keepalives_idle": PG_KEEPALIVES_IDLE,
             "keepalives_interval": PG_KEEPALIVES_INTERVAL,
             "keepalives_count": PG_KEEPALIVES_COUNT,
-            "application_name": "afa_fail_wasted_time_realtime",
-            "options": opt,  # ✅ 핵심
+            "application_name": application_name,
+            "options": options,
         },
     )
+    return eng
 
 
-def get_engine_blocking():
-    global _ENGINE
+def _dispose_engine_main():
+    global _ENGINE_MAIN
+    try:
+        if _ENGINE_MAIN is not None:
+            _ENGINE_MAIN.dispose()
+    except Exception:
+        pass
+    _ENGINE_MAIN = None
 
-    if _ENGINE is not None:
+
+def _dispose_engine_health():
+    global _ENGINE_HEALTH
+    try:
+        if _ENGINE_HEALTH is not None:
+            _ENGINE_HEALTH.dispose()
+    except Exception:
+        pass
+    _ENGINE_HEALTH = None
+
+
+def get_engine_main_blocking():
+    global _ENGINE_MAIN
+
+    while _ENGINE_MAIN is not None:
+        try:
+            with _ENGINE_MAIN.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return _ENGINE_MAIN
+        except Exception as e:
+            log("[DB][RETRY] main engine ping failed -> rebuild", info="down")
+            log_exc("[DB][RETRY] main ping error", e)
+            _dispose_engine_main()
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+    while True:
+        try:
+            _ENGINE_MAIN = _build_engine(DB_CONFIG, "d4_afa_fail_main")
+            with _ENGINE_MAIN.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            log(
+                f"[DB][OK] main engine ready pool_size=1 max_overflow=0 "
+                f"work_mem={WORK_MEM} stmt_timeout_ms={STMT_TIMEOUT_MS} "
+                f"lock_timeout_ms={LOCK_TIMEOUT_MS} idle_tx_timeout_ms={IDLE_TX_TIMEOUT_MS}",
+                info="boot",
+            )
+            log(f"[INFO] MAIN DB = {_masked_db_info(DB_CONFIG)}", info="info")
+            return _ENGINE_MAIN
+        except Exception as e:
+            log("[DB][RETRY] main engine create/connect failed", info="down")
+            log_exc("[DB][RETRY] main connect error", e)
+            _dispose_engine_main()
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def get_engine_health_blocking():
+    global _ENGINE_HEALTH
+
+    while _ENGINE_HEALTH is not None:
+        try:
+            with _ENGINE_HEALTH.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return _ENGINE_HEALTH
+        except Exception as e:
+            ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}] [WARN] health engine ping failed: {type(e).__name__}: {e}", flush=True)
+            _dispose_engine_health()
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+    while True:
+        try:
+            _ENGINE_HEALTH = _build_engine(DB_CONFIG, "d4_afa_fail_health")
+            with _ENGINE_HEALTH.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            log("[DB][OK] health engine ready dedicated for health log", info="boot")
+            return _ENGINE_HEALTH
+        except Exception as e:
+            ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}] [WARN] health engine create/connect failed: {type(e).__name__}: {e}", flush=True)
+            _dispose_engine_health()
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+# =========================================================
+# DDL
+# =========================================================
+CREATE_SAVE_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {SCHEMA}.{SAVE_TABLE} (
+    end_day       TEXT,
+    station       TEXT,
+    from_contents TEXT,
+    from_time     TEXT,
+    to_contents   TEXT,
+    to_time       TEXT,
+    wasted_time   NUMERIC(10,2),
+    created_at    TIMESTAMP DEFAULT now()
+);
+"""
+
+CREATE_SAVE_UNIQUE_SQL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS ux_{SCHEMA}_{SAVE_TABLE}_pk
+ON {SCHEMA}.{SAVE_TABLE} (end_day, station, from_time, to_time);
+"""
+
+CREATE_HEALTH_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {HEALTH_SCHEMA}.{HEALTH_TABLE} (
+    id        BIGSERIAL PRIMARY KEY,
+    end_day   VARCHAR(8)  NOT NULL,
+    end_time  VARCHAR(8)  NOT NULL,
+    info      VARCHAR(32) NOT NULL,
+    contents  TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
+"""
+
+CREATE_HEALTH_INDEX_SQL = f"""
+CREATE INDEX IF NOT EXISTS ix_{HEALTH_SCHEMA}_{HEALTH_TABLE}_day_time
+ON {HEALTH_SCHEMA}.{HEALTH_TABLE} (end_day, end_time);
+"""
+
+
+def ensure_schema_and_tables(engine_main, engine_health):
+    while True:
+        try:
+            with engine_main.begin() as conn:
+                conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
+                conn.execute(text(CREATE_SAVE_TABLE_SQL))
+                conn.execute(text(CREATE_SAVE_UNIQUE_SQL))
+                log(f"[INFO] Save table ensured: {SCHEMA}.{SAVE_TABLE}", info="info")
+
+            with engine_health.begin() as conn:
+                conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {HEALTH_SCHEMA}"))
+                conn.execute(text(CREATE_HEALTH_TABLE_SQL))
+                conn.execute(text(CREATE_HEALTH_INDEX_SQL))
+                log(f"[INFO] Health log table ensured: {HEALTH_SCHEMA}.{HEALTH_TABLE}", info="info")
+
+            return
+
+        except Exception as e:
+            if _is_connection_error(e):
+                log("[DB][RETRY] ensure_schema_and_tables conn error -> rebuild", info="down")
+                log_exc("[DB][RETRY] ensure_schema_and_tables", e)
+                _dispose_engine_main()
+                _dispose_engine_health()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine_main = get_engine_main_blocking()
+                engine_health = get_engine_health_blocking()
+                continue
+
+            log("[DB][RETRY] ensure_schema_and_tables failed", info="down")
+            log_exc("[DB][RETRY] ensure_schema_and_tables", e)
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+            engine_main = get_engine_main_blocking()
+            engine_health = get_engine_health_blocking()
+
+
+# =========================================================
+# Health log worker
+# =========================================================
+class HealthLogWorker:
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="HealthLogWorker", daemon=True)
+        self._local_buffer: list[dict] = []
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def join(self, timeout: float | None = None):
+        self.thread.join(timeout=timeout)
+
+    def _flush_batch(self, batch: list[dict]):
+        if not batch:
+            return
+
         while True:
             try:
-                with _ENGINE.connect() as conn:
-                    conn.execute(text("SELECT 1"))
-                return _ENGINE
+                engine = get_engine_health_blocking()
+                with engine.begin() as conn:
+                    dbapi_conn = getattr(conn.connection, "driver_connection", None)
+                    if dbapi_conn is not None and psycopg2 is not None:
+                        cur = dbapi_conn.cursor()
+                        sql = f"""
+                            INSERT INTO {HEALTH_SCHEMA}.{HEALTH_TABLE}
+                            (end_day, end_time, info, contents)
+                            VALUES %s
+                        """
+                        values = [
+                            (r["end_day"], r["end_time"], r["info"], r["contents"])
+                            for r in batch
+                        ]
+                        psycopg2.extras.execute_values(cur, sql, values, page_size=1000)  # type: ignore
+                    else:
+                        conn.execute(
+                            text(
+                                f"""
+                                INSERT INTO {HEALTH_SCHEMA}.{HEALTH_TABLE}
+                                (end_day, end_time, info, contents)
+                                VALUES
+                                (:end_day, :end_time, :info, :contents)
+                                """
+                            ),
+                            batch,
+                        )
+                return
+
             except Exception as e:
-                log_retry(Demon_f"db ping failed -> rebuild | {type(e).__name__}: {repr(e)}")
-                _dispose_engine()
-                time.sleep(DB_RETRY_INTERVAL_SEC)
+                ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}] [WARN] health log flush failed: {type(e).__name__}: {e}", flush=True)
+                if _is_connection_error(e):
+                    _dispose_engine_health()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
-    while True:
+    def _drain_queue(self, max_items: int):
+        drained = 0
+        while drained < max_items:
+            try:
+                item = db_log_queue.get_nowait()
+                self._local_buffer.append(item)
+                drained += 1
+            except queue.Empty:
+                break
+
+    def _run(self):
+        last_flush_ts = time_mod.time()
+
+        while not self.stop_event.is_set():
+            try:
+                timeout = max(0.2, DB_LOG_FLUSH_INTERVAL_SEC / 2.0)
+
+                try:
+                    item = db_log_queue.get(timeout=timeout)
+                    self._local_buffer.append(item)
+                except queue.Empty:
+                    pass
+
+                self._drain_queue(max_items=max(0, DB_LOG_BATCH_SIZE - len(self._local_buffer)))
+
+                now_ts = time_mod.time()
+                need_flush = False
+
+                if len(self._local_buffer) >= DB_LOG_BATCH_SIZE:
+                    need_flush = True
+                elif self._local_buffer and (now_ts - last_flush_ts) >= DB_LOG_FLUSH_INTERVAL_SEC:
+                    need_flush = True
+
+                if need_flush:
+                    batch = self._local_buffer[:DB_LOG_BATCH_SIZE]
+                    del self._local_buffer[:len(batch)]
+                    self._flush_batch(batch)
+                    last_flush_ts = now_ts
+
+            except Exception as e:
+                ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}] [WARN] HealthLogWorker loop error: {type(e).__name__}: {e}", flush=True)
+                time_mod.sleep(1.0)
+
         try:
-            _ENGINE = _build_engine()
-            with _ENGINE.connect() as conn:
-                conn.execute(text("SELECT 1"))
+            while True:
+                try:
+                    item = db_log_queue.get_nowait()
+                    self._local_buffer.append(item)
+                except queue.Empty:
+                    break
 
-            log_info(
-                "db connected | "
-                Demon_f"{_masked_db()} | "
-                Demon_f"pool_size=1 max_overflow=0 work_mem={WORK_MEM} "
-                Demon_f"stmt_timeout_ms={STMT_TIMEOUT_MS} lock_timeout_ms={LOCK_TIMEOUT_MS} idle_tx_timeout_ms={IDLE_TX_TIMEOUT_MS}"
-            )
-            return _ENGINE
+            while self._local_buffer:
+                batch = self._local_buffer[:DB_LOG_BATCH_SIZE]
+                del self._local_buffer[:len(batch)]
+                self._flush_batch(batch)
+
         except Exception as e:
-            log_retry(Demon_f"db connect failed | {type(e).__name__}: {repr(e)}")
-            _dispose_engine()
-            time.sleep(DB_RETRY_INTERVAL_SEC)
+            ts = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}] [WARN] HealthLogWorker final flush error: {type(e).__name__}: {e}", flush=True)
 
 
-# =========================
-# 5) 결과 테이블/UNIQUE 보장
-# =========================
-def init_save_table_blocking(engine):
-    ddl_create = text(Demon_f"""
-    CREATE SCHEMA IF NOT EXISTS {SCHEMA};
+# =========================================================
+# Window 계산
+# =========================================================
+def calc_window(now_kst: datetime) -> Tuple[str, str, datetime, datetime]:
+    t = now_kst.time()
+    day_start = dtime(8, 30, 0)
+    day_end = dtime(20, 29, 59)
+    night_start = dtime(20, 30, 0)
 
-    CREATE TABLE IF NOT EXISTS {SCHEMA}.{SAVE_TABLE} (
-        end_day       TEXT,
-        station       TEXT,
-        from_contents TEXT,
-        from_time     TEXT,
-        to_contents   TEXT,
-        to_time       TEXT,
-        wasted_time   NUMERIC(10,2),
-        created_at    TIMESTAMP DEFAULT now()
-    );
-    """)
-    ddl_unique = text(Demon_f"""
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_afa_fail_wasted_time_pk
-    ON {SCHEMA}.{SAVE_TABLE} (end_day, station, from_time, to_time);
-    """)
+    if day_start <= t <= day_end:
+        ws = now_kst.replace(hour=8, minute=30, second=0, microsecond=0)
+        return "day", ws.strftime("%Y%m%d"), ws, now_kst
 
-    while True:
-        try:
-            with engine.begin() as conn:
-                conn.execute(ddl_create)
-                conn.execute(ddl_unique)
-            log_info("bootstrap ok: save table + unique index(end_day,station,from_time,to_time) ensured")
-            return
-        except Exception as e:
-            if _is_connection_error(e):
-                log_retry(Demon_f"init_save_table conn error -> rebuild | {type(e).__name__}: {repr(e)}")
-                _dispose_engine()
-                engine = get_engine_blocking()
-            else:
-                log_retry(Demon_f"init_save_table failed | {type(e).__name__}: {repr(e)}")
-            time.sleep(DB_RETRY_INTERVAL_SEC)
+    if t >= night_start:
+        ws = now_kst.replace(hour=20, minute=30, second=0, microsecond=0)
+        return "night", ws.strftime("%Y%m%d"), ws, now_kst
+
+    yday = (now_kst - timedelta(days=1)).date()
+    ws = datetime(yday.year, yday.month, yday.day, 20, 30, 0, tzinfo=KST)
+    return "night", ws.strftime("%Y%m%d"), ws, now_kst
 
 
-def init_health_log_table_blocking(engine):
-    """
-    요구사항:
-    - schema: k_demon_heath_check (없으면 생성)
-    - table : d4_log (없으면 생성)
-    - columns: end_day, end_time, info, contents
-    """
-    ddl = text(Demon_f"""
-    CREATE SCHEMA IF NOT EXISTS {HEALTH_SCHEMA};
-
-    CREATE TABLE IF NOT EXISTS {HEALTH_SCHEMA}.{HEALTH_TABLE} (
-        end_day   TEXT,
-        end_time  TEXT,
-        info      TEXT,
-        contents  TEXT,
-        created_at TIMESTAMP DEFAULT now()
-    );
-    """)
-    while True:
-        try:
-            with engine.begin() as conn:
-                conn.execute(ddl)
-            print(
-                Demon_f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [INFO] health log table ensured: {HEALTH_SCHEMA}.{HEALTH_TABLE}",
-                flush=True,
-            )
-            return
-        except Exception as e:
-            if _is_connection_error(e):
-                print(
-                    Demon_f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log conn error -> rebuild | {type(e).__name__}: {repr(e)}",
-                    flush=True,
-                )
-                _dispose_engine()
-                engine = get_engine_blocking()
-            else:
-                print(
-                    Demon_f"[{datetime.now(tz=KST):%Y-%m-%d %H:%M:%S}] [RETRY] init_health_log failed | {type(e).__name__}: {repr(e)}",
-                    flush=True,
-                )
-            time.sleep(DB_RETRY_INTERVAL_SEC)
-
-
-# =========================
-# 6) station별 마지막 PK(to_ts) 읽기
-# =========================
+# =========================================================
+# station별 마지막 저장 to_ts 조회
+# =========================================================
 def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
     out: Dict[str, Optional[datetime]] = {st: None for _, st in SRC_TABLES}
 
-    sql = text(Demon_f"""
+    sql = text(
+        f"""
         SELECT station,
                to_timestamp(end_day || ' ' || split_part(to_time, '.', 1), 'YYYYMMDD HH24:MI:SS') AS to_ts
         FROM {SCHEMA}.{SAVE_TABLE}
-        WHERE end_day IS NOT NULL AND station IS NOT NULL AND to_time IS NOT NULL
+        WHERE end_day IS NOT NULL
+          AND station IS NOT NULL
+          AND to_time IS NOT NULL
         ORDER BY to_ts DESC
-    """)
+        """
+    )
 
     while True:
         try:
@@ -493,38 +622,74 @@ def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
 
         except Exception as e:
             if _is_connection_error(e):
-                log_retry(Demon_f"read_last_pk conn error -> rebuild | {type(e).__name__}: {repr(e)}")
-                _dispose_engine()
-                engine = get_engine_blocking()
-            else:
-                log_retry(Demon_f"read_last_pk failed | {type(e).__name__}: {repr(e)}")
-            time.sleep(DB_RETRY_INTERVAL_SEC)
+                log("[DB][RETRY] read_last_pk_per_station conn error -> rebuild", info="down")
+                log_exc("[DB][RETRY] read_last_pk_per_station", e)
+                _dispose_engine_main()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine = get_engine_main_blocking()
+                continue
+
+            log("[DB][RETRY] read_last_pk_per_station failed", info="down")
+            log_exc("[DB][RETRY] read_last_pk_per_station", e)
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+            engine = get_engine_main_blocking()
 
 
-# =========================
-# 7) 로그 fetch
-# =========================
-def fetch_src_logs(engine, table: str, station: str, ws: datetime, we: datetime, cursor_ts: datetime,
-                   overlap_sec: int = CURSOR_OVERLAP_SEC) -> pd.DataFrame:
+# =========================================================
+# Source fetch
+# =========================================================
+def fetch_src_logs(
+    engine,
+    table: str,
+    station: str,
+    ws: datetime,
+    we: datetime,
+    cursor_ts: datetime,
+    overlap_sec: int = CURSOR_OVERLAP_SEC,
+) -> List[Dict[str, Any]]:
     cursor_eff = cursor_ts - timedelta(seconds=int(overlap_sec))
 
+    ws_day = ws.astimezone(KST).strftime("%Y%m%d")
+    we_day = we.astimezone(KST).strftime("%Y%m%d")
+    ws_time = ws.astimezone(KST).strftime("%H:%M:%S")
+    we_time = we.astimezone(KST).strftime("%H:%M:%S")
+    cursor_day = cursor_eff.astimezone(KST).strftime("%Y%m%d")
+    cursor_time = cursor_eff.astimezone(KST).strftime("%H:%M:%S")
+
     params = {
-        "ws": ws.astimezone(KST).replace(tzinfo=None),
-        "we": we.astimezone(KST).replace(tzinfo=None),
-        "cursor": cursor_eff.astimezone(KST).replace(tzinfo=None),
+        "ws_day": ws_day,
+        "we_day": we_day,
+        "ws_time": ws_time,
+        "we_time": we_time,
+        "cursor_day": cursor_day,
+        "cursor_time": cursor_time,
     }
 
-    sql = text(Demon_f"""
+    sql = text(
+        f"""
         SELECT
             end_day,
             end_time,
             contents
         FROM {SCHEMA}."{table}"
         WHERE
-            to_timestamp(end_day || ' ' || split_part(end_time, '.', 1), 'YYYYMMDD HH24:MI:SS')
-                BETWEEN :ws AND :we
-            AND to_timestamp(end_day || ' ' || split_part(end_time, '.', 1), 'YYYYMMDD HH24:MI:SS')
-                >= :cursor
+            end_day BETWEEN :ws_day AND :we_day
+
+            AND (
+                end_day > :cursor_day
+                OR (end_day = :cursor_day AND split_part(end_time, '.', 1) >= :cursor_time)
+            )
+
+            AND (
+                end_day > :ws_day
+                OR (end_day = :ws_day AND split_part(end_time, '.', 1) >= :ws_time)
+            )
+
+            AND (
+                end_day < :we_day
+                OR (end_day = :we_day AND split_part(end_time, '.', 1) <= :we_time)
+            )
+
             AND (
                 contents ILIKE '%제품 감지 NG%'
                 OR contents ILIKE '%제품 검사 투입요구 ON%'
@@ -532,285 +697,312 @@ def fetch_src_logs(engine, table: str, station: str, ws: datetime, we: datetime,
                 OR contents ILIKE '%Auto mode 전환%'
             )
         ORDER BY
-            to_timestamp(end_day || ' ' || split_part(end_time, '.', 1), 'YYYYMMDD HH24:MI:SS') ASC
-    """)
+            end_day ASC,
+            end_time ASC
+        """
+    )
 
     while True:
         try:
-            df = pd.read_sql(sql, engine, params=params)
-            if df.empty:
-                return pd.DataFrame(columns=["end_day", "end_time", "contents", "contents_norm", "station", "end_ts"])
+            with engine.connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
 
-            df["end_day"] = df["end_day"].astype(str)
-            df["end_time"] = df["end_time"].astype(str)
-            df["contents"] = df["contents"].astype(str)
+            dedup = {}
+            for end_day, end_time, contents in rows:
+                key = (str(end_day), str(end_time), str(contents))
+                dedup[key] = {
+                    "end_day": str(end_day),
+                    "end_time": str(end_time),
+                    "contents": str(contents),
+                    "contents_norm": norm_text(contents),
+                    "station": station,
+                    "end_ts": to_ts_kst(str(end_day), str(end_time)),
+                }
 
-            # source PK dedup: (end_day, end_time, contents)
-            df = df.drop_duplicates(subset=["end_day", "end_time", "contents"], keep="last")
-
-            df["station"] = station
-            df["contents_norm"] = df["contents"].map(norm_text)
-
-            end_ts = pd.to_datetime(
-                df["end_day"] + " " + df["end_time"].str.split(".").str[0],
-                format="%Y%m%d %H:%M:%S",
-                errors="coerce",
-            )
-            df["end_ts"] = end_ts.dt.tz_localize(KST, nonexistent="shift_forward", ambiguous="NaT")
-            df = df.dropna(subset=["end_ts"]).sort_values("end_ts").reset_index(drop=True)
-
-            return df[["end_day", "end_time", "contents", "contents_norm", "station", "end_ts"]]
+            out = [v for v in dedup.values() if v["end_ts"] is not None]
+            out.sort(key=lambda x: x["end_ts"])
+            return out
 
         except Exception as e:
             if _is_connection_error(e):
-                log_retry(Demon_f"fetch_src_logs conn error -> rebuild | {table}/{station} | {type(e).__name__}: {repr(e)}")
-                _dispose_engine()
-                engine = get_engine_blocking()
-            else:
-                # ✅ statement_timeout/lock_timeout 걸리면 여기로 떨어짐 -> 다음 루프에서 다시 시도
-                log_retry(Demon_f"fetch_src_logs failed | {table}/{station} | {type(e).__name__}: {repr(e)}")
-            time.sleep(DB_RETRY_INTERVAL_SEC)
+                log(f"[DB][RETRY] fetch_src_logs conn error -> rebuild table={table} station={station}", info="down")
+                log_exc("[DB][RETRY] fetch_src_logs", e)
+                _dispose_engine_main()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine = get_engine_main_blocking()
+                continue
+
+            log(f"[DB][RETRY] fetch_src_logs failed table={table} station={station}", info="down")
+            log_exc("[DB][RETRY] fetch_src_logs", e)
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+            engine = get_engine_main_blocking()
 
 
-# =========================
-# 8) 이벤트 페어링(stateful)
-# =========================
+# =========================================================
+# Event pairing
+# =========================================================
 @dataclass
 class StationState:
     in_manual: bool = False
     pending_ng_ts: Optional[datetime] = None
 
 
-def pair_events(df: pd.DataFrame, state: StationState) -> Tuple[pd.DataFrame, StationState]:
-    rows = []
+def pair_events(rows: List[Dict[str, Any]], state: StationState) -> Tuple[List[Dict[str, Any]], StationState]:
+    pairs: List[Dict[str, Any]] = []
 
-    for _, r in df.iterrows():
+    for r in rows:
         c = r["contents_norm"]
         ts: datetime = r["end_ts"]
-
-        log_info(Demon_f"[evt ] {r['station']} {ts.astimezone(KST):%Y-%m-%d %H:%M:%S} | {r['contents']}")
+        station = r["station"]
 
         if is_manual(c):
             state.in_manual = True
-            log_info(Demon_f"[stat] {r['station']} -> in_manual=y")
             continue
 
         if is_auto(c):
             state.in_manual = False
-            log_info(Demon_f"[stat] {r['station']} -> in_manual=n")
             continue
 
         if is_ng(c):
             if (not state.in_manual) and (state.pending_ng_ts is None):
                 state.pending_ng_ts = ts
-                log_info(Demon_f"[stat] {r['station']} pending_ng_ts={ts.astimezone(KST):%H:%M:%S}")
             continue
 
         if is_off(c):
             if state.pending_ng_ts is not None:
                 from_ts = state.pending_ng_ts
                 to_ts = ts
-                end_day = from_ts.astimezone(KST).strftime("%Y%m%d")
 
-                rows.append({
-                    "end_day": end_day,
-                    "station": r["station"],
-                    "from_contents": NG_PHRASE_RAW,
-                    "from_time": from_ts.astimezone(KST).strftime("%H:%M:%S.%Demon_f_mining")[:-4],
-                    "to_contents": OFF_PHRASE_RAW,
-                    "to_time": to_ts.astimezone(KST).strftime("%H:%M:%S.%Demon_f_mining")[:-4],
-                    "wasted_time": round(abs((to_ts - from_ts).total_seconds()), 2),
-                })
+                if to_ts >= from_ts:
+                    pairs.append(
+                        {
+                            "end_day": from_ts.astimezone(KST).strftime("%Y%m%d"),
+                            "station": station,
+                            "from_contents": NG_PHRASE_RAW,
+                            "from_time": format_hhmmss_ff(from_ts),
+                            "to_contents": OFF_PHRASE_RAW,
+                            "to_time": format_hhmmss_ff(to_ts),
+                            "wasted_time": round((to_ts - from_ts).total_seconds(), 2),
+                        }
+                    )
 
-                log_info(
-                    Demon_f"[pair] {r['station']} {from_ts.astimezone(KST):%H:%M:%S} -> "
-                    Demon_f"{to_ts.astimezone(KST):%H:%M:%S} = {round(abs((to_ts - from_ts).total_seconds()), 2)}s"
-                )
                 state.pending_ng_ts = None
 
-    out = pd.DataFrame(rows, columns=[
-        "end_day", "station", "from_contents", "from_time", "to_contents", "to_time", "wasted_time"
-    ])
-    return out, state
+    return pairs, state
 
 
-# =========================
-# 9) INSERT
-# =========================
-def insert_rows(engine, df_pairs: pd.DataFrame) -> int:
-    if df_pairs.empty:
+# =========================================================
+# Save insert
+# =========================================================
+def insert_rows(engine, rows: List[Dict[str, Any]]) -> int:
+    if not rows:
         return 0
 
-    ins = text(Demon_f"""
+    sql = text(
+        f"""
         INSERT INTO {SCHEMA}.{SAVE_TABLE}
             (end_day, station, from_contents, from_time, to_contents, to_time, wasted_time)
         VALUES
             (:end_day, :station, :from_contents, :from_time, :to_contents, :to_time, :wasted_time)
         ON CONFLICT (end_day, station, from_time, to_time)
         DO NOTHING
-    """)
-
-    rows = df_pairs.to_dict("records")
+        """
+    )
 
     while True:
         try:
             with engine.begin() as conn:
-                conn.execute(ins, rows)
+                conn.execute(sql, rows)
             return len(rows)
+
         except Exception as e:
             if _is_connection_error(e):
-                log_retry(Demon_f"insert conn error -> rebuild | {type(e).__name__}: {repr(e)}")
-                _dispose_engine()
-                engine = get_engine_blocking()
-                time.sleep(DB_RETRY_INTERVAL_SEC)
+                log("[DB][RETRY] insert_rows conn error -> rebuild", info="down")
+                log_exc("[DB][RETRY] insert_rows", e)
+                _dispose_engine_main()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine = get_engine_main_blocking()
                 continue
-            log_error(Demon_f"insert failed (non-conn) | {type(e).__name__}: {repr(e)}")
+
+            log("[ERROR] insert_rows failed", info="error")
+            log_exc("[ERROR] insert_rows", e)
             return 0
 
 
-# =========================
-# 10) Warm-start Backfill
-# =========================
+# =========================================================
+# Warm-start Backfill
+# =========================================================
 def run_backfill_for_window(engine, ws: datetime, we: datetime, states: Dict[str, StationState]) -> None:
-    log_info(Demon_f"[backfill] start window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S}")
+    log(f"[INFO] [backfill] start window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S}", info="info")
 
     total_fetched = 0
     total_pairs = 0
     total_ins = 0
 
     for table, station in SRC_TABLES:
-        df = fetch_src_logs(engine, table, station, ws, we, cursor_ts=ws, overlap_sec=0)
-        fetched = len(df)
+        rows = fetch_src_logs(engine, table, station, ws, we, cursor_ts=ws, overlap_sec=0)
+        fetched = len(rows)
         total_fetched += fetched
-        log_info(Demon_f"[backfill][fetch] {station} cursor=ws -> rows={fetched}")
+        log(f"[INFO] [backfill][fetch] {station} rows={fetched}", info="info")
 
         if fetched == 0:
             continue
 
-        pairs, states[station] = pair_events(df, states[station])
+        pairs, states[station] = pair_events(rows, states[station])
         pcount = len(pairs)
         total_pairs += pcount
-        log_info(
-            Demon_f"[backfill][pair ] {station} pairs={pcount} "
-            Demon_f"(pending_ng={'y' if states[station].pending_ng_ts else 'n'}, in_manual={'y' if states[station].in_manual else 'n'})"
+
+        log(
+            f"[INFO] [backfill][pair] {station} pairs={pcount} "
+            f"pending_ng={'y' if states[station].pending_ng_ts else 'n'} "
+            f"in_manual={'y' if states[station].in_manual else 'n'}",
+            info="info",
         )
 
         ins_n = insert_rows(engine, pairs) if pcount > 0 else 0
         total_ins += ins_n
-        log_info(Demon_f"[backfill][ins  ] {station} attempted_insert={ins_n} (dedup by pk/unique)")
+        log(f"[INFO] [backfill][ins] {station} attempted_insert={ins_n}", info="info")
 
-    log_info(Demon_f"[backfill] done | fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_ins}")
+    log(
+        f"[INFO] [backfill] done fetched={total_fetched} pairs={total_pairs} attempted_insert={total_ins}",
+        info="info",
+    )
 
 
-# =========================
-# 11) main
-# =========================
+# =========================================================
+# main
+# =========================================================
 def main():
-    _ensure_log_dir()
+    log("[BOOT] d4_afa_fail_wasted_time realtime starting", info="boot")
+    log(f"[INFO] MAIN DB = {_masked_db_info(DB_CONFIG)}", info="info")
+    log(f"[INFO] save = {SCHEMA}.{SAVE_TABLE}", info="info")
+    log(f"[INFO] health = {HEALTH_SCHEMA}.{HEALTH_TABLE}", info="info")
+    log(f"[INFO] work_mem={WORK_MEM}", info="info")
+    log(
+        f"[INFO] stmt_timeout_ms={STMT_TIMEOUT_MS} lock_timeout_ms={LOCK_TIMEOUT_MS} "
+        f"idle_tx_timeout_ms={IDLE_TX_TIMEOUT_MS}",
+        info="info",
+    )
+    log(f"[INFO] cursor_overlap_sec={CURSOR_OVERLAP_SEC}", info="info")
+    log(f"[INFO] health queue max={DB_LOG_QUEUE_MAX} batch={DB_LOG_BATCH_SIZE}", info="info")
 
-    # 부팅 초기 로그 (DB 없어도 남겨야 하므로 먼저 파일/콘솔)
-    log_boot("backend afa_fail_wasted_time realtime starting (mp=1, loop=5s, warm-start backfill=on)")
-    log_info(Demon_f"log_file = {LOG_FILE}")
-    log_info(Demon_f"db = {_masked_db()}")
-    log_info(Demon_f"work_mem cap = {WORK_MEM}")
-    log_info(Demon_f"stmt_timeout_ms={STMT_TIMEOUT_MS} lock_timeout_ms={LOCK_TIMEOUT_MS} idle_tx_timeout_ms={IDLE_TX_TIMEOUT_MS}")
-    log_info(Demon_f"src = {SCHEMA}.FCT1~4_machine_log | pk(end_day,end_time,contents) assumed")
-    log_info(Demon_f"save = {SCHEMA}.{SAVE_TABLE} | pk/unique(end_day,station,from_time,to_time)")
-    log_info(Demon_f"cursor_overlap_sec = {CURSOR_OVERLAP_SEC}")
+    engine_main = get_engine_main_blocking()
+    engine_health = get_engine_health_blocking()
+    ensure_schema_and_tables(engine_main, engine_health)
 
-    engine = get_engine_blocking()
-
-    # health log 테이블 먼저 보장 (이후부터 로그들이 db 적재됨)
-    init_health_log_table_blocking(engine)
-    log_info(Demon_f"health log target = {HEALTH_SCHEMA}.{HEALTH_TABLE} (end_day,end_time,info,contents)")
-
-    # 결과 저장 테이블 보장
-    init_save_table_blocking(engine)
+    health_worker = HealthLogWorker()
+    health_worker.start()
+    log("[INFO] HealthLogWorker started", info="info")
 
     states: Dict[str, StationState] = {st: StationState() for _, st in SRC_TABLES}
-
-    # warm-start 키: shift + ws(윈도우 시작) 단위로 한번만 backfill
     last_backfill_key: Optional[Tuple[str, datetime]] = None
 
     while True:
-        loop_t0 = time.perf_counter()
-        now_kst = datetime.now(tz=KST)
-        shift, prod_day, ws, we = calc_window(now_kst)
+        loop_t0 = time_mod.perf_counter()
 
         try:
-            engine = get_engine_blocking()
+            now_kst = datetime.now(tz=KST)
+            shift, prod_day, ws, we = calc_window(now_kst)
 
-            # 시작/shift 변경 시 ws~now 범위 전체 스캔
+            engine_main = get_engine_main_blocking()
+
             backfill_key = (shift, ws)
             if last_backfill_key != backfill_key:
                 states = {st: StationState() for _, st in SRC_TABLES}
-                run_backfill_for_window(engine, ws, we, states)
+                run_backfill_for_window(engine_main, ws, we, states)
                 last_backfill_key = backfill_key
 
-            # 1) 마지막 PK 읽기
-            last_to_ts = read_last_pk_per_station(engine)
+            last_to_ts = read_last_pk_per_station(engine_main)
+
             last_pk_str = ", ".join(
-                [Demon_f"{k}={(v.strftime('%Y-%m-%d %H:%M:%S') if v else 'None')}" for k, v in last_to_ts.items()]
+                [f"{k}={(v.strftime('%Y-%m-%d %H:%M:%S') if v else 'None')}" for k, v in last_to_ts.items()]
             )
-            log_info(
-                Demon_f"[last_pk] shift={shift} prod_day={prod_day} "
-                Demon_f"window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S} | {last_pk_str}"
+            log(
+                f"[INFO] [last_pk] shift={shift} prod_day={prod_day} "
+                f"window={ws:%Y-%m-%d %H:%M:%S}~{we:%Y-%m-%d %H:%M:%S} | {last_pk_str}",
+                info="info",
             )
 
             total_fetched = 0
             total_pairs = 0
             total_attempted = 0
 
-            # 2) station별 신규 fetch/pair/insert (증분)
             for table, station in SRC_TABLES:
                 cursor_base = last_to_ts.get(station) or ws
                 if cursor_base < ws:
                     cursor_base = ws
 
-                df = fetch_src_logs(engine, table, station, ws, we, cursor_base, overlap_sec=CURSOR_OVERLAP_SEC)
-                fetched = len(df)
+                rows = fetch_src_logs(
+                    engine_main,
+                    table,
+                    station,
+                    ws,
+                    we,
+                    cursor_base,
+                    overlap_sec=CURSOR_OVERLAP_SEC,
+                )
+                fetched = len(rows)
                 total_fetched += fetched
-                log_info(Demon_f"[fetch] {station} cursor={cursor_base:%Y-%m-%d %H:%M:%S} -> rows={fetched}")
+                log(f"[INFO] [fetch] {station} cursor={cursor_base:%Y-%m-%d %H:%M:%S} rows={fetched}", info="info")
 
                 if fetched == 0:
                     continue
 
-                pairs, states[station] = pair_events(df, states[station])
+                pairs, states[station] = pair_events(rows, states[station])
                 pcount = len(pairs)
                 total_pairs += pcount
-                log_info(
-                    Demon_f"[pair ] {station} pairs={pcount} "
-                    Demon_f"(pending_ng={'y' if states[station].pending_ng_ts else 'n'}, "
-                    Demon_f"in_manual={'y' if states[station].in_manual else 'n'})"
+
+                log(
+                    f"[INFO] [pair] {station} pairs={pcount} "
+                    f"pending_ng={'y' if states[station].pending_ng_ts else 'n'} "
+                    f"in_manual={'y' if states[station].in_manual else 'n'}",
+                    info="info",
                 )
 
-                attempted = insert_rows(engine, pairs) if pcount > 0 else 0
+                attempted = insert_rows(engine_main, pairs) if pcount > 0 else 0
                 total_attempted += attempted
-                log_info(Demon_f"[ins  ] {station} attempted_insert={attempted} (dedup by pk/unique)")
+                log(f"[INFO] [ins] {station} attempted_insert={attempted}", info="info")
 
-            log_info(
-                Demon_f"[loop ] shift={shift} prod_day={prod_day} "
-                Demon_f"| fetched={total_fetched} | pairs={total_pairs} | attempted_insert={total_attempted}"
+            loop_t1 = time_mod.perf_counter()
+            log(
+                f"[PERF] shift={shift} prod_day={prod_day} "
+                f"fetched={total_fetched} pairs={total_pairs} attempted_insert={total_attempted} "
+                f"loop={loop_t1 - loop_t0:.3f}s qsize={db_log_queue.qsize()}",
+                info="perf",
             )
 
         except KeyboardInterrupt:
-            log_info("keyboardinterrupt -> exit")
+            log("[STOP] Interrupted by user", info="stop")
+            try:
+                health_worker.stop()
+                health_worker.join(timeout=15.0)
+                log("[INFO] HealthLogWorker stopped", info="info")
+            except Exception as e:
+                log_exc("[WARN] HealthLogWorker stop failed", e)
             break
+
         except Exception as e:
             if _is_connection_error(e):
-                log_retry(Demon_f"loop conn error -> rebuild | {type(e).__name__}: {repr(e)}")
-                _dispose_engine()
-                time.sleep(DB_RETRY_INTERVAL_SEC)
-                engine = get_engine_blocking()
+                log("[DB][RETRY] loop-level conn error -> rebuild main engine", info="down")
+                log_exc("[DB][RETRY] loop-level", e)
+                _dispose_engine_main()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine_main = get_engine_main_blocking()
             else:
-                log_error(Demon_f"{type(e).__name__}: {repr(e)}")
+                log("[ERROR] Loop error continue", info="error")
+                log_exc("[ERROR] Loop error", e)
 
-        elapsed = time.perf_counter() - loop_t0
-        sleep_sec = LOOP_INTERVAL_SEC - elapsed
-        if sleep_sec > 0:
-            log_info(Demon_f"sleep {sleep_sec:.3f}s")
-            time.sleep(sleep_sec)
+        elapsed = time_mod.perf_counter() - loop_t0
+        sleep_sec = max(0.0, LOOP_INTERVAL_SEC - elapsed)
+        time_mod.sleep(sleep_sec)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("[STOP] user interrupted Ctrl+C", info="stop")
+    except Exception as e:
+        log("[UNHANDLED] fatal error", info="error")
+        log_exc("[UNHANDLED]", e)
+        raise

@@ -1,67 +1,82 @@
 # -*- coding: utf-8 -*-
-# ============================================
 # d2_Vision_machine_log_factory.py
-# Vision Machine Log Parser (Realtime + Thread2 + TodayOnly) - OPTION A (DB가 중복 영구 차단)
+# ============================================
+# Vision 머신 로그 파싱 + PostgreSQL 적재 (실시간/중복방지/오늘자만)
 #
-# [핵심 운영 목표]
-# - 오늘 파일만 파싱 (Vision\YYYY\MM만 정확히 스캔)
-# - 스레드 2개 고정
-# - offset 기반 tail-follow (신규 라인만 처리)
-# - 중복은 DB에서 영구 차단(UNIQUE INDEX + ON CONFLICT DO NOTHING)
-# - 어떤 상황에서도 프로세스가 멈추지 않도록(예외는 로그 후 continue)
-# - INIT(스키마/테이블/인덱스) 실패 시 재시도
-# - 날짜 변경 시 캐시 초기화 + 해당일 커서(offset) DB 로드
-# - 커서(offset) DB 주기 저장/재시작 로드
+# 운영체계:
+# 1) 오늘(YYYY/MM) 폴더만 스캔
+# 2) ThreadPoolExecutor 재사용(파일 파싱 병렬)
+# 3) 바이너리 tail(rb) + byte offset 저장/복원
+# 4) pandas 제거 + psycopg2.execute_values bulk insert
+# 5) 커서 저장 주기 기본 30초
+# 6) 헬스 로그 DB 저장을 별도 스레드로 분리
+#    - 본 데이터 적재와 health log 적재 엔진 분리
+#    - queue.Queue 기반 producer-consumer
+# 7) DB 접속 실패/중간 끊김 시 무한 재시도
+# 8) pool 최소화 / engine 재사용 / work_mem 세션 적용
 #
-# [최종 안정화 포인트]
-# - ✅ 무한 루프 인터벌 5초
-# - ✅ DB 서버 접속 실패/실행 중 끊김: engine dispose 후 "연결 성공까지" 무한 재접속(블로킹)
-# - ✅ 상시 연결 1개로 고정(풀 최소화): pool_size=1, max_overflow=0
-# - ✅ work_mem 폭증 방지: connect 시 options로 -c work_mem=... (SET 바인드 파라미터 제거)
-# - ✅ INSERT 재시도 정책:
-#     * 연결 오류만 무한 재시도
-#     * 데이터/제약/인코딩 등 비연결 오류는 해당 배치 스킵(루프는 계속)
-# - ✅ 파일 로그 남김(콘솔 + 파일 동시 로깅, 일자별 롤링)
+# 대상:
+# - BASE_DIR\YYYY\MM\YYYYMMDD_Vision1_Machine_Log.txt
+# - BASE_DIR\YYYY\MM\YYYYMMDD_Vision2_Machine_Log.txt
 #
-# [추가 반영: 데몬 헬스 로그 DB 저장]
-# - ✅ 스키마: k_demon_heath_check (없으면 생성)
-# - ✅ 테이블: d2_log (없으면 생성)
-# - ✅ 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
-# - ✅ end_day, end_time, info, contents 순서로 DataFrame화 후 저장
+# DB:
+# - schema: d1_machine_log
+# - table : Vision1_machine_log, Vision2_machine_log
+# - dedup : (end_day, station, end_time, contents) UNIQUE INDEX
 #
-# [중요 수정(멈춤 방지)]
-# - ✅ UNC/NAS 파일 stat/open/read 블로킹 대비:
-#     * ThreadPoolExecutor future 처리에 timeout 적용
-#     * timeout 발생 시 해당 파일은 스킵하고 다음 루프로 진행(프로세스 절대 멈추지 않음)
-# - ENV: D2_PARSE_TIMEOUT_SEC (default=5)
+# health log:
+# - schema: k_demon_heath_check
+# - table : d2_log
+# - cols  : end_day, end_time, info, contents
 # ============================================
 
-import re
-import sys
+from __future__ import annotations
+
 import os
+import re
 import time as time_mod
 import atexit
 import traceback
+import threading
+import queue
+import urllib.parse
+
 from pathlib import Path
 from datetime import datetime
-from multiprocessing import freeze_support
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError  # ✅ TimeoutError 추가
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
-import urllib.parse
+
+try:
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
+except Exception:
+    psycopg2 = None  # type: ignore
 
 
 # ============================================
-# ✅ libpq/psycopg2 인코딩 안정화(EXE 환경)
+# psycopg2/libpq 인코딩 안정화
 # ============================================
 os.environ.setdefault("PGCLIENTENCODING", "UTF8")
 os.environ.setdefault("PGOPTIONS", "-c client_encoding=UTF8")
 
 
 # ============================================
-# 1) 기본 설정
+# 로그(콘솔 + 파일) / 날짜별 롤링
+# ============================================
+LOG_DIR = Path(os.getenv("D2_LOG_DIR", r"C:\AptivAgent\logs\d2_Vision_machine_log_factory"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_FILE_LOG_DISABLED = False
+
+
+def _log_file_path():
+    day = datetime.now().strftime("%Y%m%d")
+    return LOG_DIR / f"d2_Vision_machine_log_factory_{day}.log"
+
+
+# ============================================
+# DB / 경로 설정
 # ============================================
 BASE_DIR = Path(r"\\192.168.108.155\FCT LogFile\Machine Log\Vision")
 
@@ -70,163 +85,64 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",  # 비번은 보완 사항
+    "password": "",  # 비밀번호 입력
 }
 
-SCHEMA_NAME = "d1_machine_log"
-TABLE_MAP = {
-    "Vision1": "Vision1_machine_log",
-    "Vision2": "Vision2_machine_log",
-}
-
-THREAD_WORKERS = 2
-SLEEP_SEC = 5
-LOG_EVERY_LOOP = 10
-
-# ✅ UNC/NAS 블로킹 방지: 파일 파싱 future 전체 대기 상한(초)
-PARSE_FUTURE_TIMEOUT_SEC = int(os.getenv("D2_PARSE_TIMEOUT_SEC", "5"))
-
-# offset 캐시: path -> 마지막 읽은 파일 byte 위치
-PROCESSED_OFFSET = {}
-
-FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
-LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2}\.\d{2})\]\s*(.*)$")
-
-
-# ============================================
-# 2) 커서 DB 저장 설정
-# ============================================
-CURSOR_TABLE = "machine_log_cursor"
-CURSOR_SAVE_INTERVAL_SEC = 5
-_last_cursor_save_ts = 0.0
-_cursor_dirty_paths = set()
-
-
-# ============================================
-# 2-1) 데몬 헬스 로그 DB 저장 설정 (신규)
-# ============================================
-HEALTH_SCHEMA = "k_demon_heath_check"  # 사용자 사양 그대로 사용
+SCHEMA = "d1_machine_log"
+HEALTH_SCHEMA = "k_demon_heath_check"
 HEALTH_TABLE = "d2_log"
 
-RUNTIME_LOG_SAVE_INTERVAL_SEC = 5
-_last_runtime_log_save_ts = 0.0
-_runtime_log_buffer = []  # [{"end_day","end_time","info","contents"}, ...]
+TABLE_BY_STATION = {
+    "Vision1": '"Vision1_machine_log"',
+    "Vision2": '"Vision2_machine_log"',
+}
 
+CURSOR_TABLE = "machine_log_cursor"
 
-# ============================================
-# 3) DB 재시도 / 풀 최소화 / work_mem 제한
-# ============================================
-DB_RETRY_INTERVAL_SEC = 5
+FILENAME_PATTERN = re.compile(r"(\d{8})_Vision([12])_Machine_Log", re.IGNORECASE)
+LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?\]\s*(.*)$")
 
-# 예: 4MB, 16MB, 128kB, 1GB
+SLEEP_SEC = int(os.getenv("SLEEP_SEC", "5"))
+PARSE_WORKERS = int(os.getenv("PARSE_WORKERS", "2"))
+CURSOR_SAVE_INTERVAL_SEC = int(os.getenv("CURSOR_SAVE_INTERVAL_SEC", "30"))
+
+DB_RETRY_INTERVAL_SEC = int(os.getenv("DB_RETRY_INTERVAL_SEC", "5"))
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
-# keepalive (기본 ON, 필요 시 OFF)
-ENABLE_PG_KEEPALIVE = os.getenv("ENABLE_PG_KEEPALIVE", "1").strip() not in ("0", "false", "False", "OFF", "off")
 PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
 PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
 PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
-_ENGINE = None
+DB_LOG_QUEUE_MAX = int(os.getenv("DB_LOG_QUEUE_MAX", "10000"))
+DB_LOG_BATCH_SIZE = int(os.getenv("DB_LOG_BATCH_SIZE", "300"))
+DB_LOG_FLUSH_INTERVAL_SEC = float(os.getenv("DB_LOG_FLUSH_INTERVAL_SEC", "2.0"))
+DB_LOG_CONTENTS_MAXLEN = int(os.getenv("DB_LOG_CONTENTS_MAXLEN", "2000"))
 
 
 # ============================================
-# 4) ✅ 로그(콘솔 + 파일 동시) / 일자별 롤링
+# 전역 상태
 # ============================================
-LOG_DIR = Path(os.getenv("D2_LOG_DIR", r"C:\AptivAgent\logs\d2_Vision_machine_log_factory"))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_OFFSET: dict[str, int] = {}
+_cursor_dirty_paths: set[str] = set()
+_last_cursor_save_ts = 0.0
 
-_FILE_LOG_DISABLED = False
+_ENGINE_MAIN = None
+_ENGINE_HEALTH = None
 
-
-def _console_print(msg: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(Demon_f"[{ts}] {msg}", flush=True)
-
-
-def _log_file_path():
-    day = datetime.now().strftime("%Y%m%d")
-    return LOG_DIR / Demon_f"d2_Vision_machine_log_factory_{day}.log"
+db_log_queue: queue.Queue = queue.Queue(maxsize=max(1000, DB_LOG_QUEUE_MAX))
+_db_log_enabled = True
 
 
-def _normalize_info_tag(info: str) -> str:
-    s = (info or "info").strip().lower()
-    if not s:
-        s = "info"
-    return s
-
-
-def _append_runtime_log(info: str, contents: str):
-    """
-    사양:
-    - end_day: yyyymmdd
-    - end_time: hh:mi:ss
-    - info: 소문자
-    - contents: 나머지 내용
-    """
-    now = datetime.now()
-    rec = {
-        "end_day": now.strftime("%Y%m%d"),
-        "end_time": now.strftime("%H:%M:%S"),
-        "info": _normalize_info_tag(info),
-        "contents": str(contents or "")[:2000],  # 안전 길이 제한
-    }
-    _runtime_log_buffer.append(rec)
-
-
-def log(msg: str, info: str = "info", to_db: bool = True):
-    """
-    - 콘솔 + 파일 동시 기록
-    - 파일은 append, UTF-8
-    - 파일 기록 실패가 반복되면(_FILE_LOG_DISABLED) 콘솔만 유지
-    - 필요시 런타임 로그 버퍼에 적재 (나중에 DB flush)
-    """
-    global _FILE_LOG_DISABLED
-
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = Demon_f"[{ts}] {msg}"
-
-    # 1) 콘솔
-    print(line, flush=True)
-
-    # 2) 파일
-    if not _FILE_LOG_DISABLED:
-        try:
-            fp = _log_file_path()
-            with fp.open("a", encoding="utf-8", errors="ignore") as f:
-                f.write(line + "\n")
-        except Exception as e:
-            _FILE_LOG_DISABLED = True
-            print(Demon_f"[{ts}] [WARN] file logging disabled due to error: {type(e).__name__}: {e}", flush=True)
-
-    # 3) DB 버퍼
-    if to_db:
-        try:
-            _append_runtime_log(info=info, contents=msg)
-        except Exception:
-            pass
-
-
-def log_exc(prefix: str, e: Exception, info: str = "error"):
-    """
-    예외 상세(traceback)까지 파일로 남김 + DB 런타임 로그 버퍼 적재
-    """
-    log(Demon_f"{prefix}: {type(e).__name__}: {repr(e)}", info=info, to_db=True)
-    tb = traceback.format_exc()
-    for line in tb.rstrip().splitlines():
-        log(Demon_f"{prefix} TRACE: {line}", info=info, to_db=True)
-
-
-def pause_console():
-    try:
-        input("\n[END] 작업이 종료되었습니다. 콘솔을 닫으려면 Enter를 누르세요...")
-    except Exception:
-        pass
+# ============================================
+# 유틸
+# ============================================
+def _index_safe_name(table_quoted: str) -> str:
+    return table_quoted.replace('"', "").lower()
 
 
 def _masked_db_info(cfg=DB_CONFIG) -> str:
-    return Demon_f"postgresql://{cfg['user']}:***@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
+    return f"postgresql://{cfg['user']}:***@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
 
 
 def _is_connection_error(e: Exception) -> bool:
@@ -251,100 +167,235 @@ def _is_connection_error(e: Exception) -> bool:
     return any(k in msg for k in keywords)
 
 
-def _dispose_engine():
-    global _ENGINE
-    try:
-        if _ENGINE is not None:
-            _ENGINE.dispose()
-    except Exception:
-        pass
-    _ENGINE = None
+def _normalize_info(info: str) -> str:
+    if not info:
+        return "info"
+    s = re.sub(r"[^a-z0-9_]+", "_", info.strip().lower())
+    s = s.strip("_")
+    return s or "info"
 
 
-def _build_engine(config=DB_CONFIG):
-    user = config["user"]
-    password = urllib.parse.quote_plus(config["password"])
-    host = config["host"]
-    port = config["port"]
-    dbname = config["dbname"]
+def _infer_info_from_msg(msg: str) -> str:
+    m = (msg or "").lower()
+    if "[error]" in m or "trace" in m or "fatal" in m or "[unhandled]" in m:
+        return "error"
+    if "[retry]" in m or "down" in m or "failed" in m or "conn error" in m:
+        return "down"
+    if "[boot]" in m or "[ok]" in m:
+        return "boot"
+    if "[stop]" in m:
+        return "stop"
+    if "sleep" in m:
+        return "sleep"
+    if "[perf]" in m:
+        return "perf"
+    if "[warn]" in m:
+        return "warn"
+    return "info"
 
-    conn_str = (
-        Demon_f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
-        "?connect_timeout=5"
-    )
-    log(Demon_f"[INFO] DB={_masked_db_info(config)}", info="info")
 
-    connect_args = {
-        "connect_timeout": 5,
-        "application_name": "d2_Vision_machine_log_factory",
-        "options": Demon_f"-c work_mem={WORK_MEM}",
+def _decode_log_line(bline: bytes) -> str:
+    """
+    원본 Vision 로그가 UTF-8 형식이므로 UTF-8 계열을 우선 사용.
+    BOM 가능성 때문에 utf-8-sig 우선.
+    혹시 예외 파일이 섞여 들어오면 마지막 fallback으로 cp949 사용.
+    """
+    for enc in ("utf-8-sig", "utf-8", "cp949"):
+        try:
+            return bline.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return bline.decode("utf-8", errors="ignore")
+
+
+# ============================================
+# 로그
+# ============================================
+def _enqueue_db_log(info: str, contents: str):
+    global _db_log_enabled
+    if not _db_log_enabled:
+        return
+
+    now = datetime.now()
+    row = {
+        "end_day": now.strftime("%Y%m%d"),
+        "end_time": now.strftime("%H:%M:%S"),
+        "info": _normalize_info(info),
+        "contents": (contents or "")[:DB_LOG_CONTENTS_MAXLEN],
     }
 
-    if ENABLE_PG_KEEPALIVE:
-        connect_args.update({
-            "keepalives": PG_KEEPALIVES,
-            "keepalives_idle": PG_KEEPALIVES_IDLE,
-            "keepalives_interval": PG_KEEPALIVES_INTERVAL,
-            "keepalives_count": PG_KEEPALIVES_COUNT,
-        })
+    try:
+        db_log_queue.put_nowait(row)
+    except queue.Full:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] [WARN] db_log_queue full. health log dropped.", flush=True)
 
-    return create_engine(
+
+def log(msg: str, info: str | None = None):
+    global _FILE_LOG_DISABLED
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+
+    print(line, flush=True)
+
+    if not _FILE_LOG_DISABLED:
+        try:
+            fp = _log_file_path()
+            with fp.open("a", encoding="utf-8", errors="ignore") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            _FILE_LOG_DISABLED = True
+            print(f"[{ts}] [WARN] file logging disabled due to error: {type(e).__name__}: {e}", flush=True)
+
+    try:
+        tag = _normalize_info(info) if info else _infer_info_from_msg(msg)
+        _enqueue_db_log(tag, msg)
+    except Exception:
+        pass
+
+
+def log_exc(prefix: str, e: Exception):
+    log(f"{prefix}: {type(e).__name__}: {repr(e)}", info="error")
+    tb = traceback.format_exc()
+    for line in tb.rstrip().splitlines():
+        log(f"{prefix} TRACE: {line}", info="error")
+
+
+# ============================================
+# Engine 생성 / 관리
+# ============================================
+def _build_engine(cfg=DB_CONFIG, application_name: str = "vision_machine_log_parser"):
+    user = cfg["user"]
+    password = urllib.parse.quote_plus(cfg["password"])
+    host = cfg["host"]
+    port = cfg["port"]
+    dbname = cfg["dbname"]
+
+    conn_str = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+
+    eng = create_engine(
         conn_str,
         pool_pre_ping=True,
         pool_size=1,
         max_overflow=0,
         pool_timeout=30,
-        pool_recycle=300,
+        pool_recycle=1800,
         future=True,
-        connect_args=connect_args,
+        connect_args={
+            "connect_timeout": 5,
+            "keepalives": PG_KEEPALIVES,
+            "keepalives_idle": PG_KEEPALIVES_IDLE,
+            "keepalives_interval": PG_KEEPALIVES_INTERVAL,
+            "keepalives_count": PG_KEEPALIVES_COUNT,
+            "application_name": application_name,
+        },
     )
+    return eng
 
 
-def get_engine_blocking():
-    """
-    ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공까지 블로킹)
-    ✅ Engine 1개만 생성/재사용(풀 최소화)
-    """
-    global _ENGINE
+def _dispose_engine_main():
+    global _ENGINE_MAIN
+    try:
+        if _ENGINE_MAIN is not None:
+            _ENGINE_MAIN.dispose()
+    except Exception:
+        pass
+    _ENGINE_MAIN = None
 
-    # 1) 기존 엔진 ping
-    while _ENGINE is not None:
+
+def _dispose_engine_health():
+    global _ENGINE_HEALTH
+    try:
+        if _ENGINE_HEALTH is not None:
+            _ENGINE_HEALTH.dispose()
+    except Exception:
+        pass
+    _ENGINE_HEALTH = None
+
+
+def get_engine_main_blocking():
+    global _ENGINE_MAIN
+
+    while _ENGINE_MAIN is not None:
         try:
-            with _ENGINE.connect() as conn:
+            with _ENGINE_MAIN.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
-            return _ENGINE
+            return _ENGINE_MAIN
         except Exception as e:
-            log("[DB][RETRY] engine ping failed -> rebuild", info="down")
-            log_exc("[DB][RETRY] ping error", e, info="error")
-            _dispose_engine()
+            log("[DB][RETRY] main engine ping failed -> rebuild", info="down")
+            log_exc("[DB][RETRY] main ping error", e)
+            _dispose_engine_main()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
-    # 2) 새 엔진 생성/연결 재시도
     while True:
         try:
-            _ENGINE = _build_engine(DB_CONFIG)
-            with _ENGINE.connect() as conn:
+            _ENGINE_MAIN = _build_engine(DB_CONFIG, "vision_machine_log_parser_main")
+            with _ENGINE_MAIN.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(text("SELECT 1"))
-
-            ka = (
-                Demon_f"{PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}"
-                if ENABLE_PG_KEEPALIVE else "off"
+            log(
+                f"[DB][OK] main engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
+                info="boot",
             )
-            log(Demon_f"[DB][OK] engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, keepalive={ka})", info="info")
-            return _ENGINE
-
+            log(f"[INFO] MAIN DB = {_masked_db_info(DB_CONFIG)}", info="info")
+            return _ENGINE_MAIN
         except Exception as e:
-            log("[DB][RETRY] engine create/connect failed", info="down")
-            log_exc("[DB][RETRY] connect error", e, info="error")
-            _dispose_engine()
+            log("[DB][RETRY] main engine create/connect failed", info="down")
+            log_exc("[DB][RETRY] main connect error", e)
+            _dispose_engine_main()
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+def get_engine_health_blocking():
+    global _ENGINE_HEALTH
+
+    while _ENGINE_HEALTH is not None:
+        try:
+            with _ENGINE_HEALTH.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text("SELECT 1"))
+            return _ENGINE_HEALTH
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] health engine ping failed: {e}", flush=True)
+            _dispose_engine_health()
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+    while True:
+        try:
+            _ENGINE_HEALTH = _build_engine(DB_CONFIG, "vision_machine_log_parser_health")
+            with _ENGINE_HEALTH.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text("SELECT 1"))
+            log("[DB][OK] health engine ready (dedicated for health log)", info="boot")
+            return _ENGINE_HEALTH
+        except Exception as e:
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] health engine create/connect failed: "
+                f"{type(e).__name__}: {e}",
+                flush=True
+            )
+            _dispose_engine_health()
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
 
 
 # ============================================
-# 5) 스키마/테이블/인덱스 (중복 영구 차단)
+# DDL
 # ============================================
-CREATE_CURSOR_TABLE_SQL = Demon_f"""
-CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{CURSOR_TABLE} (
+CREATE_TABLE_TEMPLATE = """
+CREATE TABLE IF NOT EXISTS {schema}.{table} (
+    id          BIGSERIAL PRIMARY KEY,
+    end_day     VARCHAR(8),
+    station     VARCHAR(10),
+    end_time    VARCHAR(12),
+    contents    VARCHAR(200)
+);
+"""
+
+CREATE_CURSOR_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {SCHEMA}.{CURSOR_TABLE} (
     path         TEXT PRIMARY KEY,
     file_day     VARCHAR(8) NOT NULL,
     station      VARCHAR(10),
@@ -354,80 +405,83 @@ CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{CURSOR_TABLE} (
 );
 """
 
-CREATE_CURSOR_DAY_INDEX_SQL = Demon_f"""
-CREATE INDEX IF NOT EXISTS ix_{SCHEMA_NAME}_{CURSOR_TABLE}_day
-ON {SCHEMA_NAME}.{CURSOR_TABLE} (file_day);
+CREATE_CURSOR_DAY_INDEX_SQL = f"""
+CREATE INDEX IF NOT EXISTS ix_{SCHEMA}_{CURSOR_TABLE}_day
+ON {SCHEMA}.{CURSOR_TABLE} (file_day);
 """
 
-CREATE_HEALTH_TABLE_SQL = Demon_f"""
+CREATE_HEALTH_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {HEALTH_SCHEMA}.{HEALTH_TABLE} (
+    id        BIGSERIAL PRIMARY KEY,
     end_day   VARCHAR(8)  NOT NULL,
     end_time  VARCHAR(8)  NOT NULL,
-    info      VARCHAR(50) NOT NULL,
+    info      VARCHAR(32) NOT NULL,
     contents  TEXT
 );
 """
 
-CREATE_HEALTH_INDEX_SQL = Demon_f"""
+CREATE_HEALTH_INDEX_SQL = f"""
 CREATE INDEX IF NOT EXISTS ix_{HEALTH_SCHEMA}_{HEALTH_TABLE}_day_time
 ON {HEALTH_SCHEMA}.{HEALTH_TABLE} (end_day, end_time);
 """
 
 
-def ensure_schema_tables(engine):
-    """
-    INIT 실패 시 재시도(블로킹)
-    - 테이블 생성
-    - UNIQUE INDEX 생성(중복 영구 차단)
-    - 커서 테이블 생성
-    - 헬스 로그 스키마/테이블 생성
-    """
-    ddl_template = """
-    CREATE TABLE IF NOT EXISTS {schema}."{table}" (
-        end_day     VARCHAR(8),
-        station     VARCHAR(10),
-        end_time    VARCHAR(12),
-        contents    VARCHAR(200)
-    );
-    """
+def ensure_schema_and_tables(engine_main, engine_health):
     while True:
         try:
-            with engine.begin() as conn:
-                conn.execute(text(Demon_f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"))
-                for _, tbl in TABLE_MAP.items():
-                    conn.execute(text(ddl_template.format(schema=SCHEMA_NAME, table=tbl)))
+            with engine_main.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
 
-                    idx_name = Demon_f'ux_{SCHEMA_NAME}_{tbl}_dedup'
-                    conn.execute(text(Demon_f"""
-                        CREATE UNIQUE INDEX IF NOT EXISTS {idx_name}
-                        ON {SCHEMA_NAME}."{tbl}" (end_day, station, end_time, contents)
-                    """))
+                for station, table_quoted in TABLE_BY_STATION.items():
+                    ddl = CREATE_TABLE_TEMPLATE.format(schema=SCHEMA, table=table_quoted)
+                    conn.execute(text(ddl))
+                    log(f"[INFO] Table ensured: {SCHEMA}.{table_quoted}", info="info")
+
+                    idx_name = f"ux_{SCHEMA}_{_index_safe_name(table_quoted)}_dedup"
+                    conn.execute(
+                        text(
+                            f"""
+                            CREATE UNIQUE INDEX IF NOT EXISTS {idx_name}
+                            ON {SCHEMA}.{table_quoted} (end_day, station, end_time, contents)
+                            """
+                        )
+                    )
+                    log(f"[INFO] Unique index ensured: {idx_name}", info="info")
 
                 conn.execute(text(CREATE_CURSOR_TABLE_SQL))
                 conn.execute(text(CREATE_CURSOR_DAY_INDEX_SQL))
+                log(f"[INFO] Cursor table ensured: {SCHEMA}.{CURSOR_TABLE}", info="info")
 
-                conn.execute(text(Demon_f"CREATE SCHEMA IF NOT EXISTS {HEALTH_SCHEMA}"))
+            with engine_health.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {HEALTH_SCHEMA}"))
                 conn.execute(text(CREATE_HEALTH_TABLE_SQL))
                 conn.execute(text(CREATE_HEALTH_INDEX_SQL))
+                log(f"[INFO] Health log table ensured: {HEALTH_SCHEMA}.{HEALTH_TABLE}", info="info")
 
-            log("[INFO] Schema/tables/indexes ready (incl. cursor + health log table).", info="info")
             return
 
         except Exception as e:
             if _is_connection_error(e):
-                log("[DB][RETRY] ensure_schema_tables conn error -> rebuild", info="down")
-                log_exc("[DB][RETRY] ensure_schema_tables", e, info="error")
-                _dispose_engine()
-            else:
-                log("[FATAL-INIT][RETRY] ensure_schema_tables failed", info="error")
-                log_exc("[FATAL-INIT][RETRY] ensure_schema_tables", e, info="error")
+                log("[DB][RETRY] ensure_schema_and_tables conn error -> rebuild", info="down")
+                log_exc("[DB][RETRY] ensure_schema_and_tables", e)
+                _dispose_engine_main()
+                _dispose_engine_health()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine_main = get_engine_main_blocking()
+                engine_health = get_engine_health_blocking()
+                continue
 
+            log("[DB][RETRY] ensure_schema_and_tables failed", info="down")
+            log_exc("[DB][RETRY] ensure_schema_and_tables", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
-            engine = get_engine_blocking()
+            engine_main = get_engine_main_blocking()
+            engine_health = get_engine_health_blocking()
 
 
 # ============================================
-# 6) 커서 유틸
+# 파일명에서 file_day station 추출
 # ============================================
 def extract_day_station_from_path(path_str: str):
     p = Path(path_str)
@@ -435,48 +489,55 @@ def extract_day_station_from_path(path_str: str):
     if not m:
         return None, None
     file_day = m.group(1)
-    vision_no = m.group(2)
-    station = Demon_f"Vision{vision_no}"
+    station = f"Vision{m.group(2)}"
     return file_day, station
 
 
-def load_today_offsets_from_db(engine, today_ymd: str):
+# ============================================
+# 커서 로드 / 저장
+# ============================================
+def load_today_offsets_from_db(engine, today_ymd: str) -> dict[str, int]:
     while True:
         try:
-            loaded = {}
+            loaded: dict[str, int] = {}
             with engine.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 rows = conn.execute(
-                    text(Demon_f"""
+                    text(
+                        f"""
                         SELECT path, byte_offset
-                        FROM {SCHEMA_NAME}.{CURSOR_TABLE}
+                        FROM {SCHEMA}.{CURSOR_TABLE}
                         WHERE file_day = :today
-                    """),
-                    {"today": today_ymd}
+                        """
+                    ),
+                    {"today": today_ymd},
                 ).fetchall()
 
                 for r in rows:
                     loaded[str(r[0])] = int(r[1])
 
             if loaded:
-                log(Demon_f"[INFO] Loaded cursor offsets from DB: {len(loaded)} file(s) for {today_ymd}", info="info")
+                log(f"[INFO] Loaded cursor offsets from DB: {len(loaded)} file(s) for {today_ymd}", info="info")
             else:
-                log(Demon_f"[INFO] No cursor offsets in DB for {today_ymd} (fresh start)", info="info")
+                log(f"[INFO] No cursor offsets in DB for {today_ymd} (fresh start)", info="info")
             return loaded
 
         except Exception as e:
             if _is_connection_error(e):
                 log("[DB][RETRY] load_today_offsets conn error -> rebuild", info="down")
-                log_exc("[DB][RETRY] load_today_offsets", e, info="error")
-                _dispose_engine()
-            else:
-                log("[DB][RETRY] load_today_offsets failed", info="error")
-                log_exc("[DB][RETRY] load_today_offsets", e, info="error")
+                log_exc("[DB][RETRY] load_today_offsets", e)
+                _dispose_engine_main()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine = get_engine_main_blocking()
+                continue
 
+            log("[DB][RETRY] load_today_offsets failed", info="down")
+            log_exc("[DB][RETRY] load_today_offsets", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
-            engine = get_engine_blocking()
+            engine = get_engine_main_blocking()
 
 
-def upsert_cursor_offsets_to_db(engine, path_to_offset: dict):
+def upsert_cursor_offsets_to_db(engine, path_to_offset: dict[str, int]):
     if not path_to_offset:
         return
 
@@ -491,19 +552,22 @@ def upsert_cursor_offsets_to_db(engine, path_to_offset: dict):
         except Exception:
             file_size = None
 
-        records.append({
-            "path": path_str,
-            "file_day": file_day,
-            "station": station,
-            "byte_offset": int(off),
-            "file_size": file_size,
-        })
+        records.append(
+            {
+                "path": path_str,
+                "file_day": file_day,
+                "station": station,
+                "byte_offset": int(off),
+                "file_size": file_size,
+            }
+        )
 
     if not records:
         return
 
-    sql = text(Demon_f"""
-        INSERT INTO {SCHEMA_NAME}.{CURSOR_TABLE}
+    sql = text(
+        f"""
+        INSERT INTO {SCHEMA}.{CURSOR_TABLE}
             (path, file_day, station, byte_offset, file_size)
         VALUES
             (:path, :file_day, :station, :byte_offset, :file_size)
@@ -513,28 +577,33 @@ def upsert_cursor_offsets_to_db(engine, path_to_offset: dict):
             byte_offset = EXCLUDED.byte_offset,
             file_size   = EXCLUDED.file_size,
             updated_at  = now()
-    """)
+        """
+    )
 
     while True:
         try:
             with engine.begin() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
                 conn.execute(sql, records)
-            log(Demon_f"[INFO] Cursor saved to DB: {len(records)} file(s)", info="info")
+            log(f"[INFO] Cursor saved to DB: {len(records)} file(s)", info="info")
             return
+
         except Exception as e:
             if _is_connection_error(e):
                 log("[DB][RETRY] cursor upsert conn error -> rebuild", info="down")
-                log_exc("[DB][RETRY] cursor upsert", e, info="error")
-                _dispose_engine()
-            else:
-                log("[DB][RETRY] cursor upsert failed", info="error")
-                log_exc("[DB][RETRY] cursor upsert", e, info="error")
+                log_exc("[DB][RETRY] cursor upsert", e)
+                _dispose_engine_main()
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                engine = get_engine_main_blocking()
+                continue
 
+            log("[DB][RETRY] cursor upsert failed", info="down")
+            log_exc("[DB][RETRY] cursor upsert", e)
             time_mod.sleep(DB_RETRY_INTERVAL_SEC)
-            engine = get_engine_blocking()
+            engine = get_engine_main_blocking()
 
 
-def maybe_save_cursor(engine, force=False):
+def maybe_save_cursor(engine, force: bool = False):
     global _last_cursor_save_ts, _cursor_dirty_paths
 
     now_ts = time_mod.time()
@@ -547,7 +616,7 @@ def maybe_save_cursor(engine, force=False):
     if not _cursor_dirty_paths:
         return
 
-    payload = {p: PROCESSED_OFFSET.get(p, 0) for p in list(_cursor_dirty_paths)}
+    payload = {p: int(PROCESSED_OFFSET.get(p, 0)) for p in list(_cursor_dirty_paths)}
     upsert_cursor_offsets_to_db(engine, payload)
 
     _cursor_dirty_paths.clear()
@@ -555,160 +624,76 @@ def maybe_save_cursor(engine, force=False):
 
 
 # ============================================
-# 6-1) 런타임 로그(DB) 저장 유틸 (신규)
+# contents 정리
 # ============================================
-def flush_runtime_logs_to_db(engine, force=False):
-    """
-    - 버퍼를 DataFrame으로 만든 뒤
-      [end_day, end_time, info, contents] 순서로 DB 저장
-    - 연결 오류는 무한 재시도
-    - 비연결 오류는 해당 flush만 스킵(메인 루프 계속)
-    """
-    global _last_runtime_log_save_ts, _runtime_log_buffer
-
-    if not _runtime_log_buffer:
-        return
-
-    now_ts = time_mod.time()
-    if not force and (now_ts - _last_runtime_log_save_ts) < RUNTIME_LOG_SAVE_INTERVAL_SEC:
-        return
-
-    df = pd.DataFrame(_runtime_log_buffer, columns=["end_day", "end_time", "info", "contents"])
-    if df.empty:
-        _last_runtime_log_save_ts = now_ts
-        return
-
-    sql = text(Demon_f"""
-        INSERT INTO {HEALTH_SCHEMA}.{HEALTH_TABLE}
-            (end_day, end_time, info, contents)
-        VALUES
-            (:end_day, :end_time, :info, :contents)
-    """)
-
-    records = df.to_dict(orient="records")
-
-    while True:
-        try:
-            with engine.begin() as conn:
-                conn.execute(sql, records)
-
-            saved_n = len(records)
-            _runtime_log_buffer = []
-            _last_runtime_log_save_ts = now_ts
-
-            log(Demon_f"[INFO] runtime logs saved to DB: {saved_n}", info="info", to_db=False)
-            return
-
-        except Exception as e:
-            if _is_connection_error(e):
-                _console_print("[DB][RETRY] runtime log flush conn error -> rebuild")
-                _console_print(Demon_f"[DB][RETRY] runtime log flush: {type(e).__name__}: {e}")
-                _dispose_engine()
-                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
-                engine = get_engine_blocking()
-                continue
-
-            _console_print(Demon_f"[DB][SKIP] runtime log flush non-conn error: {type(e).__name__}: {e}")
-            _last_runtime_log_save_ts = now_ts
-            return
-
-
-# ============================================
-# 7) 파일 파싱 유틸
-# ============================================
-def clean_contents(raw: str, max_len: int = 200):
+def clean_contents(raw: str, max_len: int = 200) -> str:
     s = raw.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     s = " ".join(s.split())
     return s[:max_len].strip()
 
 
-def _open_text_file(path: Path):
-    try:
-        return path.open("r", encoding="utf-8", errors="ignore")
-    except Exception:
-        return path.open("r", encoding="cp949", errors="ignore")
+# ============================================
+# 단일 로그 파일 파싱 binary tail follow
+# ============================================
+def parse_machine_log_file_tail_binary(path_str: str, offset: int, today_ymd: str):
+    path = Path(path_str)
 
-
-def list_target_files_today(base_dir: Path, today_ymd: str):
-    files = []
-    if not base_dir.exists():
-        log(Demon_f"[WARN] BASE_DIR not found: {base_dir}", info="warn")
-        return files
-
-    now = datetime.now()
-    year_dir = base_dir / Demon_f"{now.year:04d}"
-    month_dir = year_dir / Demon_f"{now.month:02d}"
-
-    if not month_dir.exists():
-        log(Demon_f"[WARN] month_dir not found: {month_dir}", info="warn")
-        return files
-
-    candidates = [
-        month_dir / Demon_f"{today_ymd}_Vision1_Machine_Log.txt",
-        month_dir / Demon_f"{today_ymd}_Vision2_Machine_Log.txt",
-    ]
-
-    for fp in candidates:
-        if fp.is_file():
-            files.append(str(fp))
-
-    if not files:
-        for fp in month_dir.glob(Demon_f"{today_ymd}_Vision*_Machine_Log.*"):
-            if fp.is_file() and FILENAME_PATTERN.search(fp.name):
-                files.append(str(fp))
-
-    return sorted(set(files))
-
-
-def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
-    file_path = Path(path_str)
-
-    m = FILENAME_PATTERN.search(file_path.name)
+    m = FILENAME_PATTERN.search(path.name)
     if not m:
-        return [], offset, None, path_str, "skip_badname"
+        return {"path": path_str, "station": None, "new_offset": offset, "rows": [], "status": "SKIP_BADNAME"}
 
     file_ymd = m.group(1)
-    vision_no = m.group(2)
-    station = Demon_f"Vision{vision_no}"
+    station = f"Vision{m.group(2)}"
 
     if file_ymd != today_ymd:
-        return [], offset, station, path_str, "skip_not_today"
+        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": "SKIP_NOT_TODAY"}
 
     try:
-        size = file_path.stat().st_size
+        size = path.stat().st_size
     except Exception as e:
-        return [], offset, station, path_str, Demon_f"error_stat:{type(e).__name__.lower()}"
+        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": f"ERROR_STAT:{type(e).__name__}"}
 
     if offset > size:
         offset = 0
-
     if offset == size:
-        return [], offset, station, path_str, "sleep"
+        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": "SKIP_NOCHANGE"}
 
-    result = []
+    rows = []
     new_offset = offset
 
     try:
-        with _open_text_file(file_path) as f:
+        with path.open("rb") as f:
             f.seek(offset, os.SEEK_SET)
 
-            for line in f:
-                line = line.rstrip("\n")
-                m2 = LINE_PATTERN.match(line)
-                if not m2:
+            while True:
+                pos = f.tell()
+                bline = f.readline()
+                if not bline:
+                    break
+
+                # 마지막 줄이 아직 쓰는 중이면 보류
+                if not bline.endswith(b"\n"):
+                    f.seek(pos, os.SEEK_SET)
+                    break
+
+                line = _decode_log_line(bline).rstrip("\r\n")
+                mm = LINE_PATTERN.match(line)
+                if not mm:
                     continue
 
-                end_time_str = m2.group(1)
-                contents_raw = m2.group(2)
+                hms = mm.group(1)
+                frac = mm.group(2) or ""
+                contents_raw = mm.group(3)
 
-                try:
-                    _ = datetime.strptime(end_time_str, "%H:%M:%S.%Demon_f_mining").time()
-                except ValueError:
+                frac2 = (frac.ljust(2, "0")[:2] if frac else "00")
+                end_time_str = f"{hms}.{frac2}"
+
+                if len(end_time_str) != 11 or end_time_str[2] != ":" or end_time_str[5] != ":" or end_time_str[8] != ".":
                     continue
 
                 contents = clean_contents(contents_raw, max_len=200)
 
-                result.append(
+                rows.append(
                     {
                         "end_day": file_ymd,
                         "station": station,
@@ -720,247 +705,433 @@ def parse_machine_log_file_tail(path_str: str, today_ymd: str, offset: int):
             new_offset = f.tell()
 
     except Exception as e:
-        log(Demon_f"[WARN] Failed to read(tail): {file_path} / {type(e).__name__}: {e}", info="error")
-        return [], offset, station, path_str, Demon_f"error_read:{type(e).__name__.lower()}"
+        return {"path": path_str, "station": station, "new_offset": offset, "rows": [], "status": f"ERROR_READ:{type(e).__name__}:{e}"}
 
-    return result, int(new_offset), station, path_str, "ok"
+    return {"path": path_str, "station": station, "new_offset": new_offset, "rows": rows, "status": "OK"}
 
 
 # ============================================
-# 8) DB INSERT (중복 무시) + 재시도 정책(연결 오류만 무한)
+# 오늘 파일 목록 수집
 # ============================================
-def insert_to_db(engine, df: pd.DataFrame):
-    if df is None or df.empty:
+def list_target_files_today_only(today_ymd: str) -> list[str]:
+    files: list[str] = []
+
+    if not BASE_DIR.exists():
+        log(f"[WARN] BASE_DIR not found: {BASE_DIR}", info="down")
+        return files
+
+    year = today_ymd[:4]
+    month = today_ymd[4:6]
+    month_dir = BASE_DIR / year / month
+
+    if not month_dir.exists():
+        return files
+
+    try:
+        for file_path in month_dir.iterdir():
+            if not file_path.is_file():
+                continue
+            m = FILENAME_PATTERN.search(file_path.name)
+            if not m:
+                continue
+            file_ymd = m.group(1)
+            if file_ymd != today_ymd:
+                continue
+            files.append(str(file_path))
+    except Exception as e:
+        log("[WARN] list_target_files_today_only failed", info="error")
+        log_exc("[WARN] list_target_files_today_only", e)
+
+    return files
+
+
+# ============================================
+# ThreadPool로 tail follow 파싱
+# ============================================
+def collect_all_rows_threadpool(executor: ThreadPoolExecutor, file_list: list[str], today_ymd: str):
+    data_by_station: dict[str, list[dict]] = {st: [] for st in TABLE_BY_STATION.keys()}
+    offset_updates: dict[str, int] = {}
+
+    if not file_list:
+        return data_by_station, offset_updates
+
+    futures = []
+    for fp in file_list:
+        off = int(PROCESSED_OFFSET.get(fp, 0))
+        futures.append(executor.submit(parse_machine_log_file_tail_binary, fp, off, today_ymd))
+
+    for fut in as_completed(futures):
+        out = fut.result()
+        fp = out["path"]
+        st = out["station"]
+        offset_updates[fp] = int(out["new_offset"])
+
+        if out["status"] == "OK" and out["rows"]:
+            if st in data_by_station:
+                data_by_station[st].extend(out["rows"])
+
+    return data_by_station, offset_updates
+
+
+# ============================================
+# DB INSERT
+# ============================================
+def _bulk_insert_executemany(conn, full_table: str, rows: list[dict]):
+    if not rows:
         return 0
 
-    df = df.sort_values(["end_day", "end_time"]).reset_index(drop=True)
+    insert_sql = text(
+        f"""
+        INSERT INTO {full_table} (end_day, station, end_time, contents)
+        VALUES (:end_day, :station, :end_time, :contents)
+        ON CONFLICT (end_day, station, end_time, contents) DO NOTHING
+        """
+    )
+    conn.execute(insert_sql, rows)
+    return len(rows)
 
-    insert_sql_map = {
-        st: text(Demon_f"""
-            INSERT INTO {SCHEMA_NAME}."{tbl}" (end_day, station, end_time, contents)
-            VALUES (:end_day, :station, :end_time, :contents)
-            ON CONFLICT (end_day, station, end_time, contents)
-            DO NOTHING
-        """)
-        for st, tbl in TABLE_MAP.items()
-    }
 
+def _bulk_insert_execute_values(conn, full_table: str, rows: list[dict]):
+    if not rows:
+        return 0
+
+    dbapi_conn = getattr(conn.connection, "connection", None)
+    if dbapi_conn is None or psycopg2 is None:
+        return _bulk_insert_executemany(conn, full_table, rows)
+
+    cur = dbapi_conn.cursor()
+    sql = f"""
+        INSERT INTO {full_table} (end_day, station, end_time, contents)
+        VALUES %s
+        ON CONFLICT (end_day, station, end_time, contents) DO NOTHING
+    """
+    values = [(r["end_day"], r["station"], r["end_time"], r["contents"]) for r in rows]
+    page_size = int(os.getenv("INSERT_PAGE_SIZE", "2000"))
+
+    psycopg2.extras.execute_values(cur, sql, values, page_size=page_size)  # type: ignore
+    return len(values)
+
+
+def insert_to_db(engine, data_by_station: dict[str, list[dict]]):
     while True:
         try:
-            inserted_attempt = 0
+            total_attempt = 0
             with engine.begin() as conn:
-                for st, _tbl in TABLE_MAP.items():
-                    sub = df[df["station"] == st]
-                    if sub.empty:
-                        continue
-                    records = sub.to_dict(orient="records")
-                    conn.execute(insert_sql_map[st], records)
-                    inserted_attempt += len(records)
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
 
-            return inserted_attempt
+                for station, rows in data_by_station.items():
+                    if not rows:
+                        continue
+
+                    full_table = f"{SCHEMA}.{TABLE_BY_STATION[station]}"
+
+                    if os.getenv("LOCAL_DEDUP", "1") == "1":
+                        seen = set()
+                        deduped = []
+                        for r in rows:
+                            k = (r["end_day"], r["station"], r["end_time"], r["contents"])
+                            if k in seen:
+                                continue
+                            seen.add(k)
+                            deduped.append(r)
+                        rows = deduped
+
+                    attempted = _bulk_insert_execute_values(conn, full_table, rows)
+                    total_attempt += attempted
+                    log(f"[INFO] Insert attempted {attempted} rows → {full_table} (duplicates ignored)", info="info")
+
+            if total_attempt:
+                log(f"[INFO] Insert batch done. attempted_total={total_attempt}", info="info")
+            return
 
         except Exception as e:
             if _is_connection_error(e):
-                log("[DB][RETRY] insert conn error -> rebuild engine", info="down")
-                log_exc("[DB][RETRY] insert", e, info="error")
-                _dispose_engine()
+                log("[DB][RETRY] insert_to_db conn error -> rebuild main engine", info="down")
+                log_exc("[DB][RETRY] insert_to_db", e)
+                _dispose_engine_main()
                 time_mod.sleep(DB_RETRY_INTERVAL_SEC)
-                engine = get_engine_blocking()
+                engine = get_engine_main_blocking()
                 continue
 
-            log("[DB][SKIP] insert non-conn error -> drop this batch", info="error")
-            log_exc("[DB][SKIP] insert", e, info="error")
-            return 0
+            log("[DB][RETRY] insert_to_db failed", info="down")
+            log_exc("[DB][RETRY] insert_to_db", e)
+            time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+            engine = get_engine_main_blocking()
 
 
 # ============================================
-# 9) main loop
+# Health log worker
+# ============================================
+class HealthLogWorker:
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="HealthLogWorker", daemon=True)
+        self._local_buffer: list[dict] = []
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def join(self, timeout: float | None = None):
+        self.thread.join(timeout=timeout)
+
+    def _flush_batch(self, batch: list[dict]):
+        if not batch:
+            return
+
+        while True:
+            try:
+                engine = get_engine_health_blocking()
+                with engine.begin() as conn:
+                    conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO {HEALTH_SCHEMA}.{HEALTH_TABLE}
+                            (end_day, end_time, info, contents)
+                            VALUES
+                            (:end_day, :end_time, :info, :contents)
+                            """
+                        ),
+                        batch,
+                    )
+                return
+
+            except Exception as e:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}] [WARN] health log flush failed: {type(e).__name__}: {e}", flush=True)
+
+                if _is_connection_error(e):
+                    _dispose_engine_health()
+
+                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+
+    def _drain_queue(self, max_items: int):
+        drained = 0
+        while drained < max_items:
+            try:
+                item = db_log_queue.get_nowait()
+                self._local_buffer.append(item)
+                drained += 1
+            except queue.Empty:
+                break
+
+    def _run(self):
+        last_flush_ts = time_mod.time()
+
+        while not self.stop_event.is_set():
+            try:
+                timeout = max(0.2, DB_LOG_FLUSH_INTERVAL_SEC / 2.0)
+                try:
+                    item = db_log_queue.get(timeout=timeout)
+                    self._local_buffer.append(item)
+                except queue.Empty:
+                    pass
+
+                self._drain_queue(max_items=max(0, DB_LOG_BATCH_SIZE - len(self._local_buffer)))
+
+                now_ts = time_mod.time()
+                need_flush = False
+
+                if len(self._local_buffer) >= DB_LOG_BATCH_SIZE:
+                    need_flush = True
+                elif self._local_buffer and (now_ts - last_flush_ts) >= DB_LOG_FLUSH_INTERVAL_SEC:
+                    need_flush = True
+
+                if need_flush:
+                    batch = self._local_buffer[:DB_LOG_BATCH_SIZE]
+                    del self._local_buffer[:len(batch)]
+                    self._flush_batch(batch)
+                    last_flush_ts = now_ts
+
+            except Exception as e:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}] [WARN] HealthLogWorker loop error: {type(e).__name__}: {e}", flush=True)
+                time_mod.sleep(1.0)
+
+        # 종료 시 남은 queue + local buffer flush
+        try:
+            while True:
+                try:
+                    item = db_log_queue.get_nowait()
+                    self._local_buffer.append(item)
+                except queue.Empty:
+                    break
+
+            while self._local_buffer:
+                batch = self._local_buffer[:DB_LOG_BATCH_SIZE]
+                del self._local_buffer[:len(batch)]
+                self._flush_batch(batch)
+
+        except Exception as e:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}] [WARN] HealthLogWorker final flush error: {type(e).__name__}: {e}", flush=True)
+
+
+# ============================================
+# main
 # ============================================
 def main():
-    global _last_cursor_save_ts
+    global _cursor_dirty_paths
 
-    log("### BUILD: d2 Vision parser OPTION-A (TAIL-FOLLOW) + cursor-persist + db-blocking + pool-min + healthlog-db ###", info="info")
-    log(Demon_f"[INFO] LOG_DIR={LOG_DIR}", info="info")
-    log(Demon_f"[INFO] HEALTH_LOG_TABLE={HEALTH_SCHEMA}.{HEALTH_TABLE}", info="info")
-    log(Demon_f"[INFO] PARSE_FUTURE_TIMEOUT_SEC={PARSE_FUTURE_TIMEOUT_SEC}", info="info")
+    log("[BOOT] d2_Vision_machine_log_factory starting", info="boot")
+    log(f"[INFO] LOG_DIR={LOG_DIR}", info="info")
+    log(f"[INFO] BASE_DIR = {BASE_DIR}", info="info")
+    log(f"[INFO] Realtime mode: binary tail-follow (byte offset), loop every {SLEEP_SEC}s", info="info")
+    log("[INFO] Only today's files are tailed. Cursor is persisted to DB periodically.", info="info")
+    log(f"[INFO] Cursor save interval = {CURSOR_SAVE_INTERVAL_SEC}s", info="info")
+    log(f"[INFO] Parse workers = {PARSE_WORKERS} (ThreadPoolExecutor)", info="info")
+    log(f"[INFO] MAIN engine pool minimized: pool_size=1, max_overflow=0 | session work_mem={WORK_MEM}", info="info")
+    log(f"[INFO] HEALTH engine dedicated: pool_size=1, max_overflow=0 | flush_interval={DB_LOG_FLUSH_INTERVAL_SEC}s", info="info")
+    log(f"[INFO] health log queue max={DB_LOG_QUEUE_MAX}, batch={DB_LOG_BATCH_SIZE}", info="info")
+    log(f"[INFO] keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT}", info="info")
 
-    engine = get_engine_blocking()
-    ensure_schema_tables(engine)
+    engine_main = get_engine_main_blocking()
+    engine_health = get_engine_health_blocking()
+    ensure_schema_and_tables(engine_main, engine_health)
 
-    today_ymd_init = datetime.now().strftime("%Y%m%d")
-    loaded = load_today_offsets_from_db(engine, today_ymd_init)
+    health_worker = HealthLogWorker()
+    health_worker.start()
+    log("[INFO] HealthLogWorker started", info="info")
+
+    today_ymd = datetime.now().strftime("%Y%m%d")
+    loaded = load_today_offsets_from_db(engine_main, today_ymd)
     if loaded:
         PROCESSED_OFFSET.update(loaded)
 
     def _on_exit():
         try:
-            maybe_save_cursor(engine, force=True)
+            eng = get_engine_main_blocking()
+            maybe_save_cursor(eng, force=True)
         except Exception as e:
             log("[WARN] Exit cursor save failed", info="error")
-            log_exc("[WARN] Exit cursor save failed", e, info="error")
+            log_exc("[WARN] Exit cursor save failed", e)
 
         try:
-            flush_runtime_logs_to_db(engine, force=True)
+            health_worker.stop()
+            health_worker.join(timeout=15.0)
         except Exception as e:
-            _console_print(Demon_f"[WARN] Exit runtime-log flush failed: {type(e).__name__}: {e}")
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}] [WARN] health worker shutdown failed: {e}", flush=True)
+
+        _dispose_engine_main()
+        _dispose_engine_health()
 
     atexit.register(_on_exit)
 
-    log("=" * 78, info="info")
-    log("[START] d2 Vision machine log realtime parser", info="info")
-    log(Demon_f"[INFO] BASE_DIR={BASE_DIR}", info="info")
-    log(Demon_f"[INFO] THREADS={THREAD_WORKERS} | SLEEP={SLEEP_SEC}s", info="info")
-    log("[INFO] DEDUP POLICY = UNIQUE INDEX + ON CONFLICT DO NOTHING", info="info")
-    log("[INFO] FILE POLICY = TodayOnly + Tail-Follow(offset)", info="info")
-    log("[INFO] FILE SCAN = Vision\\YYYY\\MM fixed (fast on UNC)", info="info")
-    log(Demon_f"[INFO] CURSOR PERSIST = DB({SCHEMA_NAME}.{CURSOR_TABLE}) | interval={CURSOR_SAVE_INTERVAL_SEC}s", info="info")
-    log(Demon_f"[INFO] Engine pool minimized: pool_size=1, max_overflow=0 | work_mem={WORK_MEM}", info="info")
-    log(Demon_f"[INFO] keepalive={'on' if ENABLE_PG_KEEPALIVE else 'off'}", info="info")
-    log("=" * 78, info="info")
+    with ThreadPoolExecutor(max_workers=max(1, PARSE_WORKERS)) as executor:
+        while True:
+            loop_t0 = time_mod.perf_counter()
 
-    loop_i = 0
-    last_day = datetime.now().strftime("%Y%m%d")
+            try:
+                now_today = datetime.now().strftime("%Y%m%d")
+                if now_today != today_ymd:
+                    today_ymd = now_today
+                    PROCESSED_OFFSET.clear()
+                    _cursor_dirty_paths.clear()
 
-    while True:
-        loop_i += 1
-        loop_t0 = time_mod.perf_counter()
-
-        try:
-            today_ymd = datetime.now().strftime("%Y%m%d")
-
-            if today_ymd != last_day:
-                log(Demon_f"[INFO] Day changed {last_day} -> {today_ymd} | reset processed cache(offset)", info="info")
-                last_day = today_ymd
-                PROCESSED_OFFSET.clear()
-                _cursor_dirty_paths.clear()
-                _last_cursor_save_ts = 0.0
-
-                engine = get_engine_blocking()
-                loaded2 = load_today_offsets_from_db(engine, today_ymd)
-                if loaded2:
+                    engine_main = get_engine_main_blocking()
+                    loaded2 = load_today_offsets_from_db(engine_main, today_ymd)
                     PROCESSED_OFFSET.update(loaded2)
+                    log(f"[DAY-CHANGE] Reloaded cursor for {today_ymd}: {len(loaded2)} file(s)", info="info")
 
-            files = list_target_files_today(BASE_DIR, today_ymd=today_ymd)
-            if not files:
-                if loop_i % LOG_EVERY_LOOP == 0:
+                t_scan0 = time_mod.perf_counter()
+                file_list = list_target_files_today_only(today_ymd)
+                t_scan1 = time_mod.perf_counter()
+
+                if not file_list:
+                    maybe_save_cursor(engine_main, force=False)
+                    if os.getenv("SLEEP_LOG", "0") == "1":
+                        log("[INFO] no target file, sleep", info="sleep")
+                    time_mod.sleep(SLEEP_SEC)
+                    continue
+
+                t_parse0 = time_mod.perf_counter()
+                data_by_station, offset_updates = collect_all_rows_threadpool(executor, file_list, today_ymd)
+                t_parse1 = time_mod.perf_counter()
+
+                changed = 0
+                for fp, new_off in offset_updates.items():
+                    new_off_int = int(new_off)
+                    old_off = int(PROCESSED_OFFSET.get(fp, 0))
+                    PROCESSED_OFFSET[fp] = new_off_int
+                    if new_off_int != old_off:
+                        _cursor_dirty_paths.add(fp)
+                        changed += 1
+
+                t_ins0 = time_mod.perf_counter()
+                insert_to_db(engine_main, data_by_station)
+                t_ins1 = time_mod.perf_counter()
+
+                t_cur0 = time_mod.perf_counter()
+                maybe_save_cursor(engine_main, force=False)
+                t_cur1 = time_mod.perf_counter()
+
+                loop_t1 = time_mod.perf_counter()
+
+                if os.getenv("PERF_LOG", "1") == "1":
+                    total_rows = sum(len(v) for v in data_by_station.values())
                     log(
-                        Demon_f"[LOOP] no files (today={today_ymd}) | expected_dir={BASE_DIR}\\{datetime.now().year:04d}\\{datetime.now().month:02d}",
-                        info="sleep"
+                        "[PERF] scan=%.3fs parse=%.3fs insert=%.3fs cursor=%.3fs loop=%.3fs files=%d changed=%d rows=%d qsize=%d"
+                        % (
+                            (t_scan1 - t_scan0),
+                            (t_parse1 - t_parse0),
+                            (t_ins1 - t_ins0),
+                            (t_cur1 - t_cur0),
+                            (loop_t1 - loop_t0),
+                            len(file_list),
+                            changed,
+                            total_rows,
+                            db_log_queue.qsize(),
+                        ),
+                        info="perf",
                     )
 
-                maybe_save_cursor(engine, force=False)
-                flush_runtime_logs_to_db(engine, force=False)
+            except KeyboardInterrupt:
+                log("[STOP] Interrupted by user.", info="stop")
 
-                time_mod.sleep(SLEEP_SEC)
-                continue
-
-            all_records = []
-            offset_updates = {}
-
-            workers = min(THREAD_WORKERS, len(files))
-            workers = max(1, workers)
-
-            # ✅ 핵심 수정: as_completed + timeout으로 UNC 블로킹 방지
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                fut_map = {}
-                for fp in files:
-                    off = int(PROCESSED_OFFSET.get(fp, 0))
-                    fut = ex.submit(parse_machine_log_file_tail, fp, today_ymd, off)
-                    fut_map[fut] = fp
-
-                done_futs = set()
                 try:
-                    for fut in as_completed(fut_map.keys(), timeout=PARSE_FUTURE_TIMEOUT_SEC):
-                        done_futs.add(fut)
-                        try:
-                            rows, new_off, _station, fp, _status = fut.result(timeout=0)
-                        except Exception as e:
-                            fp = fut_map.get(fut, "unknown")
-                            log(Demon_f"[WARN] parse future error -> skip file={fp} / {type(e).__name__}: {e}", info="warn")
-                            continue
+                    maybe_save_cursor(engine_main, force=True)
+                except Exception as e:
+                    log("[WARN] Final cursor save failed", info="error")
+                    log_exc("[WARN] Final cursor save failed", e)
 
-                        offset_updates[fp] = int(new_off)
-                        if rows:
-                            all_records.extend(rows)
+                try:
+                    health_worker.stop()
+                    health_worker.join(timeout=15.0)
+                    log("[INFO] HealthLogWorker stopped", info="info")
+                except Exception as e:
+                    log("[WARN] HealthLogWorker stop failed", info="error")
+                    log_exc("[WARN] HealthLogWorker stop failed", e)
 
-                except TimeoutError:
-                    pending = [fut_map[f] for f in fut_map.keys() if f not in done_futs]
-                    if pending:
-                        log(Demon_f"[WARN] parse timeout({PARSE_FUTURE_TIMEOUT_SEC}s) -> skip pending={len(pending)} file(s)", info="warn")
-                        # offset은 기존 유지(안전)
-                        for fp in pending:
-                            offset_updates[fp] = int(PROCESSED_OFFSET.get(fp, 0))
+                break
 
-            # offset 갱신 + dirty mark
-            for fp, new_off in offset_updates.items():
-                new_off_int = int(new_off)
-                old_off = int(PROCESSED_OFFSET.get(fp, 0))
-                PROCESSED_OFFSET[fp] = new_off_int
-                if new_off_int != old_off:
-                    _cursor_dirty_paths.add(fp)
-
-            if not all_records:
-                if loop_i % LOG_EVERY_LOOP == 0:
-                    log(Demon_f"[LOOP] parsed=0 | files={len(files)} | (tail no new lines)", info="sleep")
-            else:
-                df = pd.DataFrame(all_records)
-                attempted = insert_to_db(engine, df)
-                if loop_i % LOG_EVERY_LOOP == 0 or attempted > 0:
-                    log(Demon_f"[DB] attempted={attempted:,} | files={len(files)} | parsed={len(df):,}", info="info")
-
-            maybe_save_cursor(engine, force=False)
-            flush_runtime_logs_to_db(engine, force=False)
-
-        except KeyboardInterrupt:
-            log("\n[STOP] Interrupted by user.", info="info")
-            try:
-                maybe_save_cursor(engine, force=True)
             except Exception as e:
-                log("[WARN] Final cursor save failed", info="error")
-                log_exc("[WARN] Final cursor save failed", e, info="error")
+                if _is_connection_error(e):
+                    log("[DB][RETRY] loop-level conn error -> rebuild main engine", info="down")
+                    log_exc("[DB][RETRY] loop-level", e)
+                    _dispose_engine_main()
+                    time_mod.sleep(DB_RETRY_INTERVAL_SEC)
+                    engine_main = get_engine_main_blocking()
+                else:
+                    log("[ERROR] Loop error (continue)", info="error")
+                    log_exc("[ERROR] Loop error", e)
 
-            try:
-                flush_runtime_logs_to_db(engine, force=True)
-            except Exception as e:
-                _console_print(Demon_f"[WARN] Final runtime-log flush failed: {type(e).__name__}: {e}")
-            break
-
-        except Exception as e:
-            if _is_connection_error(e):
-                log("[DB][RETRY] loop-level conn error -> rebuild engine", info="down")
-                log_exc("[DB][RETRY] loop-level", e, info="error")
-                _dispose_engine()
-                time_mod.sleep(DB_RETRY_INTERVAL_SEC)
-                engine = get_engine_blocking()
-            else:
-                log("[ERROR] Loop error (continue)", info="error")
-                log_exc("[ERROR] Loop error", e, info="error")
-
-            try:
-                flush_runtime_logs_to_db(engine, force=False)
-            except Exception as fe:
-                _console_print(Demon_f"[WARN] runtime-log flush after exception failed: {type(fe).__name__}: {fe}")
-
-        elapsed = time_mod.perf_counter() - loop_t0
-        time_mod.sleep(max(0.0, SLEEP_SEC - elapsed))
+            elapsed = time_mod.perf_counter() - loop_t0
+            sleep_sec = max(0.0, SLEEP_SEC - elapsed)
+            if sleep_sec > 0 and os.getenv("SLEEP_LOG", "0") == "1":
+                log(f"[INFO] sleep {sleep_sec:.2f}s", info="sleep")
+            time_mod.sleep(sleep_sec)
 
 
 if __name__ == "__main__":
-    freeze_support()
     try:
         main()
     except KeyboardInterrupt:
-        log("\n[STOP] 사용자 중단(Ctrl+C).", info="info")
-        pause_console()
+        log("[STOP] user interrupted (Ctrl+C)", info="stop")
     except Exception as e:
-        log("\n[UNHANDLED] 치명 오류가 발생했습니다.", info="error")
-        log_exc("[UNHANDLED]", e, info="error")
-
-        try:
-            engine = get_engine_blocking()
-            flush_runtime_logs_to_db(engine, force=True)
-        except Exception:
-            pass
-
-        pause_console()
-        sys.exit(1)
+        log("[UNHANDLED] fatal error", info="error")
+        log_exc("[UNHANDLED]", e)
+        raise
