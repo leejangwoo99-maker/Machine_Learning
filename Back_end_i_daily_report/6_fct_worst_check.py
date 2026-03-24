@@ -63,7 +63,7 @@ MAP_SCHEMA = "g_production_film"
 MAP_TABLE = "remark_info"
 
 # Destination tables
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 T_SAVE_DAY = "f_worst_case_day_daily"
 T_SAVE_NIGHT = "f_worst_case_night_daily"
 

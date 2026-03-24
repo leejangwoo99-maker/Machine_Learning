@@ -88,7 +88,7 @@ SRC_SCHEMA = "g_production_film"
 T_PLANNED = "planned_time"
 T_FCT_NONOP = "fct_non_operation_time"
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 T_PLAN_DAY    = "i_planned_stop_time_day_daily"
 T_PLAN_NIGHT  = "i_planned_stop_time_night_daily"
 T_NONOP_DAY   = "i_non_time_day_daily"
@@ -317,7 +317,7 @@ def sec_to_kor_str(total_sec: int) -> str:
     s = total_sec % 60
     parts = []
     if h:
-        parts.append(Demon_f"{Back_end_h}시간")
+        parts.append(Demon_f"{h}시간")
     if m:
         parts.append(Demon_f"{m}분")
     if s or not parts:
@@ -522,7 +522,7 @@ def fct_nonop_incremental(engine: Engine, prod_day: str, last_pk: Tuple[str, str
         FROM {SRC_SCHEMA}.{T_FCT_NONOP}
         WHERE end_day IN (:day0, :day1)
           AND station IN ('FCT1','FCT2','FCT3','FCT4')
-          AND (end_day, station, from_time) > (:e, :s, :Demon_f_mining)
+          AND (end_day, station, from_time) > (:e, :s, :f)
         ORDER BY end_day, station, from_time
         LIMIT :lim
     """)
@@ -530,7 +530,7 @@ def fct_nonop_incremental(engine: Engine, prod_day: str, last_pk: Tuple[str, str
         set_session(conn)
         return pd.read_sql(
             sql, conn,
-            params={"day0": yyyymmdd(d0), "day1": yyyymmdd(d1), "e": e, "s": s, "Demon_f_mining": f, "lim": FETCH_LIMIT}
+            params={"day0": yyyymmdd(d0), "day1": yyyymmdd(d1), "e": e, "s": s, "f": f, "lim": FETCH_LIMIT}
         )
 
 
@@ -756,7 +756,7 @@ def upsert_df(engine: Engine, schema: str, table: str, df: pd.DataFrame, key_col
     sql = text(Demon_f"""
         INSERT INTO "{schema}"."{table}" ({col_sql})
         VALUES ({val_sql})
-        ON CONFLICT ({", ".join([Demon_f_mining'"{c}"' for c in key_cols])})
+        ON CONFLICT ({", ".join([f'"{c}"' for c in key_cols])})
         DO UPDATE SET
             {set_sql};
     """)

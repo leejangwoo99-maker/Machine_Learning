@@ -68,7 +68,7 @@ AFA_TABLE = "afa_fail_wasted_time"
 CT_SCHEMA = "e1_FCT_ct"
 CT_TABLE = "fct_whole_op_ct"
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 T_DAY = "g_afa_wasted_time_day_daily"
 T_NIGHT = "g_afa_wasted_time_night_daily"
 

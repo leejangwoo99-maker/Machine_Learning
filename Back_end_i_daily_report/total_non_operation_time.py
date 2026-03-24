@@ -3,32 +3,23 @@
 total_non_operation_time_realtime.py
 
 최종 구조
-1) SOURCE는 created_at 기준으로 "신규행만" 증분 조회
+1) SOURCE는 created_at / updated_at 기준 "신규 또는 갱신 대상만" 증분 조회
 2) 주/야간 window는 조회 범위용이 아니라 "분류용"으로만 사용
-3) 기존 row 수정 없음, 새 비가동은 무조건 새 row insert 전제
-4) reason / sparepart 는 SOURCE에서 읽지 않음
-5) Streamlit이 i_daily_report.total_non_operation_time 에 직접 입력/수정
-6) UPSERT 시 기존 reason / sparepart 는 절대 덮어쓰지 않음
-7) WRITE(UPSERT) / WRITE(LOG) 분리
-8) Heartbeat 1분 1회, DB 로그 최소화
-9) 워터마크(last_created_at)는 DB state table + 메모리 공유로 관리
-10) 프로세스 재시작 시 state가 없으면 "현재 활성 shift 시작시각 - LOOKBACK"부터 시작
+3) FCT 원본은 g_production_film.fct_non_operation_time 에서 읽어 i_daily_report.total_non_operation_time 로 적재
+4) Vision은 i_daily_report.total_non_operation_time 안의 FCT1~4 행끼리 교집합을 계산해 같은 테이블에 Vision1 / Vision2 로 적재
+5) reason / sparepart 는 SOURCE에서 읽지 않음
+6) Streamlit이 i_daily_report.total_non_operation_time 에 직접 입력/수정
+7) UPSERT 시 기존 reason / sparepart 는 절대 덮어쓰지 않음
+8) WRITE(UPSERT) / WRITE(LOG) 분리
+9) Heartbeat 1분 1회, DB 로그 최소화
+10) 워터마크는 DB state table + 메모리 공유로 관리
+11) 재시작 시 최근 row가 아닌 "최근 row 이전 행의 to_ts timestamp" 기준으로 다시 읽음
 
 주/야간 분류 규칙
 - 주간 : [D-DAY] 08:30:00 ~ 20:29:59
 - 야간 : [D-DAY] 20:30:00 ~ [D+1] 08:29:59
 - row가 주/야간에 걸치면 더 많이 겹친 shift에 귀속
 - 겹치는 시간이 동일하면 day
-- 분류 기준은 source의 end_day + from_time + to_time
-
-추가 반영
-- SOURCE에서 no_operation_time >= 300초 인 행만 조회
-- work_mem 기본값 16MB
-- worker 분리:
-  1) FCT reader
-  2) VISION reader
-  3) LOG worker
-- UPSERT writer는 별도 유지
 """
 
 from __future__ import annotations
@@ -42,21 +33,23 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any
+from zoneinfo import ZoneInfo
 
 import psycopg2
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_values
 
 
 # =========================
 # Config
 # =========================
-SLEEP_SEC = 5
+FCT_SLEEP_SEC = 5
+VISION_SLEEP_SEC = 6
+
 FETCH_MANY_ROWS = 2000
 UPSERT_BATCH_ROWS = 300
 
 SRC_SCHEMA = "g_production_film"
 SRC_FCT_TABLE = "fct_non_operation_time"
-SRC_VISION_TABLE = "vision_non_operation_time"
 
 DST_SCHEMA = "i_daily_report"
 DST_TABLE = "total_non_operation_time"
@@ -65,8 +58,14 @@ LOG_SCHEMA = "k_demon_heath_check"
 LOG_TABLE = "total_non_operation"
 STATE_TABLE = "total_non_operation_state"
 
+FCT_THRESH_SCHEMA = "e1_FCT_ct"
+FCT_THRESH_TABLE = "fct_op_ct"
+FCT_THRESH_COL = "q3"
+FCT_THRESH_FALLBACK_SEC = 44.0
+
 DAY_START = dtime(8, 30, 0)
 NIGHT_START = dtime(20, 30, 0)
+KST = ZoneInfo("Asia/Seoul")
 
 STATEMENT_TIMEOUT_MS = 30_000
 DEFAULT_WORK_MEM = "16MB"
@@ -76,7 +75,18 @@ SIG_CACHE_MAX = 300_000
 LOG_QUEUE_MAX = 10_000
 
 LOOKBACK_SEC = 3
-MIN_NO_OPERATION_SEC = 300
+MANUAL_FORCE_VALUE = "o"
+
+FCT_STATE_KEY = SRC_FCT_TABLE
+VISION_STATE_KEY = "VISION_OVERLAP"
+VISION_SOURCE_TABLE = "vision_overlap_from_total_non_operation_time"
+
+VISION_PAIR_MAP = {
+    "FCT1": ("FCT2", "Vision1"),
+    "FCT2": ("FCT1", "Vision1"),
+    "FCT3": ("FCT4", "Vision2"),
+    "FCT4": ("FCT3", "Vision2"),
+}
 
 DB_CONFIG = {
     "host": os.getenv("PGHOST", "100.105.75.47"),
@@ -121,6 +131,13 @@ def log(level: str, msg: str):
 
 
 # =========================
+# SQL identifier quote
+# =========================
+def qi(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+# =========================
 # DB connect
 # =========================
 def _work_mem_value() -> str:
@@ -129,11 +146,6 @@ def _work_mem_value() -> str:
 
 
 def connect_blocking(role: str):
-    """
-    role: 'READ' or 'WRITE'
-    - READ : autocommit False
-    - WRITE: autocommit True
-    """
     assert role in ("READ", "WRITE")
     work_mem = _work_mem_value()
 
@@ -172,8 +184,26 @@ def connect_blocking(role: str):
             return conn
 
         except Exception as e:
-            log("down", f"[DB][RETRY] connect({role}) failed -> retry in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
-            time_mod.sleep(SLEEP_SEC)
+            log("down", f"[DB][RETRY] connect({role}) failed -> retry in 5s | {type(e).__name__}: {repr(e)}")
+            time_mod.sleep(5)
+
+
+def ensure_connection(conn, role: str):
+    try:
+        if conn is None or getattr(conn, "closed", 1) != 0:
+            return connect_blocking(role)
+
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        cur.fetchall()
+        cur.close()
+        return conn
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return connect_blocking(role)
 
 
 def _close_silent(conn):
@@ -221,11 +251,26 @@ def ensure_target_table(write_conn):
     ALTER TABLE {DST_SCHEMA}.{DST_TABLE} ALTER COLUMN created_at SET DEFAULT now();
     ALTER TABLE {DST_SCHEMA}.{DST_TABLE} ALTER COLUMN updated_at SET DEFAULT now();
 
+    UPDATE {DST_SCHEMA}.{DST_TABLE}
+       SET created_at = COALESCE(created_at, now()),
+           updated_at = COALESCE(updated_at, created_at, now())
+     WHERE created_at IS NULL
+        OR updated_at IS NULL;
+
     CREATE UNIQUE INDEX IF NOT EXISTS ux_total_nonop_pk
     ON {DST_SCHEMA}.{DST_TABLE} (source_table, end_day, station, from_ts);
 
     CREATE INDEX IF NOT EXISTS idx_total_nonop_query
     ON {DST_SCHEMA}.{DST_TABLE} (prod_day, shift_type, from_ts DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_total_nonop_station_time
+    ON {DST_SCHEMA}.{DST_TABLE} (station, from_ts, to_ts);
+
+    CREATE INDEX IF NOT EXISTS idx_total_nonop_updated
+    ON {DST_SCHEMA}.{DST_TABLE} (updated_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_total_nonop_created
+    ON {DST_SCHEMA}.{DST_TABLE} (created_at DESC);
 
     CREATE OR REPLACE FUNCTION {DST_SCHEMA}.trg_set_updated_at()
     RETURNS TRIGGER AS $$
@@ -378,10 +423,7 @@ class AsyncDbLogger:
             log("warn", f"[LOG][DROP] queue full phase={phase} src={src}")
 
 
-def log_worker_main(
-    q_log: "queue.Queue[LogItem]",
-    stop_evt: threading.Event,
-):
+def log_worker_main(q_log: "queue.Queue[LogItem]", stop_evt: threading.Event):
     log("info", "[BOOT] log_worker start")
 
     write_conn = connect_blocking("WRITE")
@@ -396,10 +438,7 @@ def log_worker_main(
         try:
             while True:
                 try:
-                    if write_conn is None or getattr(write_conn, "closed", 1) != 0:
-                        write_conn = connect_blocking("WRITE")
-                        ensure_progress_table(write_conn)
-
+                    write_conn = ensure_connection(write_conn, "WRITE")
                     cur = write_conn.cursor()
                     cur.execute(
                         f"""
@@ -424,18 +463,11 @@ def log_worker_main(
                     )
                     cur.close()
                     break
-
-                except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                    log("down", f"[LOG][RETRY] conn lost -> reconnect in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
-                    _close_silent(write_conn)
-                    write_conn = None
-                    time_mod.sleep(SLEEP_SEC)
-
                 except Exception as e:
-                    log("down", f"[LOG][RETRY] insert failed -> reconnect in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
+                    log("down", f"[LOG][RETRY] insert failed -> reconnect | {type(e).__name__}: {repr(e)}")
                     _close_silent(write_conn)
-                    write_conn = None
-                    time_mod.sleep(SLEEP_SEC)
+                    write_conn = connect_blocking("WRITE")
+                    ensure_progress_table(write_conn)
         finally:
             q_log.task_done()
 
@@ -454,9 +486,10 @@ class Window:
 
 
 def compute_window(now: datetime) -> Window:
+    now = now.astimezone(KST) if now.tzinfo else now.replace(tzinfo=KST)
     today = now.date()
-    dt_day_start = datetime.combine(today, DAY_START)
-    dt_night_start = datetime.combine(today, NIGHT_START)
+    dt_day_start = datetime.combine(today, DAY_START, tzinfo=KST)
+    dt_night_start = datetime.combine(today, NIGHT_START, tzinfo=KST)
 
     if now >= dt_night_start:
         return Window(
@@ -478,7 +511,7 @@ def compute_window(now: datetime) -> Window:
     return Window(
         prod_day=y.strftime("%Y%m%d"),
         shift_type="night",
-        start_ts=datetime.combine(y, NIGHT_START),
+        start_ts=datetime.combine(y, NIGHT_START, tzinfo=KST),
         end_ts=now,
     )
 
@@ -515,11 +548,22 @@ def make_from_to_dt(end_day_text: str, from_time_text: Any, to_time_text: Any) -
     except Exception:
         return None, None
 
-    from_dt = datetime.combine(d, ft)
-    to_dt = datetime.combine(d, tt)
+    from_dt = datetime.combine(d, ft, tzinfo=KST)
+    to_dt = datetime.combine(d, tt, tzinfo=KST)
     if to_dt <= from_dt:
         to_dt += timedelta(days=1)
     return from_dt, to_dt
+
+
+def _to_kst_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=KST)
+    return dt.astimezone(KST)
+
+
+def _month_key(dt: datetime) -> str:
+    dt = _to_kst_aware(dt)
+    return dt.strftime("%Y%m")
 
 
 def _overlap_seconds(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> float:
@@ -530,11 +574,17 @@ def _overlap_seconds(a_start: datetime, a_end: datetime, b_start: datetime, b_en
     return (e - s).total_seconds()
 
 
-def classify_shift_by_overlap(end_day_text: str, from_time_text: Any, to_time_text: Any) -> Tuple[Optional[str], Optional[str], Optional[datetime], Optional[datetime]]:
-    from_dt, to_dt = make_from_to_dt(end_day_text, from_time_text, to_time_text)
+def classify_shift_by_dt(from_dt: datetime, to_dt: datetime) -> Tuple[Optional[str], Optional[str]]:
     if from_dt is None or to_dt is None:
-        return None, None, None, None
+        return None, None
 
+    from_dt = _to_kst_aware(from_dt)
+    to_dt = _to_kst_aware(to_dt)
+
+    if to_dt <= from_dt:
+        return None, None
+
+    tz = from_dt.tzinfo
     start_date = from_dt.date() - timedelta(days=1)
     end_date = to_dt.date() + timedelta(days=1)
 
@@ -544,8 +594,8 @@ def classify_shift_by_overlap(end_day_text: str, from_time_text: Any, to_time_te
 
     cur = start_date
     while cur <= end_date:
-        day_s = datetime.combine(cur, DAY_START)
-        day_e = datetime.combine(cur, NIGHT_START)
+        day_s = datetime.combine(cur, DAY_START, tzinfo=tz)
+        day_e = datetime.combine(cur, NIGHT_START, tzinfo=tz)
         day_sec = _overlap_seconds(from_dt, to_dt, day_s, day_e)
         if day_sec > 0:
             if (day_sec > best_overlap) or (day_sec == best_overlap and best_shift_type != "day"):
@@ -553,8 +603,8 @@ def classify_shift_by_overlap(end_day_text: str, from_time_text: Any, to_time_te
                 best_prod_day = cur.strftime("%Y%m%d")
                 best_shift_type = "day"
 
-        night_s = datetime.combine(cur, NIGHT_START)
-        night_e = datetime.combine(cur + timedelta(days=1), DAY_START)
+        night_s = datetime.combine(cur, NIGHT_START, tzinfo=tz)
+        night_e = datetime.combine(cur + timedelta(days=1), DAY_START, tzinfo=tz)
         night_sec = _overlap_seconds(from_dt, to_dt, night_s, night_e)
         if night_sec > 0:
             if (night_sec > best_overlap) or (night_sec == best_overlap and best_shift_type != "day"):
@@ -564,7 +614,75 @@ def classify_shift_by_overlap(end_day_text: str, from_time_text: Any, to_time_te
 
         cur += timedelta(days=1)
 
-    return best_prod_day, best_shift_type, from_dt, to_dt
+    return best_prod_day, best_shift_type
+
+
+def classify_shift_by_overlap(end_day_text: str, from_time_text: Any, to_time_text: Any) -> Tuple[Optional[str], Optional[str], Optional[datetime], Optional[datetime]]:
+    from_dt, to_dt = make_from_to_dt(end_day_text, from_time_text, to_time_text)
+    if from_dt is None or to_dt is None:
+        return None, None, None, None
+    prod_day, shift_type = classify_shift_by_dt(from_dt, to_dt)
+    return prod_day, shift_type, from_dt, to_dt
+
+
+def second_largest_or_none(values: List[datetime]) -> Optional[datetime]:
+    uniq = sorted(set(values))
+    if len(uniq) >= 2:
+        return uniq[-2]
+    return None
+
+
+# =========================
+# Monthly threshold cache
+# =========================
+class MonthlyThresholdStore:
+    def __init__(self, schema_name: str, table_name: str, col_name: str, fallback_sec: float):
+        self.schema_name = schema_name
+        self.table_name = table_name
+        self.col_name = col_name
+        self.fallback_sec = float(fallback_sec)
+        self._lock = threading.Lock()
+        self._month: Optional[str] = None
+        self._value: float = float(fallback_sec)
+
+    def refresh_if_needed(self, read_conn, now: datetime) -> Tuple[Any, str, float, bool]:
+        want_month = _month_key(now)
+
+        with self._lock:
+            if self._month == want_month:
+                return read_conn, self._month, float(self._value), False
+
+        read_conn, val = fetch_monthly_threshold(
+            read_conn=read_conn,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+            col_name=self.col_name,
+            fallback_sec=self.fallback_sec,
+        )
+
+        with self._lock:
+            self._month = want_month
+            self._value = float(val)
+            return read_conn, self._month, float(self._value), True
+
+
+def fetch_monthly_threshold(read_conn, schema_name: str, table_name: str, col_name: str, fallback_sec: float) -> Tuple[Any, float]:
+    sql = f"""
+    SELECT COALESCE(MAX({qi(col_name)}), %s)::float8 AS threshold_sec
+    FROM {qi(schema_name)}.{qi(table_name)}
+    """
+    read_conn, cols, rows = fetch_all_rows_persistent(read_conn, sql, (fallback_sec,))
+    if not rows:
+        return read_conn, float(fallback_sec)
+
+    idx = {c: i for i, c in enumerate(cols)}
+    try:
+        v = rows[0][idx["threshold_sec"]]
+        if v is None:
+            return read_conn, float(fallback_sec)
+        return read_conn, float(v)
+    except Exception:
+        return read_conn, float(fallback_sec)
 
 
 # =========================
@@ -606,28 +724,26 @@ class WatermarkStore:
         with self._lock:
             self._m = {}
             for src_table, last_created_at in rows:
-                if src_table:
-                    self._m[str(src_table)] = last_created_at
+                if src_table and last_created_at is not None:
+                    self._m[str(src_table)] = _to_kst_aware(last_created_at)
 
     def get(self, src_table: str) -> Optional[datetime]:
         with self._lock:
             return self._m.get(src_table)
 
     def set(self, src_table: str, last_created_at: Optional[datetime]):
+        if last_created_at is None:
+            return
+        last_created_at = _to_kst_aware(last_created_at)
         with self._lock:
-            if last_created_at is not None:
-                old = self._m.get(src_table)
-                if old is None or last_created_at > old:
-                    self._m[src_table] = last_created_at
-
-    def items(self):
-        with self._lock:
-            return dict(self._m)
+            self._m[src_table] = last_created_at
 
 
 def persist_watermark(write_conn, src_table: str, last_created_at: datetime):
+    last_created_at = _to_kst_aware(last_created_at)
     while True:
         try:
+            write_conn = ensure_connection(write_conn, "WRITE")
             cur = write_conn.cursor()
             cur.execute(
                 f"""
@@ -635,27 +751,18 @@ def persist_watermark(write_conn, src_table: str, last_created_at: datetime):
                 VALUES (%s, %s)
                 ON CONFLICT (src_table)
                 DO UPDATE SET
-                    last_created_at = GREATEST(
-                        COALESCE({LOG_SCHEMA}.{STATE_TABLE}.last_created_at, EXCLUDED.last_created_at),
-                        EXCLUDED.last_created_at
-                    ),
+                    last_created_at = EXCLUDED.last_created_at,
                     updated_at = now()
                 """,
                 (src_table, last_created_at),
             )
             cur.close()
-            return
-
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            log("down", f"[DB][RETRY] persist_watermark conn lost -> reconnect in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
+            return write_conn
+        except Exception as e:
+            log("down", f"[DB][RETRY] persist_watermark failed -> reconnect | {type(e).__name__}: {repr(e)}")
             _close_silent(write_conn)
-            time_mod.sleep(SLEEP_SEC)
             write_conn = connect_blocking("WRITE")
             ensure_state_table(write_conn)
-
-        except Exception as e:
-            log("down", f"[DB][RETRY] persist_watermark failed -> retry in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
-            time_mod.sleep(SLEEP_SEC)
 
 
 # =========================
@@ -668,126 +775,172 @@ def make_incremental_scan_sql(src_table: str) -> str:
         station,
         from_time,
         to_time,
-        created_at
+        created_at,
+        COALESCE(updated_at, created_at) AS changed_ts,
+        manual
     FROM {SRC_SCHEMA}.{src_table}
-    WHERE created_at >= %s
-      AND COALESCE(no_operation_time, 0) >= %s
-    ORDER BY created_at ASC, end_day ASC, station ASC, from_time ASC, to_time ASC
+    WHERE COALESCE(updated_at, created_at) >= %s
+      AND (
+            COALESCE(no_operation_time, 0) > %s
+            OR manual = %s
+          )
+    ORDER BY COALESCE(updated_at, created_at) ASC, end_day ASC, station ASC, from_time ASC, to_time ASC
     """
+
+
+def make_incremental_scan_params(query_from: datetime, threshold_sec: float) -> Tuple:
+    return (query_from, threshold_sec, MANUAL_FORCE_VALUE)
+
+
+VISION_CHANGED_SQL = f"""
+SELECT
+    station,
+    from_ts,
+    to_ts,
+    COALESCE(updated_at, created_at) AS changed_ts
+FROM {DST_SCHEMA}.{DST_TABLE}
+WHERE COALESCE(updated_at, created_at) >= %s
+  AND station IN ('FCT1', 'FCT2', 'FCT3', 'FCT4')
+ORDER BY COALESCE(updated_at, created_at) ASC, station ASC, from_ts ASC, to_ts ASC
+"""
+
+VISION_PARTNER_SQL = f"""
+SELECT
+    station,
+    from_ts,
+    to_ts,
+    COALESCE(updated_at, created_at) AS changed_ts
+FROM {DST_SCHEMA}.{DST_TABLE}
+WHERE station = %s
+  AND to_ts > %s
+  AND from_ts < %s
+ORDER BY from_ts ASC, to_ts ASC
+"""
+
+
+# =========================
+# Dedup helper
+# =========================
+def dedup_upsert_rows(rows: List[dict]) -> List[dict]:
+    best: Dict[tuple, dict] = {}
+    for r in rows:
+        k = (r["source_table"], r["end_day"], r["station"], r["from_ts"])
+        prev = best.get(k)
+        if prev is None:
+            best[k] = r
+            continue
+        if str(r["to_ts"]) >= str(prev["to_ts"]):
+            best[k] = r
+    return list(best.values())
 
 
 # =========================
 # Upsert
 # =========================
-UPSERT_SQL = f"""
-INSERT INTO {DST_SCHEMA}.{DST_TABLE} (
-    source_table, end_day, prod_day, shift_type, station, from_ts, to_ts, reason, sparepart
-) VALUES (
-    %(source_table)s,
-    %(end_day)s,
-    %(prod_day)s,
-    %(shift_type)s,
-    %(station)s,
-    %(from_ts)s::timestamptz,
-    %(to_ts)s::timestamptz,
-    NULL,
-    NULL
-)
-ON CONFLICT (source_table, end_day, station, from_ts)
-DO UPDATE SET
-    prod_day   = EXCLUDED.prod_day,
-    shift_type = EXCLUDED.shift_type,
-    to_ts      = EXCLUDED.to_ts,
-    updated_at = now();
-"""
-
-
 def upsert_batch_keepfirst(write_conn, rows: List[dict]):
+    rows = dedup_upsert_rows(rows)
     if not rows:
-        return 0, 0
+        return write_conn, 0, 0
+
+    values = [
+        (
+            r["source_table"],
+            r["end_day"],
+            r["prod_day"],
+            r["shift_type"],
+            r["station"],
+            r["from_ts"],
+            r["to_ts"],
+        )
+        for r in rows
+    ]
+
+    sql = f"""
+    INSERT INTO {DST_SCHEMA}.{DST_TABLE} (
+        source_table,
+        end_day,
+        prod_day,
+        shift_type,
+        station,
+        from_ts,
+        to_ts,
+        reason,
+        sparepart
+    )
+    SELECT
+        v.source_table,
+        v.end_day,
+        v.prod_day,
+        v.shift_type,
+        v.station,
+        v.from_ts::timestamptz,
+        v.to_ts::timestamptz,
+        NULL,
+        NULL
+    FROM (
+        VALUES %s
+    ) AS v (
+        source_table,
+        end_day,
+        prod_day,
+        shift_type,
+        station,
+        from_ts,
+        to_ts
+    )
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM {DST_SCHEMA}.{DST_TABLE} t
+        WHERE t.prod_day = v.prod_day
+          AND t.shift_type = v.shift_type
+          AND t.station = v.station
+          AND t.from_ts = v.from_ts::timestamptz
+          AND t.to_ts = v.to_ts::timestamptz
+    )
+    ON CONFLICT (source_table, end_day, station, from_ts)
+    DO UPDATE SET
+        prod_day   = EXCLUDED.prod_day,
+        shift_type = EXCLUDED.shift_type,
+        to_ts      = EXCLUDED.to_ts
+    WHERE {DST_SCHEMA}.{DST_TABLE}.prod_day   IS DISTINCT FROM EXCLUDED.prod_day
+       OR {DST_SCHEMA}.{DST_TABLE}.shift_type IS DISTINCT FROM EXCLUDED.shift_type
+       OR {DST_SCHEMA}.{DST_TABLE}.to_ts      IS DISTINCT FROM EXCLUDED.to_ts
+    """
 
     while True:
         try:
+            write_conn = ensure_connection(write_conn, "WRITE")
             cur = write_conn.cursor()
-            execute_batch(cur, UPSERT_SQL, rows, page_size=len(rows))
+            execute_values(
+                cur,
+                sql,
+                values,
+                template="(%s, %s, %s, %s, %s, %s, %s)",
+                page_size=len(values),
+            )
+            affected = cur.rowcount if cur.rowcount is not None else 0
             cur.close()
-            return len(rows), 0
-
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            log("down", f"[DB][RETRY] upsert conn lost -> reconnect in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
-            _close_silent(write_conn)
-            time_mod.sleep(SLEEP_SEC)
-            write_conn = connect_blocking("WRITE")
-            ensure_target_table(write_conn)
-
-        except psycopg2.errors.UniqueViolation:
+            skipped = max(0, len(rows) - affected)
+            return write_conn, affected, skipped
+        except Exception as e:
+            log("down", f"[DB][RETRY] upsert failed -> reconnect | {type(e).__name__}: {repr(e)}")
             try:
-                if not write_conn.autocommit:
+                if write_conn is not None and not write_conn.autocommit:
                     write_conn.rollback()
             except Exception:
                 pass
-
-            up_ok = 0
-            skipped = 0
-            retry_break = False
-
-            for r in rows:
-                try:
-                    c2 = write_conn.cursor()
-                    c2.execute(UPSERT_SQL, r)
-                    c2.close()
-                    up_ok += 1
-
-                except psycopg2.errors.UniqueViolation:
-                    skipped += 1
-                    try:
-                        if not write_conn.autocommit:
-                            write_conn.rollback()
-                    except Exception:
-                        pass
-                    continue
-
-                except (psycopg2.OperationalError, psycopg2.InterfaceError) as ee:
-                    try:
-                        if not write_conn.autocommit:
-                            write_conn.rollback()
-                    except Exception:
-                        pass
-                    log("down", f"[DB][RETRY] upsert row conn lost -> reconnect in {SLEEP_SEC}s | {type(ee).__name__}: {repr(ee)}")
-                    _close_silent(write_conn)
-                    time_mod.sleep(SLEEP_SEC)
-                    write_conn = connect_blocking("WRITE")
-                    ensure_target_table(write_conn)
-                    retry_break = True
-                    break
-
-                except Exception as ee:
-                    try:
-                        if not write_conn.autocommit:
-                            write_conn.rollback()
-                    except Exception:
-                        pass
-                    log("down", f"[DB][RETRY] upsert row failed -> retry in {SLEEP_SEC}s | {type(ee).__name__}: {repr(ee)}")
-                    time_mod.sleep(SLEEP_SEC)
-                    retry_break = True
-                    break
-
-            if retry_break:
-                continue
-
-            return up_ok, skipped
-
-        except Exception as e:
-            log("down", f"[DB][RETRY] upsert failed -> retry in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
-            time_mod.sleep(SLEEP_SEC)
+            _close_silent(write_conn)
+            write_conn = connect_blocking("WRITE")
+            ensure_target_table(write_conn)
 
 
 # =========================
-# Stream select
+# DB reads using persistent conn
 # =========================
-def stream_select(read_conn, sql: str, params: Tuple, fetchmany_rows: int):
+def stream_select_persistent(read_conn, sql: str, params: Tuple, fetchmany_rows: int):
     while True:
         try:
+            read_conn = ensure_connection(read_conn, "READ")
             try:
                 read_conn.rollback()
             except Exception:
@@ -805,32 +958,57 @@ def stream_select(read_conn, sql: str, params: Tuple, fetchmany_rows: int):
                 rows = cur.fetchmany(int(fetchmany_rows))
                 if not rows:
                     break
-                yield cols, rows
+                yield read_conn, cols, rows
 
             cur.close()
             read_conn.commit()
             return
-
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            log("down", f"[DB][RETRY] stream_select conn lost -> reconnect in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)}")
-            _close_silent(read_conn)
-            time_mod.sleep(SLEEP_SEC)
-            read_conn = connect_blocking("READ")
-
         except Exception as e:
             pgerr = ""
             try:
                 pgerr = getattr(e, "pgerror", "") or ""
             except Exception:
                 pass
+            try:
+                read_conn.rollback()
+            except Exception:
+                pass
+            log("down", f"[DB][RETRY] stream_select failed -> reconnect | {type(e).__name__}: {repr(e)} {pgerr}")
+            _close_silent(read_conn)
+            read_conn = connect_blocking("READ")
 
+
+def fetch_all_rows_persistent(read_conn, sql: str, params: Tuple) -> Tuple[Any, List[str], List[tuple]]:
+    while True:
+        try:
+            read_conn = ensure_connection(read_conn, "READ")
             try:
                 read_conn.rollback()
             except Exception:
                 pass
 
-            log("down", f"[DB][RETRY] stream_select failed -> retry in {SLEEP_SEC}s | {type(e).__name__}: {repr(e)} {pgerr}")
-            time_mod.sleep(SLEEP_SEC)
+            cur = read_conn.cursor()
+            cur.execute(sql, params)
+
+            if cur.description is None:
+                raise RuntimeError("cursor.description is None (non-select executed?)")
+
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            cur.close()
+            read_conn.commit()
+            return read_conn, cols, rows
+        except Exception as e:
+            pgerr = ""
+            try:
+                pgerr = getattr(e, "pgerror", "") or ""
+            except Exception:
+                pass
+            try:
+                read_conn.rollback()
+            except Exception:
+                pass
+            log("down", f"[DB][RETRY] fetch_all_rows failed -> reconnect | {type(e).__name__}: {repr(e)} {pgerr}")
             _close_silent(read_conn)
             read_conn = connect_blocking("READ")
 
@@ -846,7 +1024,7 @@ class UpsertItem:
     fetched: int
     bad: int
     skipped: int
-    max_created_at: Optional[datetime]
+    restart_watermark_ts: Optional[datetime]
     win_start: Optional[datetime]
     win_end: Optional[datetime]
 
@@ -855,108 +1033,257 @@ class UpsertItem:
 # Reader helpers
 # =========================
 def _initial_watermark(now: datetime) -> datetime:
+    now = _to_kst_aware(now)
     win = compute_window(now)
     return win.start_ts - timedelta(seconds=LOOKBACK_SEC)
 
 
-def scan_source_once(
-    src_table: str,
-    src_tag: str,
+def _restart_watermark_from_to_ts_list(to_ts_list: List[datetime], old_watermark: Optional[datetime]) -> Optional[datetime]:
+    if not to_ts_list:
+        return old_watermark
+    second_latest = second_largest_or_none(to_ts_list)
+    if second_latest is not None:
+        return second_latest
+    return old_watermark
+
+
+def scan_fct_source_once(
+    read_conn,
+    wm_store: WatermarkStore,
+    sig_cache: SigCache,
+    fct_threshold_store: MonthlyThresholdStore,
+    now: datetime,
+):
+    read_conn, month_key, threshold_sec, refreshed = fct_threshold_store.refresh_if_needed(read_conn, now)
+    if refreshed:
+        log("info", f"[THRESHOLD][FCT] month={month_key} threshold_sec={threshold_sec}")
+
+    last_wm = wm_store.get(FCT_STATE_KEY)
+    if last_wm is None:
+        last_wm = _initial_watermark(now)
+
+    query_from = last_wm - timedelta(seconds=LOOKBACK_SEC)
+    sql = make_incremental_scan_sql(SRC_FCT_TABLE)
+    params = make_incremental_scan_params(query_from, threshold_sec)
+
+    changed_rows: List[dict] = []
+    fetched = 0
+    bad = 0
+    skipped = 0
+    to_ts_seen: List[datetime] = []
+    win_start_for_log: Optional[datetime] = None
+    win_end_for_log: Optional[datetime] = None
+
+    for read_conn, cols, rows in stream_select_persistent(read_conn, sql, params, FETCH_MANY_ROWS):
+        idx = {c: i for i, c in enumerate(cols)}
+        fetched += len(rows)
+
+        for row in rows:
+            end_day = str(row[idx["end_day"]])
+            station = str(row[idx["station"]])
+
+            prod_day, shift_type, from_dt, to_dt = classify_shift_by_overlap(
+                end_day,
+                row[idx["from_time"]],
+                row[idx["to_time"]],
+            )
+            if from_dt is None or to_dt is None or prod_day is None or shift_type is None:
+                bad += 1
+                continue
+
+            key = (SRC_FCT_TABLE, end_day, station, from_dt, to_dt)
+            sig = (_to_kst_aware(row[idx["changed_ts"]]),)
+
+            if not sig_cache.upsert_if_changed(key, sig):
+                skipped += 1
+                continue
+
+            to_ts_seen.append(to_dt)
+
+            if win_start_for_log is None or from_dt < win_start_for_log:
+                win_start_for_log = from_dt
+            if win_end_for_log is None or to_dt > win_end_for_log:
+                win_end_for_log = to_dt
+
+            changed_rows.append(
+                {
+                    "source_table": SRC_FCT_TABLE,
+                    "end_day": end_day,
+                    "prod_day": prod_day,
+                    "shift_type": shift_type,
+                    "station": station,
+                    "from_ts": from_dt.isoformat(),
+                    "to_ts": to_dt.isoformat(),
+                }
+            )
+
+    restart_wm_ts = _restart_watermark_from_to_ts_list(to_ts_seen, last_wm)
+
+    return read_conn, {
+        "src_table": FCT_STATE_KEY,
+        "src_tag": "FCT",
+        "rows": changed_rows,
+        "fetched": fetched,
+        "bad": bad,
+        "skipped": skipped,
+        "restart_watermark_ts": restart_wm_ts,
+        "win_start": win_start_for_log,
+        "win_end": win_end_for_log,
+        "threshold_sec": threshold_sec,
+        "threshold_month": month_key,
+    }
+
+
+def _vision_overlap_rows_for_changed(
+    read_conn,
+    changed_station: str,
+    changed_from_ts: datetime,
+    changed_to_ts: datetime,
+    changed_updated_at: datetime,
+    sig_cache: SigCache,
+):
+    changed_from_ts = _to_kst_aware(changed_from_ts)
+    changed_to_ts = _to_kst_aware(changed_to_ts)
+    changed_updated_at = _to_kst_aware(changed_updated_at)
+
+    partner_station, vision_station = VISION_PAIR_MAP[changed_station]
+    read_conn, cols, partner_rows = fetch_all_rows_persistent(
+        read_conn,
+        VISION_PARTNER_SQL,
+        (partner_station, changed_from_ts, changed_to_ts),
+    )
+    idx = {c: i for i, c in enumerate(cols)}
+
+    out_rows: List[dict] = []
+    bad = 0
+    skipped = 0
+    win_start = None
+    win_end = None
+    to_ts_out: List[datetime] = []
+
+    for prow in partner_rows:
+        partner_from = _to_kst_aware(prow[idx["from_ts"]])
+        partner_to = _to_kst_aware(prow[idx["to_ts"]])
+        partner_updated_at = _to_kst_aware(prow[idx["changed_ts"]])
+
+        overlap_from = max(changed_from_ts, partner_from)
+        overlap_to = min(changed_to_ts, partner_to)
+        if overlap_to <= overlap_from:
+            continue
+
+        prod_day, shift_type = classify_shift_by_dt(overlap_from, overlap_to)
+        if prod_day is None or shift_type is None:
+            bad += 1
+            continue
+
+        end_day = overlap_from.strftime("%Y%m%d")
+        sig_key = (VISION_SOURCE_TABLE, vision_station, overlap_from, overlap_to)
+        sig_val = (changed_updated_at, partner_updated_at)
+
+        if not sig_cache.upsert_if_changed(sig_key, sig_val):
+            skipped += 1
+            continue
+
+        to_ts_out.append(overlap_to)
+
+        if win_start is None or overlap_from < win_start:
+            win_start = overlap_from
+        if win_end is None or overlap_to > win_end:
+            win_end = overlap_to
+
+        out_rows.append(
+            {
+                "source_table": VISION_SOURCE_TABLE,
+                "end_day": end_day,
+                "prod_day": prod_day,
+                "shift_type": shift_type,
+                "station": vision_station,
+                "from_ts": overlap_from.isoformat(),
+                "to_ts": overlap_to.isoformat(),
+            }
+        )
+
+    return read_conn, out_rows, bad, skipped, win_start, win_end, to_ts_out
+
+
+def scan_vision_overlap_once(
+    read_conn,
     wm_store: WatermarkStore,
     sig_cache: SigCache,
     now: datetime,
 ):
-    read_conn = connect_blocking("READ")
-    try:
-        last_wm = wm_store.get(src_table)
-        if last_wm is None:
-            last_wm = _initial_watermark(now)
+    last_wm = wm_store.get(VISION_STATE_KEY)
+    if last_wm is None:
+        last_wm = _initial_watermark(now)
 
-        query_from = last_wm - timedelta(seconds=LOOKBACK_SEC)
-        sql = make_incremental_scan_sql(src_table)
-        params = (query_from, MIN_NO_OPERATION_SEC)
+    query_from = last_wm - timedelta(seconds=LOOKBACK_SEC)
+    read_conn, changed_cols, changed_rows = fetch_all_rows_persistent(read_conn, VISION_CHANGED_SQL, (query_from,))
+    changed_idx = {c: i for i, c in enumerate(changed_cols)}
 
-        changed_rows: List[dict] = []
-        fetched = 0
-        bad = 0
-        skipped = 0
-        max_created_at: Optional[datetime] = None
-        win_start_for_log: Optional[datetime] = None
-        win_end_for_log: Optional[datetime] = None
+    out_rows: List[dict] = []
+    fetched = len(changed_rows)
+    bad = 0
+    skipped = 0
+    to_ts_seen: List[datetime] = []
+    win_start_for_log: Optional[datetime] = None
+    win_end_for_log: Optional[datetime] = None
 
-        for cols, rows in stream_select(read_conn, sql, params, FETCH_MANY_ROWS):
-            idx = {c: i for i, c in enumerate(cols)}
-            fetched += len(rows)
+    for crow in changed_rows:
+        station = str(crow[changed_idx["station"]])
+        from_ts = _to_kst_aware(crow[changed_idx["from_ts"]])
+        to_ts = _to_kst_aware(crow[changed_idx["to_ts"]])
+        changed_ts = _to_kst_aware(crow[changed_idx["changed_ts"]])
 
-            for row in rows:
-                end_day = str(row[idx["end_day"]])
-                station = str(row[idx["station"]])
-                created_at = row[idx["created_at"]]
+        if station not in VISION_PAIR_MAP:
+            continue
 
-                if created_at is not None:
-                    if max_created_at is None or created_at > max_created_at:
-                        max_created_at = created_at
+        read_conn, rows_one, bad_one, skipped_one, win_start_one, win_end_one, to_ts_one = _vision_overlap_rows_for_changed(
+            read_conn=read_conn,
+            changed_station=station,
+            changed_from_ts=from_ts,
+            changed_to_ts=to_ts,
+            changed_updated_at=changed_ts,
+            sig_cache=sig_cache,
+        )
 
-                prod_day, shift_type, from_dt, to_dt = classify_shift_by_overlap(
-                    end_day,
-                    row[idx["from_time"]],
-                    row[idx["to_time"]],
-                )
-                if from_dt is None or to_dt is None or prod_day is None or shift_type is None:
-                    bad += 1
-                    continue
+        out_rows.extend(rows_one)
+        bad += bad_one
+        skipped += skipped_one
+        to_ts_seen.extend(to_ts_one)
 
-                key = (src_table, end_day, station, from_dt, to_dt)
-                sig = (created_at,)
+        if win_start_one is not None and (win_start_for_log is None or win_start_one < win_start_for_log):
+            win_start_for_log = win_start_one
+        if win_end_one is not None and (win_end_for_log is None or win_end_one > win_end_for_log):
+            win_end_for_log = win_end_one
 
-                if not sig_cache.upsert_if_changed(key, sig):
-                    skipped += 1
-                    continue
+    restart_wm_ts = _restart_watermark_from_to_ts_list(to_ts_seen, last_wm)
 
-                if win_start_for_log is None or from_dt < win_start_for_log:
-                    win_start_for_log = from_dt
-                if win_end_for_log is None or to_dt > win_end_for_log:
-                    win_end_for_log = to_dt
-
-                changed_rows.append(
-                    {
-                        "source_table": src_table,
-                        "end_day": end_day,
-                        "prod_day": prod_day,
-                        "shift_type": shift_type,
-                        "station": station,
-                        "from_ts": from_dt.isoformat(),
-                        "to_ts": to_dt.isoformat(),
-                    }
-                )
-
-        return {
-            "src_table": src_table,
-            "src_tag": src_tag,
-            "rows": changed_rows,
-            "fetched": fetched,
-            "bad": bad,
-            "skipped": skipped,
-            "max_created_at": max_created_at,
-            "win_start": win_start_for_log,
-            "win_end": win_end_for_log,
-            "query_from": query_from,
-        }
-    finally:
-        _close_silent(read_conn)
+    return read_conn, {
+        "src_table": VISION_STATE_KEY,
+        "src_tag": "VISION",
+        "rows": dedup_upsert_rows(out_rows),
+        "fetched": fetched,
+        "bad": bad,
+        "skipped": skipped,
+        "restart_watermark_ts": restart_wm_ts,
+        "win_start": win_start_for_log,
+        "win_end": win_end_for_log,
+    }
 
 
 # =========================
-# FCT reader
+# Readers
 # =========================
 def fct_reader_main(
     q_out: "queue.Queue[UpsertItem]",
     q_log: "queue.Queue[LogItem]",
     stop_evt: threading.Event,
     wm_store: WatermarkStore,
+    fct_threshold_store: MonthlyThresholdStore,
 ):
     logger = AsyncDbLogger(q_log)
     sig_cache = SigCache(SIG_CACHE_MAX)
+    read_conn = connect_blocking("READ")
 
     heartbeat_last = 0.0
     scan_log_last = 0.0
@@ -965,7 +1292,7 @@ def fct_reader_main(
 
     while not stop_evt.is_set():
         now_ts = time_mod.time()
-        now = datetime.now()
+        now = datetime.now(KST)
         active_win = compute_window(now)
 
         if now_ts - heartbeat_last >= 60:
@@ -975,11 +1302,11 @@ def fct_reader_main(
             logger.write("info", "HEARTBEAT", "FCT_READER", hb_msg, active_win.start_ts, active_win.end_ts)
 
         try:
-            result = scan_source_once(
-                src_table=SRC_FCT_TABLE,
-                src_tag="FCT",
+            read_conn, result = scan_fct_source_once(
+                read_conn=read_conn,
                 wm_store=wm_store,
                 sig_cache=sig_cache,
+                fct_threshold_store=fct_threshold_store,
                 now=now,
             )
 
@@ -995,7 +1322,7 @@ def fct_reader_main(
                             fetched=result["fetched"],
                             bad=result["bad"],
                             skipped=result["skipped"],
-                            max_created_at=result["max_created_at"],
+                            restart_watermark_ts=result["restart_watermark_ts"],
                             win_start=result["win_start"],
                             win_end=result["win_end"],
                         )
@@ -1005,7 +1332,11 @@ def fct_reader_main(
                 scan_log_last = now_ts
                 total_msg = (
                     f"scan src=FCT fetched={result['fetched']} changed={len(rows)} "
-                    f"bad={result['bad']} skipped={result['skipped']} queue_size={q_out.qsize()}"
+                    f"bad={result['bad']} skipped={result['skipped']} "
+                    f"threshold_sec={result['threshold_sec']} "
+                    f"threshold_month={result['threshold_month']} "
+                    f"restart_wm={result['restart_watermark_ts']} "
+                    f"queue_size={q_out.qsize()}"
                 )
                 log("info", f"[SCAN] {total_msg}")
                 logger.write(
@@ -1022,17 +1353,16 @@ def fct_reader_main(
                 )
 
         except Exception as e:
-            err = f"fct_reader failed | {type(e).__name__}: {repr(e)}"
-            log("down", f"[SCAN][ERR] {err}")
-            logger.write("down", "SCAN_ERR", "FCT", err)
-            time_mod.sleep(SLEEP_SEC)
+            log("down", f"[SCAN][ERR] fct_reader failed | {type(e).__name__}: {repr(e)}")
+            _close_silent(read_conn)
+            read_conn = connect_blocking("READ")
+            time_mod.sleep(FCT_SLEEP_SEC)
 
-        time_mod.sleep(SLEEP_SEC)
+        time_mod.sleep(FCT_SLEEP_SEC)
+
+    _close_silent(read_conn)
 
 
-# =========================
-# VISION reader
-# =========================
 def vision_reader_main(
     q_out: "queue.Queue[UpsertItem]",
     q_log: "queue.Queue[LogItem]",
@@ -1041,6 +1371,7 @@ def vision_reader_main(
 ):
     logger = AsyncDbLogger(q_log)
     sig_cache = SigCache(SIG_CACHE_MAX)
+    read_conn = connect_blocking("READ")
 
     heartbeat_last = 0.0
     scan_log_last = 0.0
@@ -1049,7 +1380,7 @@ def vision_reader_main(
 
     while not stop_evt.is_set():
         now_ts = time_mod.time()
-        now = datetime.now()
+        now = datetime.now(KST)
         active_win = compute_window(now)
 
         if now_ts - heartbeat_last >= 60:
@@ -1059,9 +1390,8 @@ def vision_reader_main(
             logger.write("info", "HEARTBEAT", "VISION_READER", hb_msg, active_win.start_ts, active_win.end_ts)
 
         try:
-            result = scan_source_once(
-                src_table=SRC_VISION_TABLE,
-                src_tag="VISION",
+            read_conn, result = scan_vision_overlap_once(
+                read_conn=read_conn,
                 wm_store=wm_store,
                 sig_cache=sig_cache,
                 now=now,
@@ -1079,7 +1409,7 @@ def vision_reader_main(
                             fetched=result["fetched"],
                             bad=result["bad"],
                             skipped=result["skipped"],
-                            max_created_at=result["max_created_at"],
+                            restart_watermark_ts=result["restart_watermark_ts"],
                             win_start=result["win_start"],
                             win_end=result["win_end"],
                         )
@@ -1089,7 +1419,9 @@ def vision_reader_main(
                 scan_log_last = now_ts
                 total_msg = (
                     f"scan src=VISION fetched={result['fetched']} changed={len(rows)} "
-                    f"bad={result['bad']} skipped={result['skipped']} queue_size={q_out.qsize()}"
+                    f"bad={result['bad']} skipped={result['skipped']} "
+                    f"restart_wm={result['restart_watermark_ts']} "
+                    f"queue_size={q_out.qsize()}"
                 )
                 log("info", f"[SCAN] {total_msg}")
                 logger.write(
@@ -1106,12 +1438,14 @@ def vision_reader_main(
                 )
 
         except Exception as e:
-            err = f"vision_reader failed | {type(e).__name__}: {repr(e)}"
-            log("down", f"[SCAN][ERR] {err}")
-            logger.write("down", "SCAN_ERR", "VISION", err)
-            time_mod.sleep(SLEEP_SEC)
+            log("down", f"[SCAN][ERR] vision_reader failed | {type(e).__name__}: {repr(e)}")
+            _close_silent(read_conn)
+            read_conn = connect_blocking("READ")
+            time_mod.sleep(VISION_SLEEP_SEC)
 
-        time_mod.sleep(SLEEP_SEC)
+        time_mod.sleep(VISION_SLEEP_SEC)
+
+    _close_silent(read_conn)
 
 
 # =========================
@@ -1185,11 +1519,11 @@ def writer_main(
             continue
 
         try:
-            up_ok, skipped_keepfirst = upsert_batch_keepfirst(write_conn, item.rows)
+            write_conn, up_ok, skipped_keepfirst = upsert_batch_keepfirst(write_conn, item.rows)
 
-            if item.max_created_at is not None:
-                wm_store.set(item.src_table, item.max_created_at)
-                persist_watermark(write_conn, item.src_table, item.max_created_at)
+            if item.restart_watermark_ts is not None:
+                wm_store.set(item.src_table, item.restart_watermark_ts)
+                write_conn = persist_watermark(write_conn, item.src_table, item.restart_watermark_ts)
 
             agg_batches += 1
             agg_up_ok += up_ok
@@ -1200,38 +1534,14 @@ def writer_main(
             last_win_end = item.win_end
 
         except Exception as e:
-            err_msg = f"{type(e).__name__}: {repr(e)}"
-            log("down", f"[UPSERT][ERR] {err_msg}")
-            logger.write(
-                "down",
-                "UPSERT_ERR",
-                item.src_tag,
-                err_msg,
-                item.win_start,
-                item.win_end,
-            )
+            log("down", f"[UPSERT][ERR] {type(e).__name__}: {repr(e)}")
+            _close_silent(write_conn)
+            write_conn = connect_blocking("WRITE")
+            ensure_target_table(write_conn)
+            ensure_state_table(write_conn)
 
         finally:
             q_in.task_done()
-
-    if agg_batches > 0:
-        msg = (
-            f"writer_summary batches={agg_batches} upserted={agg_up_ok} "
-            f"skipped={agg_skipped} fetched={agg_fetched} bad={agg_bad} queue_size={q_in.qsize()}"
-        )
-        log("info", f"[UPSERT][SUMMARY] {msg}")
-        logger.write(
-            "info",
-            "UPSERT_SUMMARY",
-            "ALL",
-            msg,
-            last_win_start,
-            last_win_end,
-            fetched_rows=agg_fetched,
-            upsert_rows=agg_up_ok,
-            bad_rows=agg_bad,
-            skipped_rows=agg_skipped,
-        )
 
     _close_silent(write_conn)
 
@@ -1243,15 +1553,20 @@ def main():
     _ensure_local_log_dir()
 
     log("info", "[BOOT] start")
-    log("info", f"[CONF] SOURCE=({SRC_SCHEMA}.{SRC_FCT_TABLE}, {SRC_SCHEMA}.{SRC_VISION_TABLE})")
+    log("info", f"[CONF] FCT_SOURCE={SRC_SCHEMA}.{SRC_FCT_TABLE}")
     log("info", f"[CONF] TARGET(i)={DST_SCHEMA}.{DST_TABLE} | LOG(k)={LOG_SCHEMA}.{LOG_TABLE} | STATE(k)={LOG_SCHEMA}.{STATE_TABLE}")
-    log("info", "[CONF] polling=created_at incremental only")
+    log("info", f"[CONF] fct_interval={FCT_SLEEP_SEC}s")
+    log("info", f"[CONF] vision_interval={VISION_SLEEP_SEC}s")
+    log("info", "[CONF] read_connection=reuse_until_broken")
+    log("info", "[CONF] reconnect=retry_until_connected")
     log("info", "[CONF] classify=overlap_majority(day_vs_night), tie=>day")
-    log("info", "[CONF] source_reason_sparepart=ignored")
-    log("info", f"[CONF] lookback={LOOKBACK_SEC}s")
-    log("info", f"[CONF] min_no_operation_time={MIN_NO_OPERATION_SEC}s")
+    log("info", f"[CONF] fct_threshold_source={FCT_THRESH_SCHEMA}.{FCT_THRESH_TABLE}.{FCT_THRESH_COL}")
+    log("info", f"[CONF] fct_threshold_rule=no_operation_time > monthly_max_q3 fallback={FCT_THRESH_FALLBACK_SEC}")
+    log("info", "[CONF] vision_threshold_rule=removed")
+    log("info", "[CONF] vision_overlap_rule=overlap_to > overlap_from only")
+    log("info", "[CONF] restart_recovery=use second-latest processed to_ts")
+    log("info", f"[CONF] fct_manual_force_include=manual='{MANUAL_FORCE_VALUE}'")
     log("info", f"[CONF] default_work_mem={DEFAULT_WORK_MEM}")
-    log("info", "[CONF] workers=FCT reader + VISION reader + LOG worker + UPSERT writer")
 
     w = connect_blocking("WRITE")
     ensure_target_table(w)
@@ -1262,6 +1577,13 @@ def main():
     wm_store.load_from_db(w)
     _close_silent(w)
 
+    fct_threshold_store = MonthlyThresholdStore(
+        schema_name=FCT_THRESH_SCHEMA,
+        table_name=FCT_THRESH_TABLE,
+        col_name=FCT_THRESH_COL,
+        fallback_sec=FCT_THRESH_FALLBACK_SEC,
+    )
+
     q_upsert: "queue.Queue[UpsertItem]" = queue.Queue(maxsize=QUEUE_MAX)
     q_log: "queue.Queue[LogItem]" = queue.Queue(maxsize=LOG_QUEUE_MAX)
     stop_evt = threading.Event()
@@ -1270,7 +1592,7 @@ def main():
     boot_logger.write("info", "BOOT", None, "daemon booted")
 
     th_log = threading.Thread(target=log_worker_main, args=(q_log, stop_evt), daemon=True)
-    th_fct = threading.Thread(target=fct_reader_main, args=(q_upsert, q_log, stop_evt, wm_store), daemon=True)
+    th_fct = threading.Thread(target=fct_reader_main, args=(q_upsert, q_log, stop_evt, wm_store, fct_threshold_store), daemon=True)
     th_vis = threading.Thread(target=vision_reader_main, args=(q_upsert, q_log, stop_evt, wm_store), daemon=True)
     th_wri = threading.Thread(target=writer_main, args=(q_upsert, q_log, stop_evt, wm_store), daemon=True)
 

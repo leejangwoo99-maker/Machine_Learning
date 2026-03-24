@@ -62,7 +62,7 @@ VISION_TABLE = "vision_table"
 REMARK_SCHEMA = "g_production_film"
 REMARK_TABLE = "remark_info"
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 
 TABLES = {
     ("day", "1"): "d_vs_1time_step_decription_day_daily",
@@ -448,10 +448,10 @@ def build_window_filter(win: WindowKey) -> Tuple[str, Dict[str, str]]:
         (
             (end_day = :d0 AND end_time >= '20:30:00' AND end_time <= '23:59:59')
             OR
-            (end_day = :Demon_d1 AND end_time >= '00:00:00' AND end_time <= :upper_t)
+            (end_day = :d1 AND end_time >= '00:00:00' AND end_time <= :upper_t)
         )
     """
-    params = {"d0": d0s, "Demon_d1": d1s, "upper_t": upper_time_str}
+    params = {"d0": d0s, "d1": d1s, "upper_t": upper_time_str}
     return where_sql, params
 
 

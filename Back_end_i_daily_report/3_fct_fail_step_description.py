@@ -63,7 +63,7 @@ SRC_TABLE = "fct_table"
 REMARK_SCHEMA = "g_production_film"
 REMARK_TABLE = "remark_info"
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 
 DAY_T1 = "c_1time_step_decription_day_daily"
 DAY_T2 = "c_2time_step_decription_day_daily"

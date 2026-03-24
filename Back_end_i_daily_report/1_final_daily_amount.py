@@ -17,7 +17,7 @@ backend1_daily_final_amount_daemon.py
 12) 재실행(프로세스 재시작) 시 PK 무시 + 윈도우 초기화 후 처음부터 처리(=full rebuild)
 13) 주간 리셋: 14:22:00, 20:22:00 (±30s 윈도우 내 최초 1회)
 14) 야간 리셋: 02:22:00, 08:22:00 (±30s 윈도우 내 최초 1회)
-15~16) 결과 저장 테이블 4개(스키마 Back_end_i_daily_report)
+15~16) 결과 저장 테이블 4개(스키마 i_daily_report)
   - a_day_daily_final_amount
   - a_station_day_daily_final_amount
   - a_night_daily_final_amount
@@ -95,7 +95,7 @@ TESTLOG_TABLE  = "fct_vision_testlog_txt_processing_history"
 REMARK_SCHEMA = "g_production_film"
 REMARK_TABLE  = "remark_info"
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 T_DAY_OVERALL   = "a_day_daily_final_amount"
 T_DAY_STATION   = "a_station_day_daily_final_amount"
 T_NIGHT_OVERALL = "a_night_daily_final_amount"

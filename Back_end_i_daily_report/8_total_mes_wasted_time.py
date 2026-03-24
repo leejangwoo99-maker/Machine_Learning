@@ -70,7 +70,7 @@ T_MES_FAIL2 = "mes_fail2_wasted_time"
 VISION_SCHEMA = "e2_vision_ct"
 T_VISION_OP_CT = "vision_op_ct"
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 T_DAY = "h_mes_wasted_time_day_daily"
 T_NIGHT = "h_mes_wasted_time_night_daily"
 

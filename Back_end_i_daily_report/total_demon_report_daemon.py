@@ -401,7 +401,7 @@ class LastPK:
 def std_latest_row(sel: Connection, schema: str, obj: str):
     return sel.execute(text(f"""
         SELECT end_day, end_time, info, contents,
-               md5(coalesce(info,'') || '|' || coalesce(contents,'')) AS Back_end_h
+               md5(coalesce(info,'') || '|' || coalesce(contents,'')) AS h
         FROM "{schema}"."{obj}"
         ORDER BY end_day DESC, end_time DESC, md5(coalesce(info,'') || '|' || coalesce(contents,'')) DESC
         LIMIT 1
@@ -410,7 +410,7 @@ def std_latest_row(sel: Connection, schema: str, obj: str):
 def logts_latest_row(sel: Connection, schema: str, obj: str):
     return sel.execute(text(f"""
         SELECT log_ts, level, phase, src, message,
-               md5(coalesce(level,'') || '|' || coalesce(phase,'') || '|' || coalesce(src,'') || '|' || coalesce(message,'')) AS Back_end_h
+               md5(coalesce(level,'') || '|' || coalesce(phase,'') || '|' || coalesce(src,'') || '|' || coalesce(message,'')) AS h
         FROM "{schema}"."{obj}"
         ORDER BY log_ts DESC,
                  md5(coalesce(level,'') || '|' || coalesce(phase,'') || '|' || coalesce(src,'') || '|' || coalesce(message,'')) DESC
@@ -420,7 +420,7 @@ def logts_latest_row(sel: Connection, schema: str, obj: str):
 def fetch_rows_incremental_std(sel: Connection, schema: str, obj: str, last_pk: LastPK, limit: int = 2000):
     return sel.execute(text(f"""
         SELECT end_day, end_time, info, contents,
-               md5(coalesce(info,'') || '|' || coalesce(contents,'')) AS Back_end_h
+               md5(coalesce(info,'') || '|' || coalesce(contents,'')) AS h
         FROM "{schema}"."{obj}"
         WHERE
             (
@@ -429,7 +429,7 @@ def fetch_rows_incremental_std(sel: Connection, schema: str, obj: str, last_pk: 
                 OR (end_day = :ld AND end_time = :lt
                     AND md5(coalesce(info,'') || '|' || coalesce(contents,'')) > :lh)
             )
-        ORDER BY end_day, end_time, Back_end_h
+        ORDER BY end_day, end_time, h
         LIMIT :lim
     """), {"ld": last_pk.k1, "lt": last_pk.k2, "lh": last_pk.h, "lim": limit}).fetchall()
 
@@ -443,7 +443,7 @@ def fetch_rows_incremental_logts(sel: Connection, schema: str, obj: str, last_pk
 
     return sel.execute(text(f"""
         SELECT log_ts, level, phase, src, message,
-               md5(coalesce(level,'') || '|' || coalesce(phase,'') || '|' || coalesce(src,'') || '|' || coalesce(message,'')) AS Back_end_h
+               md5(coalesce(level,'') || '|' || coalesce(phase,'') || '|' || coalesce(src,'') || '|' || coalesce(message,'')) AS h
         FROM "{schema}"."{obj}"
         WHERE
             (
@@ -451,7 +451,7 @@ def fetch_rows_incremental_logts(sel: Connection, schema: str, obj: str, last_pk
                 OR (log_ts = :lts
                     AND md5(coalesce(level,'') || '|' || coalesce(phase,'') || '|' || coalesce(src,'') || '|' || coalesce(message,'')) > :lh)
             )
-        ORDER BY log_ts, Back_end_h
+        ORDER BY log_ts, h
         LIMIT :lim
     """), {"lts": lts, "lh": last_pk.h, "lim": limit}).fetchall()
 

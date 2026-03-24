@@ -10,9 +10,9 @@
   - non_time / quality full rescan each loop
   - final_amount full rescan each loop
   - CREATE IF NOT EXISTS + ENSURE UNIQUE INDEX + UPSERT to:
-    - Back_end_i_daily_report.k_total_oee_{day|night}_daily   (UNIQUE: prod_day)
-    - Back_end_i_daily_report.k_line_oee_{day|night}_daily    (UNIQUE: prod_day, line)
-    - Back_end_i_daily_report.k_station_oee_{day|night}_daily (UNIQUE: prod_day, station)
+    - i_daily_report.k_total_oee_{day|night}_daily   (UNIQUE: prod_day)
+    - i_daily_report.k_line_oee_{day|night}_daily    (UNIQUE: prod_day, line)
+    - i_daily_report.k_station_oee_{day|night}_daily (UNIQUE: prod_day, station)
 
 - Added for Nuitka EXE diagnostics:
   - Logs to BOTH console and rotating file
@@ -273,7 +273,7 @@ WINDOW_SECONDS = 43200
 STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4", "Vision1", "Vision2"]
 REMARKS  = ["PD", "Non-PD"]
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 
 T_REMARK_CHANGE_DAY   = "j_remark_change_day_daily"
 T_REMARK_CHANGE_NIGHT = "j_remark_change_night_daily"

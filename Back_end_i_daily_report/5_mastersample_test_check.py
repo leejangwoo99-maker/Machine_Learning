@@ -16,8 +16,8 @@ Backend-5: Mastersample All OK daemon (incremental PK)
 - 재실행/윈도우 변경 시 bootstrap(윈도우 start~now full scan) 후 UPSERT
 - DELETE/TRUNCATE 금지
 - 결과 저장:
-  - day  -> Back_end_i_daily_report.e_mastersample_test_day_daily
-  - night-> Back_end_i_daily_report.e_mastersample_test_night_daily
+  - day  -> i_daily_report.e_mastersample_test_day_daily
+  - night-> i_daily_report.e_mastersample_test_night_daily
   - UNIQUE key: prod_day 단일
   - 컬럼: prod_day, shift_type, "Mastersample", first_time(HH:MI:SS text), updated_at(timestamptz)
 - 윈도우 경계:
@@ -66,7 +66,7 @@ WORK_MEM = "4MB"  # 고정
 SRC_SCHEMA = "d1_machine_log"
 SRC_TABLE = "Main_machine_log"  # 대소문자 고정 (따옴표로 감싸서 사용)
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 SAVE_DAY_TABLE = "e_mastersample_test_day_daily"
 SAVE_NIGHT_TABLE = "e_mastersample_test_night_daily"
 
@@ -691,7 +691,7 @@ def main() -> None:
                         log_info(f"[BACKOFF] empty_fetch_streak={st.empty_fetch_streak} => sleep_target={st.sleep_target_sec}s")
                     else:
                         # streak가 쌓이는 구간도 로그로 보고 싶으면 주석 해제
-                        # log_info(Demon_f_mining"[BACKOFF] empty_fetch_streak={st.empty_fetch_streak} sleep_target={st.sleep_target_sec}s")
+                        # log_info(f"[BACKOFF] empty_fetch_streak={st.empty_fetch_streak} sleep_target={st.sleep_target_sec}s")
                         pass
 
                     if rows:

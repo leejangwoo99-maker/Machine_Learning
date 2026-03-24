@@ -17,8 +17,8 @@ Station PASS percentage daemon (incremental PK, 5s loop)
 10) BOOT 로그 즉시 출력, DB 미접속 시 RETRY 로그 5초마다
 11) LAST_PK / FETCH / UPSERT 단계마다 INFO 로그
 12~14) (요구 제거됨) -> 대신 DB 기존 데이터 DELETE/초기화 절대 없음
-15) day -> Back_end_i_daily_report.b_station_day_daily_percentage
-16) night -> Back_end_i_daily_report.b_station_night_daily_percentage
+15) day -> i_daily_report.b_station_day_daily_percentage
+16) night -> i_daily_report.b_station_night_daily_percentage
 
 ✅ 추가 조건:
 - goodorbad = 'GoodFile' 인 row만 집계 대상으로 포함
@@ -58,7 +58,7 @@ PG_WORK_MEM = os.getenv("PG_WORK_MEM", "64MB")
 
 STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4", "Vision1", "Vision2"]
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 DAY_TABLE   = "b_station_day_daily_percentage"
 NIGHT_TABLE = "b_station_night_daily_percentage"
 KEY_COLS    = ["prod_day", "shift_type"]  # UPSERT 키 고정

@@ -64,7 +64,7 @@ DB_CONFIG = {
 SRC_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
 SRC_TABLE = "fct_vision_testlog_txt_processing_history"
 
-SAVE_SCHEMA = "Back_end_i_daily_report"
+SAVE_SCHEMA = "i_daily_report"
 T_DAY = "j_remark_change_day_daily"
 T_NIGHT = "j_remark_change_night_daily"
 
