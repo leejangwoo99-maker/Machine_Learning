@@ -518,7 +518,7 @@ def normalize_test_time_for_sort(s: pd.Series) -> pd.Series:
 
     m = out.isna() & ss.str.contains(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", regex=True)
     if m.any():
-        out.loc[m] = pd.to_datetime(ss[m], format="%Y-%m-%d %H:%M:%S.%Demon_f_mining", errors="coerce")
+        out.loc[m] = pd.to_datetime(ss[m], format="%Y-%m-%d %H:%M:%S.%f", errors="coerce")
 
     m = out.isna() & ss.str.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
     if m.any():
@@ -686,9 +686,9 @@ def load_source(_engine_unused, d_from: date, d_to: date) -> pd.DataFrame:
     SELECT
         barcode_information, remark, end_day, end_time, contents, test_ct, test_time, file_path
     FROM {SRC_SCHEMA}.{SRC_TABLE}
-    WHERE end_day BETWEEN :Demon_d1 AND :d2
+    WHERE end_day BETWEEN :d1 AND :d2
     """)
-    df = read_sql_blocking(sql, params={"Demon_d1": d_from, "d2": d_to})
+    df = read_sql_blocking(sql, params={"d1": d_from, "d2": d_to})
 
     if df.empty:
         log_console("sleep", Demon_f"[SKIP] source 0 rows in range {d_from} ~ {d_to}")
