@@ -12,3 +12,5 @@
    https://serious-ambert-bc0.notion.site/APTIV-31d8bc55235b80f58ecff4b949efdbdf?source=copy_link
 
 FYI, demon & back-end & streamlit are compiled by Nuitka.
+
+7. Recommend relearning algorithm once a year at the time of the inventory count, if use the data for 6months, it will take 6days to finish learning algorithm.
