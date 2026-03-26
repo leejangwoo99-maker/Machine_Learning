@@ -493,14 +493,10 @@ def _mount_alarm_sse(now_day: str, now_shift: str, view_day: str, view_shift: st
 
 
 def _snap_data_ready_state(prod_day: str, shift_type: str) -> Dict[str, Any]:
-    scope_ok = (
-        str(st.session_state.get("analysis_prod_day", "") or "") == str(prod_day)
-        and str(st.session_state.get("analysis_shift_type", "") or "") == str(shift_type)
-    )
-
+    scope_ok = True
     data_ready = bool(st.session_state.get("p03_snap_data_ready", False))
 
-    ready = bool(scope_ok and data_ready)
+    ready = bool(data_ready)
 
     return {
         "ready": ready,
@@ -607,13 +603,50 @@ def _snap_mark_ready():
 # -----------------------------
 # UI
 # -----------------------------
+def is_snapshot_mode() -> bool:
+    try:
+        v = st.query_params.get("snap", "")
+        if isinstance(v, list):
+            v = v[0] if v else ""
+        return str(v).strip().lower() in ("1", "true", "yes", "y")
+    except Exception:
+        return False
+
+
+SNAP_MODE = is_snapshot_mode()
+
+
+def _snapshot_requested_scope() -> tuple[str, str]:
+    try:
+        d = st.query_params.get("prod_day", "")
+        s = st.query_params.get("shift_type", "")
+        if isinstance(d, list):
+            d = d[0] if d else ""
+        if isinstance(s, list):
+            s = s[0] if s else ""
+    except Exception:
+        d, s = "", ""
+
+    d = _norm_day(d)
+    s = _norm_shift(s)
+    if d:
+        return d, s
+    return _now_prod_day_shift()
+
+
 st.set_page_config(page_title="생산 분석", layout="wide")
 
-default_day, default_shift = _now_prod_day_shift()
+if SNAP_MODE:
+    default_day, default_shift = _snapshot_requested_scope()
+else:
+    default_day, default_shift = _now_prod_day_shift()
+
 if "analysis_prod_day" not in st.session_state:
     st.session_state.analysis_prod_day = default_day
 if "analysis_shift_type" not in st.session_state:
     st.session_state.analysis_shift_type = default_shift
+
+
 
 st.markdown("### 📌 생산 분석 (주간/야간)")
 c1, c2, c3, c4 = st.columns([2.2, 1.2, 0.9, 1.1])

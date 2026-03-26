@@ -3098,17 +3098,16 @@ def _snap_data_ready_state(end_day: str, shift: str) -> Dict[str, Any]:
     nonop_ready = bool(st.session_state.get("nonop_loaded_once", False))
     nonop_chart_ready = bool(st.session_state.get("nonop_chart_loaded_once", False))
 
-    worker_ready = ("worker_rows_cache" in st.session_state) and (st.session_state.get("worker_rows_cache") is not None)
-    master_ready = ("master_rows_cache" in st.session_state) and (st.session_state.get("master_rows_cache") is not None)
-
     scope_ok = str(st.session_state.get("last_scope", "") or "") == f"{end_day}:{shift}"
+
+    # SNAP 캡처에서는 worker/master 조회 지연 때문에 전체 ready를 막지 않도록 완화
+    worker_ready = True
+    master_ready = True
 
     ready = bool(
         planned_ready
         and nonop_ready
         and nonop_chart_ready
-        and worker_ready
-        and master_ready
         and scope_ok
     )
 
