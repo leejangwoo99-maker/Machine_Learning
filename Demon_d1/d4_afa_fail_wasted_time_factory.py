@@ -12,6 +12,8 @@ AFA FAIL wasted time (NG -> ON) 실시간 계산/저장
 - pandas 제거
 - warm-start backfill 유지
 - 증분 fetch는 station별 마지막 저장 to_ts 기준
+- 저장 테이블에 to_ts TIMESTAMP 컬럼 사용
+- last cursor 조회는 현재 운영 window 내부만 조회
 """
 
 from __future__ import annotations
@@ -82,7 +84,8 @@ CURSOR_OVERLAP_SEC = int(os.getenv("AFA_CURSOR_OVERLAP_SEC", "3"))
 
 WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 
-STMT_TIMEOUT_MS = int(os.getenv("D4_STMT_TIMEOUT_MS", "10000"))
+# 10초 -> 20초로 상향
+STMT_TIMEOUT_MS = int(os.getenv("D4_STMT_TIMEOUT_MS", "20000"))
 LOCK_TIMEOUT_MS = int(os.getenv("D4_LOCK_TIMEOUT_MS", "3000"))
 IDLE_TX_TIMEOUT_MS = int(os.getenv("D4_IDLE_TX_TIMEOUT_MS", "5000"))
 
@@ -204,6 +207,10 @@ def to_ts_kst(end_day: str, hhmmss_like: str) -> Optional[datetime]:
 
 def format_hhmmss_ff(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%H:%M:%S.%f")[:11]
+
+
+def to_naive_kst(dt: datetime) -> datetime:
+    return dt.astimezone(KST).replace(tzinfo=None)
 
 
 # =========================================================
@@ -380,9 +387,15 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.{SAVE_TABLE} (
     from_time     TEXT,
     to_contents   TEXT,
     to_time       TEXT,
+    to_ts         TIMESTAMP,
     wasted_time   NUMERIC(10,2),
     created_at    TIMESTAMP DEFAULT now()
 );
+"""
+
+ALTER_SAVE_ADD_TO_TS_SQL = f"""
+ALTER TABLE {SCHEMA}.{SAVE_TABLE}
+ADD COLUMN IF NOT EXISTS to_ts TIMESTAMP;
 """
 
 CREATE_SAVE_UNIQUE_SQL = f"""
@@ -390,13 +403,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_{SCHEMA}_{SAVE_TABLE}_pk
 ON {SCHEMA}.{SAVE_TABLE} (end_day, station, from_time, to_time);
 """
 
+CREATE_SAVE_TO_TS_INDEX_SQL = f"""
+CREATE INDEX IF NOT EXISTS ix_{SCHEMA}_{SAVE_TABLE}_station_to_ts
+ON {SCHEMA}.{SAVE_TABLE} (station, to_ts DESC);
+"""
+
+BACKFILL_TO_TS_SQL = f"""
+UPDATE {SCHEMA}.{SAVE_TABLE}
+SET to_ts = to_timestamp(end_day || ' ' || split_part(to_time, '.', 1), 'YYYYMMDD HH24:MI:SS')
+WHERE to_ts IS NULL
+  AND end_day IS NOT NULL
+  AND to_time IS NOT NULL;
+"""
+
 CREATE_HEALTH_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {HEALTH_SCHEMA}.{HEALTH_TABLE} (
-    id        BIGSERIAL PRIMARY KEY,
-    end_day   VARCHAR(8)  NOT NULL,
-    end_time  VARCHAR(8)  NOT NULL,
-    info      VARCHAR(32) NOT NULL,
-    contents  TEXT,
+    id         BIGSERIAL PRIMARY KEY,
+    end_day    VARCHAR(8)  NOT NULL,
+    end_time   VARCHAR(8)  NOT NULL,
+    info       VARCHAR(32) NOT NULL,
+    contents   TEXT,
     created_at TIMESTAMP DEFAULT now()
 );
 """
@@ -413,7 +439,10 @@ def ensure_schema_and_tables(engine_main, engine_health):
             with engine_main.begin() as conn:
                 conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
                 conn.execute(text(CREATE_SAVE_TABLE_SQL))
+                conn.execute(text(ALTER_SAVE_ADD_TO_TS_SQL))
                 conn.execute(text(CREATE_SAVE_UNIQUE_SQL))
+                conn.execute(text(CREATE_SAVE_TO_TS_INDEX_SQL))
+                conn.execute(text(BACKFILL_TO_TS_SQL))
                 log(f"[INFO] Save table ensured: {SCHEMA}.{SAVE_TABLE}", info="info")
 
             with engine_health.begin() as conn:
@@ -588,36 +617,40 @@ def calc_window(now_kst: datetime) -> Tuple[str, str, datetime, datetime]:
 
 # =========================================================
 # station별 마지막 저장 to_ts 조회
+# 현재 window 안에서만 station별 최신 1건 조회
 # =========================================================
-def read_last_pk_per_station(engine) -> Dict[str, Optional[datetime]]:
+def read_last_pk_per_station(engine, ws: datetime, we: datetime) -> Dict[str, Optional[datetime]]:
     out: Dict[str, Optional[datetime]] = {st: None for _, st in SRC_TABLES}
 
     sql = text(
         f"""
-        SELECT station,
-               to_timestamp(end_day || ' ' || split_part(to_time, '.', 1), 'YYYYMMDD HH24:MI:SS') AS to_ts
+        SELECT DISTINCT ON (station)
+               station,
+               to_ts
         FROM {SCHEMA}.{SAVE_TABLE}
-        WHERE end_day IS NOT NULL
-          AND station IS NOT NULL
-          AND to_time IS NOT NULL
-        ORDER BY to_ts DESC
+        WHERE station IS NOT NULL
+          AND to_ts IS NOT NULL
+          AND to_ts >= :ws
+          AND to_ts <= :we
+        ORDER BY station, to_ts DESC
         """
     )
+
+    params = {
+        "ws": to_naive_kst(ws),
+        "we": to_naive_kst(we),
+    }
 
     while True:
         try:
             with engine.connect() as conn:
-                rows = conn.execute(sql).fetchall()
+                rows = conn.execute(sql, params).fetchall()
 
-            seen = set()
             for station, to_ts in rows:
-                if station in out and station not in seen and to_ts is not None:
+                if station in out and to_ts is not None:
                     if to_ts.tzinfo is None:
                         to_ts = to_ts.replace(tzinfo=KST)
                     out[station] = to_ts
-                    seen.add(station)
-                if len(seen) == len(out):
-                    break
             return out
 
         except Exception as e:
@@ -782,6 +815,7 @@ def pair_events(rows: List[Dict[str, Any]], state: StationState) -> Tuple[List[D
                             "from_time": format_hhmmss_ff(from_ts),
                             "to_contents": OFF_PHRASE_RAW,
                             "to_time": format_hhmmss_ff(to_ts),
+                            "to_ts": to_naive_kst(to_ts),
                             "wasted_time": round((to_ts - from_ts).total_seconds(), 2),
                         }
                     )
@@ -801,9 +835,9 @@ def insert_rows(engine, rows: List[Dict[str, Any]]) -> int:
     sql = text(
         f"""
         INSERT INTO {SCHEMA}.{SAVE_TABLE}
-            (end_day, station, from_contents, from_time, to_contents, to_time, wasted_time)
+            (end_day, station, from_contents, from_time, to_contents, to_time, to_ts, wasted_time)
         VALUES
-            (:end_day, :station, :from_contents, :from_time, :to_contents, :to_time, :wasted_time)
+            (:end_day, :station, :from_contents, :from_time, :to_contents, :to_time, :to_ts, :wasted_time)
         ON CONFLICT (end_day, station, from_time, to_time)
         DO NOTHING
         """
@@ -912,7 +946,8 @@ def main():
                 run_backfill_for_window(engine_main, ws, we, states)
                 last_backfill_key = backfill_key
 
-            last_to_ts = read_last_pk_per_station(engine_main)
+            # 현재 window 내에서만 last to_ts 조회
+            last_to_ts = read_last_pk_per_station(engine_main, ws, we)
 
             last_pk_str = ", ".join(
                 [f"{k}={(v.strftime('%Y-%m-%d %H:%M:%S') if v else 'None')}" for k, v in last_to_ts.items()]
