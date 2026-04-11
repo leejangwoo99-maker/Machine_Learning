@@ -2,56 +2,38 @@
 """
 e1_1_FCT_op_ct_factory_schedule.py
 
-[스케줄 실행 방식 - 적용(요청)]
-- 매일 08:22:00에 1회 실행 -> 계산/UPSERT
-- 매일 20:22:00에 1회 실행 -> 계산/UPSERT
-- 그 외 시간에는 대기만 함
-- ✅ 2회 모두 완료되더라도 종료하지 않고, 다음날 스케줄까지 대기하며 무한 반복 (ALWAYS-ON)
+[스케줄 실행 방식]
+- 매일 08:22:00 1회 실행
+- 매일 20:22:00 1회 실행
+- 그 외 시간에는 대기
+- 2회 모두 끝나도 종료하지 않고 다음날까지 계속 대기
 
-[요청 반영(안정화)]
-- ✅ 멀티프로세스 = 1개 (MP=2 제거)
-- ✅ DB 서버 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공할 때까지 블로킹)
-- ✅ 백엔드별 상시 연결 1개 고정(풀 최소화: pool_size=1, max_overflow=0)
-- ✅ work_mem 폭증 방지: 세션마다 SET work_mem (환경변수 PG_WORK_MEM로 조정 가능)
+[요청 반영]
+1. boxplot HTML / JSON 기능 제거
+2. psycopg2.extras.execute_values 기반 "단일 INSERT" UPSERT
+3. 메인 엔진과 health 로그 연결 분리
+4. 대기 health 로그는 1분마다 1건만 유지
+   - wait 로그 저장 시 이전 wait row 삭제 후 최신 row 1건만 삽입
 
-[기존 기능 유지]
-- boxplot html 저장
-- plotly_json 저장
-- UPH(left/right/whole) 계산
-- LATEST: 키 기준 UPSERT(최신 갱신)
-- HIST  : 하루 1개 롤링 UPSERT(ON CONFLICT DO UPDATE)
-- id NULL 해결: id/시퀀스/default/백필/setval 동기화
-- DataFrame 콘솔 출력 없음(로그만)
-
-(추가: 실행 중 끊김 복구 강화)
-- ✅ SQLAlchemy engine 사용 구간: pool_pre_ping + 연결 오류 감지 시 dispose 후 재생성
-- ✅ psycopg2 직접 접속 구간: 연결 오류 시 무한 재접속/재시도
-- ✅ keepalive(connect_args/환경변수) 옵션 추가(가능 범위 내)
-
-[추가: 데몬 헬스체크 로그 DB 저장]
-- 스키마: k_demon_heath_check (없으면 생성)
-- 테이블: e1_1_log (없으면 생성)
-- 컬럼: end_day(yyyymmdd), end_time(hh:mi:ss), info(소문자), contents
-- 로그는 end_day, end_time, info, contents 순서로 DataFrame화 후 저장
-
-[추가 운영 안정화]
-- ✅ SLEEP 로그는 DB 저장 안 함(콘솔만) -> 로그 테이블 폭증 방지
+[운영 안정화]
+- 메인 처리용 SQLAlchemy engine 1개
+- 헬스로그용 psycopg2 연결 별도 유지
+- DB 접속 실패/끊김 시 무한 재시도
+- 세션마다 work_mem 설정
 """
 
-import time
 import os
+import time
 import urllib.parse
 from datetime import datetime, date, time as dtime, timedelta
-
-from pathlib import Path
 from typing import List, Dict
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 
 import psycopg2
 from psycopg2 import sql
+from psycopg2.extras import execute_values
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError, DBAPIError
 from pandas.api.types import CategoricalDtype
@@ -65,52 +47,40 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "postgres",
     "user": "postgres",
-    "password": "",  # 비번은 보완 사항
+    "password": "",
 }
 
 SRC_SCHEMA = "a1_fct_vision_testlog_txt_processing_history"
-SRC_TABLE  = "fct_vision_testlog_txt_processing_history"
+SRC_TABLE = "fct_vision_testlog_txt_processing_history"
 
 TARGET_SCHEMA = "e1_FCT_ct"
 
-TBL_OPCT_LATEST  = "fct_op_ct"
+TBL_OPCT_LATEST = "fct_op_ct"
 TBL_WHOLE_LATEST = "fct_whole_op_ct"
 
-TBL_OPCT_HIST  = "fct_op_ct_hist"
+TBL_OPCT_HIST = "fct_op_ct_hist"
 TBL_WHOLE_HIST = "fct_whole_op_ct_hist"
 
-OUT_DIR = Path("./fct_opct_boxplot_html")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
 OPCT_MAX_SEC = 600
-FETCH_LIMIT = 200000
 
-# 스케줄 실행 시간(요구사항)
 RUN_TIME_1 = dtime(8, 22, 0)
 RUN_TIME_2 = dtime(20, 22, 0)
 
-# 기존 상수는 유지하되 MP는 제거 (단일 프로세스에서 전체 station 처리)
 ALL_STATIONS = ["FCT1", "FCT2", "FCT3", "FCT4"]
 
-# =========================
-# ✅ 안정화 파라미터
-# =========================
-WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")  # 필요 시 환경변수로 조정
+WORK_MEM = os.getenv("PG_WORK_MEM", "4MB")
 DB_RETRY_INTERVAL_SEC = 5
 
-# ✅ (추가/권장) keepalive 옵션(환경변수로 조정 가능)
 PG_KEEPALIVES = int(os.getenv("PG_KEEPALIVES", "1"))
 PG_KEEPALIVES_IDLE = int(os.getenv("PG_KEEPALIVES_IDLE", "30"))
 PG_KEEPALIVES_INTERVAL = int(os.getenv("PG_KEEPALIVES_INTERVAL", "10"))
 PG_KEEPALIVES_COUNT = int(os.getenv("PG_KEEPALIVES_COUNT", "3"))
 
-# =========================
-# ✅ 로그 DB(헬스체크) 설정
-# =========================
 LOG_SCHEMA = "k_demon_heath_check"
 LOG_TABLE = "e1_1_log"
 
-_ENGINE = None
+_MAIN_ENGINE = None
+_HEALTH_CONN = None
 
 
 # =========================
@@ -126,7 +96,7 @@ def _masked_db_info() -> str:
 
 
 def _is_connection_error(e: Exception) -> bool:
-    if isinstance(e, (OperationalError, DBAPIError)):
+    if isinstance(e, (OperationalError, DBAPIError, psycopg2.OperationalError, psycopg2.InterfaceError)):
         return True
 
     msg = (str(e) or "").lower()
@@ -143,84 +113,9 @@ def _is_connection_error(e: Exception) -> bool:
         "connection reset",
         "network is unreachable",
         "no route to host",
+        "closed the connection unexpectedly",
     ]
     return any(k in msg for k in keywords)
-
-
-def _dispose_engine():
-    global _ENGINE
-    try:
-        if _ENGINE is not None:
-            _ENGINE.dispose()
-    except Exception:
-        pass
-    _ENGINE = None
-
-
-def _build_engine(config=DB_CONFIG):
-    pw = urllib.parse.quote_plus(config["password"])
-    conn_str = (
-        f"postgresql+psycopg2://{config['user']}:{pw}"
-        f"@{config['host']}:{config['port']}/{config['dbname']}?connect_timeout=5"
-    )
-    print(f"[INFO] DB = {_masked_db_info()}", flush=True)
-
-    # ✅ 풀 최소화(상시 연결 1개로 고정) + ✅ keepalive
-    return create_engine(
-        conn_str,
-        pool_pre_ping=True,
-        pool_size=1,
-        max_overflow=0,
-        pool_timeout=30,
-        pool_recycle=300,
-        future=True,
-        connect_args={
-            "connect_timeout": 5,
-            "keepalives": PG_KEEPALIVES,
-            "keepalives_idle": PG_KEEPALIVES_IDLE,
-            "keepalives_interval": PG_KEEPALIVES_INTERVAL,
-            "keepalives_count": PG_KEEPALIVES_COUNT,
-            "application_name": "e1_1_fct_op_ct_schedule",
-        },
-    )
-
-
-def get_engine_blocking(config=DB_CONFIG):
-    """
-    ✅ DB 접속 실패/실행 중 끊김 시 무한 재시도(연결 성공까지 블로킹)
-    ✅ 엔진 풀 최소화(pool_size=1, max_overflow=0)
-    ✅ work_mem 폭증 방지(세션마다 SET)
-    """
-    global _ENGINE
-
-    if _ENGINE is not None:
-        while True:
-            try:
-                with _ENGINE.connect() as conn:
-                    conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
-                    conn.execute(text("SELECT 1"))
-                return _ENGINE
-            except Exception as e:
-                print(f"[DB][RETRY] ping failed -> rebuild: {type(e).__name__}: {repr(e)}", flush=True)
-                _dispose_engine()
-                time.sleep(DB_RETRY_INTERVAL_SEC)
-
-    while True:
-        try:
-            _ENGINE = _build_engine(config)
-            with _ENGINE.connect() as conn:
-                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
-                conn.execute(text("SELECT 1"))
-            print(
-                f"[DB][OK] engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
-                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
-                flush=True
-            )
-            return _ENGINE
-        except Exception as e:
-            print(f"[DB][RETRY] engine create/connect failed: {type(e).__name__}: {repr(e)}", flush=True)
-            _dispose_engine()
-            time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
 def today_yyyymmdd() -> str:
@@ -235,32 +130,156 @@ def current_yyyymm(now: datetime | None = None) -> str:
 def _cast_df_for_db(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
         return df
+
     out = df.copy()
+
     if "month" in out.columns:
         out["month"] = out["month"].astype(str)
+
     for c in out.columns:
         if isinstance(out[c].dtype, CategoricalDtype):
             out[c] = out[c].astype(str)
+
+    out = out.replace({np.nan: None})
     return out
 
 
 # =========================
-# 1-1) 로그 테이블 보장 + 로그 저장
+# 2) 메인 엔진 분리
+# =========================
+def _dispose_main_engine():
+    global _MAIN_ENGINE
+    try:
+        if _MAIN_ENGINE is not None:
+            _MAIN_ENGINE.dispose()
+    except Exception:
+        pass
+    _MAIN_ENGINE = None
+
+
+def _build_main_engine(config=DB_CONFIG):
+    pw = urllib.parse.quote_plus(config["password"])
+    conn_str = (
+        f"postgresql+psycopg2://{config['user']}:{pw}"
+        f"@{config['host']}:{config['port']}/{config['dbname']}?connect_timeout=5"
+    )
+
+    print(f"[INFO] MAIN DB = {_masked_db_info()}", flush=True)
+
+    return create_engine(
+        conn_str,
+        pool_pre_ping=True,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=30,
+        pool_recycle=300,
+        future=True,
+        connect_args={
+            "connect_timeout": 5,
+            "keepalives": PG_KEEPALIVES,
+            "keepalives_idle": PG_KEEPALIVES_IDLE,
+            "keepalives_interval": PG_KEEPALIVES_INTERVAL,
+            "keepalives_count": PG_KEEPALIVES_COUNT,
+            "application_name": "e1_1_fct_op_ct_schedule_main",
+        },
+    )
+
+
+def get_main_engine_blocking(config=DB_CONFIG):
+    global _MAIN_ENGINE
+
+    if _MAIN_ENGINE is not None:
+        while True:
+            try:
+                with _MAIN_ENGINE.connect() as conn:
+                    conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                    conn.execute(text("SELECT 1"))
+                return _MAIN_ENGINE
+            except Exception as e:
+                print(f"[DB][RETRY] main engine ping failed -> rebuild: {type(e).__name__}: {repr(e)}", flush=True)
+                _dispose_main_engine()
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+
+    while True:
+        try:
+            _MAIN_ENGINE = _build_main_engine(config)
+            with _MAIN_ENGINE.connect() as conn:
+                conn.execute(text("SET work_mem TO :wm"), {"wm": WORK_MEM})
+                conn.execute(text("SELECT 1"))
+            print(
+                f"[DB][OK] main engine ready (pool_size=1, max_overflow=0, work_mem={WORK_MEM}, "
+                f"keepalive={PG_KEEPALIVES}/{PG_KEEPALIVES_IDLE}/{PG_KEEPALIVES_INTERVAL}/{PG_KEEPALIVES_COUNT})",
+                flush=True
+            )
+            return _MAIN_ENGINE
+        except Exception as e:
+            print(f"[DB][RETRY] main engine create/connect failed: {type(e).__name__}: {repr(e)}", flush=True)
+            _dispose_main_engine()
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+# =========================
+# 3) health 연결 분리
+# =========================
+def _close_health_conn():
+    global _HEALTH_CONN
+    try:
+        if _HEALTH_CONN is not None:
+            _HEALTH_CONN.close()
+    except Exception:
+        pass
+    _HEALTH_CONN = None
+
+
+def get_health_conn_blocking():
+    global _HEALTH_CONN
+
+    if _HEALTH_CONN is not None:
+        while True:
+            try:
+                with _HEALTH_CONN.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return _HEALTH_CONN
+            except Exception as e:
+                print(f"[DB][RETRY] health conn ping failed -> reconnect: {type(e).__name__}: {repr(e)}", flush=True)
+                _close_health_conn()
+                time.sleep(DB_RETRY_INTERVAL_SEC)
+
+    while True:
+        try:
+            _HEALTH_CONN = psycopg2.connect(
+                **DB_CONFIG,
+                connect_timeout=5,
+                keepalives=PG_KEEPALIVES,
+                keepalives_idle=PG_KEEPALIVES_IDLE,
+                keepalives_interval=PG_KEEPALIVES_INTERVAL,
+                keepalives_count=PG_KEEPALIVES_COUNT,
+                application_name="e1_1_fct_op_ct_schedule_health",
+            )
+            _HEALTH_CONN.autocommit = False
+            with _HEALTH_CONN.cursor() as cur:
+                cur.execute("SELECT 1")
+            print("[DB][OK] health connection ready", flush=True)
+            return _HEALTH_CONN
+        except Exception as e:
+            print(f"[DB][RETRY] health conn failed: {type(e).__name__}: {repr(e)}", flush=True)
+            _close_health_conn()
+            time.sleep(DB_RETRY_INTERVAL_SEC)
+
+
+# =========================
+# 4) health 로그 테이블 보장 및 저장
 # =========================
 def ensure_log_table():
-    """
-    로그 스키마/테이블 보장:
-      k_demon_heath_check.e1_1_log
-    """
     ddl = f"""
     CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};
 
     CREATE TABLE IF NOT EXISTS {LOG_SCHEMA}.{LOG_TABLE} (
         id BIGSERIAL PRIMARY KEY,
-        end_day   TEXT NOT NULL,   -- yyyymmdd
-        end_time  TEXT NOT NULL,   -- hh:mi:ss
-        info      TEXT NOT NULL,   -- 소문자
-        contents  TEXT,
+        end_day TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        info TEXT NOT NULL,
+        contents TEXT,
         created_at TIMESTAMP DEFAULT now()
     );
 
@@ -270,23 +289,26 @@ def ensure_log_table():
     CREATE INDEX IF NOT EXISTS ix_{LOG_TABLE}_info
       ON {LOG_SCHEMA}.{LOG_TABLE}(info);
     """
+
     while True:
         try:
-            with psycopg2.connect(**DB_CONFIG) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(ddl)
-                conn.commit()
+            conn = get_health_conn_blocking()
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+            conn.commit()
             print(f"[OK] log table ensured: {LOG_SCHEMA}.{LOG_TABLE}", flush=True)
             return
         except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             print(f"[DB][RETRY] ensure_log_table failed: {type(e).__name__}: {repr(e)}", flush=True)
+            _close_health_conn()
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
 def _save_log_to_db(info: str, contents: str):
-    """
-    end_day, end_time, info, contents 순서 DataFrame화 후 저장
-    """
     now = datetime.now()
     row = {
         "end_day": now.strftime("%Y%m%d"),
@@ -295,34 +317,46 @@ def _save_log_to_db(info: str, contents: str):
         "contents": str(contents),
     }
 
-    log_df = pd.DataFrame(
-        [[row["end_day"], row["end_time"], row["info"], row["contents"]]],
-        columns=["end_day", "end_time", "info", "contents"]
-    )
+    delete_wait_sql = sql.SQL("""
+        DELETE FROM {}.{}
+        WHERE info = 'wait'
+    """).format(sql.Identifier(LOG_SCHEMA), sql.Identifier(LOG_TABLE))
 
     insert_sql = sql.SQL("""
         INSERT INTO {}.{} (end_day, end_time, info, contents)
-        VALUES (%(end_day)s, %(end_time)s, %(info)s, %(contents)s)
+        VALUES %s
     """).format(sql.Identifier(LOG_SCHEMA), sql.Identifier(LOG_TABLE))
 
     while True:
         try:
-            with psycopg2.connect(**DB_CONFIG) as conn:
-                with conn.cursor() as cur:
-                    cur.executemany(insert_sql.as_string(conn), log_df.to_dict(orient="records"))
-                conn.commit()
+            conn = get_health_conn_blocking()
+            with conn.cursor() as cur:
+                if row["info"] == "wait":
+                    cur.execute(delete_wait_sql)
+
+                execute_values(
+                    cur,
+                    insert_sql.as_string(conn),
+                    [(row["end_day"], row["end_time"], row["info"], row["contents"])],
+                    template="(%s, %s, %s, %s)",
+                    page_size=1,
+                )
+            conn.commit()
             return
         except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             print(f"[DB][RETRY] save_log failed: {type(e).__name__}: {repr(e)}", flush=True)
+            _close_health_conn()
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
 
 def log(msg: str, info: str = "info", save_db: bool = True):
-    """
-    공통 로그 출력 + (선택) DB 저장
-    """
     info_n = _normalize_info(info)
     print(msg, flush=True)
+
     if save_db:
         try:
             _save_log_to_db(info_n, msg)
@@ -331,7 +365,7 @@ def log(msg: str, info: str = "info", save_db: bool = True):
 
 
 # =========================
-# ✅ (변경) ALWAYS-ON 스케줄 계산/대기
+# 5) 스케줄 계산/대기
 # =========================
 def _schedule_candidates_for_day(day: date) -> List[datetime]:
     return [
@@ -341,31 +375,20 @@ def _schedule_candidates_for_day(day: date) -> List[datetime]:
 
 
 def _next_run_datetime(now_dt: datetime) -> datetime:
-    """
-    now_dt 기준 "가장 가까운 다음 실행시각" 1개 반환.
-    - 오늘 08:22 아직이면 -> 오늘 08:22
-    - else 오늘 20:22 아직이면 -> 오늘 20:22
-    - else -> 내일 08:22
-    """
     today = now_dt.date()
     t1, t2 = _schedule_candidates_for_day(today)
+
     if now_dt < t1:
         return t1
     if now_dt < t2:
         return t2
+
     tomorrow = today + timedelta(days=1)
     return _schedule_candidates_for_day(tomorrow)[0]
 
 
 def _sleep_until(target_dt: datetime):
-    """
-    target_dt까지 대기.
-
-    ✅ 요구사항 반영:
-    - 대기 중에도 로그 DB에 "대기중" 로그가 1분 간격으로 적재되게 함
-    - 너무 자주 쌓이지 않도록 DB 저장은 60초마다 1회로 제한
-    """
-    last_db_log_ts = 0.0  # epoch seconds
+    last_db_log_ts = 0.0
 
     while True:
         now = datetime.now()
@@ -374,17 +397,15 @@ def _sleep_until(target_dt: datetime):
 
         remaining = (target_dt - now).total_seconds()
 
-        # 멀리 있으면 크게, 가까우면 촘촘히 (기존 정책 유지)
         if remaining > 3600:
-            sleep_sec = 300.0   # 5분
+            sleep_sec = 300.0
         elif remaining > 600:
-            sleep_sec = 60.0    # 1분
+            sleep_sec = 60.0
         elif remaining > 120:
             sleep_sec = 30.0
         else:
             sleep_sec = 5.0
 
-        # ✅ DB에는 1분에 1번만 적재
         now_ts = time.time()
         should_db_log = (now_ts - last_db_log_ts) >= 60.0
 
@@ -393,7 +414,6 @@ def _sleep_until(target_dt: datetime):
             f"remaining={int(remaining)}s | sleep={sleep_sec:.0f}s"
         )
 
-        # 콘솔은 항상, DB는 1분 간격으로만
         log(msg, info="wait", save_db=should_db_log)
 
         if should_db_log:
@@ -403,7 +423,7 @@ def _sleep_until(target_dt: datetime):
 
 
 # =========================
-# 2) 테이블/인덱스/ID 보정 (기존 유지)
+# 6) 테이블/인덱스/ID 보정
 # =========================
 def ensure_schema(conn, schema_name: str):
     with conn.cursor() as cur:
@@ -412,84 +432,81 @@ def ensure_schema(conn, schema_name: str):
 
 
 def ensure_tables_and_indexes():
-    """
-    기존 로직 유지.
-    ✅ 실행 중 끊김/접속 실패 시 무한 재시도(블로킹)
-    """
     while True:
         try:
             with psycopg2.connect(**DB_CONFIG) as conn:
                 ensure_schema(conn, TARGET_SCHEMA)
 
                 with conn.cursor() as cur:
-                    # LATEST: fct_op_ct
                     cur.execute(sql.SQL("""
                         CREATE TABLE IF NOT EXISTS {}.{} (
                             id BIGINT,
                             station TEXT NOT NULL,
-                            remark  TEXT NOT NULL,
-                            month   TEXT NOT NULL,
+                            remark TEXT NOT NULL,
+                            month TEXT NOT NULL,
                             sample_amount INT,
                             op_ct_lower_outlier TEXT,
                             q1 NUMERIC(12,2),
                             median NUMERIC(12,2),
                             q3 NUMERIC(12,2),
                             op_ct_upper_outlier TEXT,
-                            del_out_op_ct_av NUMERIC(12,2),
-                            plotly_json TEXT
+                            del_out_op_ct_av NUMERIC(12,2)
                         );
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
 
-                    cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now();""")
-                                .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
-                    cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();""")
-                                .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
+                    cur.execute(sql.SQL("""
+                        ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now();
+                    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
+
+                    cur.execute(sql.SQL("""
+                        ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();
+                    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
 
                     cur.execute(sql.SQL("""
                         CREATE UNIQUE INDEX IF NOT EXISTS ux_fct_op_ct_key
                         ON {}.{} (station, remark, month);
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST)))
 
-                    # LATEST: fct_whole_op_ct
                     cur.execute(sql.SQL("""
                         CREATE TABLE IF NOT EXISTS {}.{} (
                             id BIGINT,
                             station TEXT NOT NULL,
-                            remark  TEXT NOT NULL,
-                            month   TEXT NOT NULL,
+                            remark TEXT NOT NULL,
+                            month TEXT NOT NULL,
                             ct_eq NUMERIC(12,2),
-                            uph   NUMERIC(12,2),
+                            uph NUMERIC(12,2),
                             final_ct NUMERIC(12,2)
                         );
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
 
-                    cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now();""")
-                                .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
-                    cur.execute(sql.SQL("""ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();""")
-                                .format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
+                    cur.execute(sql.SQL("""
+                        ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now();
+                    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
+
+                    cur.execute(sql.SQL("""
+                        ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();
+                    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
 
                     cur.execute(sql.SQL("""
                         CREATE UNIQUE INDEX IF NOT EXISTS ux_fct_whole_op_ct_key
                         ON {}.{} (station, remark, month);
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST)))
 
-                    # HIST: fct_op_ct_hist
                     cur.execute(sql.SQL("""
                         CREATE TABLE IF NOT EXISTS {}.{} (
                             id BIGINT,
                             snapshot_day TEXT NOT NULL,
-                            snapshot_ts  TIMESTAMP DEFAULT now(),
+                            snapshot_ts TIMESTAMP DEFAULT now(),
                             station TEXT NOT NULL,
-                            remark  TEXT NOT NULL,
-                            month   TEXT NOT NULL,
+                            remark TEXT NOT NULL,
+                            month TEXT NOT NULL,
                             sample_amount INT,
                             op_ct_lower_outlier TEXT,
                             q1 NUMERIC(12,2),
                             median NUMERIC(12,2),
                             q3 NUMERIC(12,2),
                             op_ct_upper_outlier TEXT,
-                            del_out_op_ct_av NUMERIC(12,2),
-                            plotly_json TEXT
+                            del_out_op_ct_av NUMERIC(12,2)
                         );
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_HIST)))
 
@@ -498,17 +515,16 @@ def ensure_tables_and_indexes():
                         ON {}.{} (snapshot_day, station, remark, month);
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_HIST)))
 
-                    # HIST: fct_whole_op_ct_hist
                     cur.execute(sql.SQL("""
                         CREATE TABLE IF NOT EXISTS {}.{} (
                             id BIGINT,
                             snapshot_day TEXT NOT NULL,
-                            snapshot_ts  TIMESTAMP DEFAULT now(),
+                            snapshot_ts TIMESTAMP DEFAULT now(),
                             station TEXT NOT NULL,
-                            remark  TEXT NOT NULL,
-                            month   TEXT NOT NULL,
+                            remark TEXT NOT NULL,
+                            month TEXT NOT NULL,
                             ct_eq NUMERIC(12,2),
-                            uph   NUMERIC(12,2),
+                            uph NUMERIC(12,2),
                             final_ct NUMERIC(12,2)
                         );
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_HIST)))
@@ -519,18 +535,16 @@ def ensure_tables_and_indexes():
                     """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_HIST)))
 
                 conn.commit()
-
             break
 
         except Exception as e:
             log(f"[DB][RETRY] ensure_tables_and_indexes failed: {type(e).__name__}: {repr(e)}", info="down")
             time.sleep(DB_RETRY_INTERVAL_SEC)
 
-    # id 자동채번/NULL 보정 (4개 테이블 모두)
-    fix_id_sequence(TARGET_SCHEMA, TBL_OPCT_LATEST,  "fct_op_ct_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_OPCT_LATEST, "fct_op_ct_id_seq")
     fix_id_sequence(TARGET_SCHEMA, TBL_WHOLE_LATEST, "fct_whole_op_ct_id_seq")
-    fix_id_sequence(TARGET_SCHEMA, TBL_OPCT_HIST,    "fct_op_ct_hist_id_seq")
-    fix_id_sequence(TARGET_SCHEMA, TBL_WHOLE_HIST,   "fct_whole_op_ct_hist_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_OPCT_HIST, "fct_op_ct_hist_id_seq")
+    fix_id_sequence(TARGET_SCHEMA, TBL_WHOLE_HIST, "fct_whole_op_ct_hist_id_seq")
 
     log(f'[OK] target tables ensured in schema "{TARGET_SCHEMA}"', info="info")
 
@@ -579,6 +593,7 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
       EXECUTE 'SELECT setval(''' || v_full_seq || ''', ' || (v_max + 1) || ', false)';
     END $$;
     """
+
     while True:
         try:
             with psycopg2.connect(**DB_CONFIG) as conn:
@@ -592,7 +607,7 @@ def fix_id_sequence(schema: str, table: str, seq_name: str):
 
 
 # =========================
-# 3) 소스 로딩(월 전체) + op_ct 계산
+# 7) 소스 로딩 및 op_ct 계산
 # =========================
 def load_month_df(engine, stations: List[str], run_month: str) -> pd.DataFrame:
     sql_query = f"""
@@ -623,11 +638,11 @@ def load_month_df(engine, stations: List[str], run_month: str) -> pd.DataFrame:
         except Exception as e:
             if _is_connection_error(e):
                 log(f"[DB][RETRY] load_month_df conn error -> rebuild: {type(e).__name__}: {repr(e)}", info="down")
-                _dispose_engine()
+                _dispose_main_engine()
             else:
                 log(f"[DB][RETRY] load_month_df failed: {type(e).__name__}: {repr(e)}", info="error")
             time.sleep(DB_RETRY_INTERVAL_SEC)
-            engine = get_engine_blocking(DB_CONFIG)
+            engine = get_main_engine_blocking(DB_CONFIG)
 
     if df.empty:
         return df
@@ -638,14 +653,13 @@ def load_month_df(engine, stations: List[str], run_month: str) -> pd.DataFrame:
 
     df = df.dropna(subset=["end_ts"]).copy()
     df = df.sort_values(["station", "remark", "end_ts"], ascending=True).reset_index(drop=True)
-
     df["op_ct"] = df.groupby(["station", "remark"])["end_ts"].diff().dt.total_seconds()
     df["month"] = df["end_ts"].dt.strftime("%Y%m")
     return df
 
 
 # =========================
-# 4) Boxplot 요약 + plotly_json
+# 8) 통계 요약
 # =========================
 def _range_str(values: pd.Series):
     values = values.dropna()
@@ -670,7 +684,6 @@ def summarize_group(g: pd.DataFrame) -> Dict:
             "q3": None,
             "op_ct_upper_outlier": None,
             "del_out_op_ct_av": None,
-            "plotly_json": None,
         }
 
     q1 = float(s.quantile(0.25))
@@ -687,16 +700,6 @@ def summarize_group(g: pd.DataFrame) -> Dict:
     s_wo = s[(s >= lower_bound) & (s <= upper_bound)]
     avg_wo = float(s_wo.mean()) if len(s_wo) else None
 
-    station = g["station"].iloc[0]
-    remark = g["remark"].iloc[0]
-    month = g["month"].iloc[0]
-
-    fig = px.box(pd.DataFrame({"op_ct": s}), y="op_ct", points="outliers", title=None)
-
-    html_name = f"boxplot_{station}_{remark}_{month}.html"
-    html_path = OUT_DIR / html_name
-    fig.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
-
     return {
         "sample_amount": int(sample_amount),
         "op_ct_lower_outlier": _range_str(lower_outliers),
@@ -705,7 +708,6 @@ def summarize_group(g: pd.DataFrame) -> Dict:
         "q3": round(q3, 2),
         "op_ct_upper_outlier": _range_str(upper_outliers),
         "del_out_op_ct_av": round(avg_wo, 2) if avg_wo is not None else None,
-        "plotly_json": fig.to_json(),
     }
 
 
@@ -714,7 +716,7 @@ def build_summary_df(df_raw: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "station", "remark", "month",
             "sample_amount", "op_ct_lower_outlier", "q1", "median", "q3",
-            "op_ct_upper_outlier", "del_out_op_ct_av", "plotly_json"
+            "op_ct_upper_outlier", "del_out_op_ct_av"
         ])
 
     groups = list(df_raw.groupby(["station", "remark", "month"], sort=True))
@@ -735,7 +737,7 @@ def build_summary_df(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 5) UPH/CTeq 계산 (left/right/whole)
+# 9) UPH / CTeq 계산
 # =========================
 def parallel_uph(ct_series: pd.Series) -> float:
     ct = ct_series.dropna()
@@ -795,33 +797,38 @@ def build_final_df_86(summary_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 6) 저장 (LATEST UPSERT + HIST 하루롤링 UPSERT)
+# 10) execute_values 기반 단일 INSERT UPSERT
 # =========================
+def _df_to_tuples(df: pd.DataFrame, cols: List[str]):
+    if df is None or df.empty:
+        return []
+    return [tuple(row[c] for c in cols) for _, row in df[cols].iterrows()]
+
+
 def upsert_latest_opct(df: pd.DataFrame):
     if df is None or df.empty:
         return
+
     df = _cast_df_for_db(df)
 
     cols = [
         "station", "remark", "month",
         "sample_amount", "op_ct_lower_outlier", "q1", "median", "q3",
-        "op_ct_upper_outlier", "del_out_op_ct_av", "plotly_json"
+        "op_ct_upper_outlier", "del_out_op_ct_av"
     ]
-    df_load = df[cols].copy()
 
-    stmt = sql.SQL("""
-        INSERT INTO {}.{} (
+    rows = _df_to_tuples(df, cols)
+    if not rows:
+        return
+
+    insert_sql = f"""
+        INSERT INTO {TARGET_SCHEMA}.{TBL_OPCT_LATEST} (
             station, remark, month,
             sample_amount, op_ct_lower_outlier, q1, median, q3,
-            op_ct_upper_outlier, del_out_op_ct_av, plotly_json,
+            op_ct_upper_outlier, del_out_op_ct_av,
             created_at, updated_at
         )
-        VALUES (
-            %(station)s, %(remark)s, %(month)s,
-            %(sample_amount)s, %(op_ct_lower_outlier)s, %(q1)s, %(median)s, %(q3)s,
-            %(op_ct_upper_outlier)s, %(del_out_op_ct_av)s, %(plotly_json)s,
-            now(), now()
-        )
+        VALUES %s
         ON CONFLICT (station, remark, month)
         DO UPDATE SET
             sample_amount       = EXCLUDED.sample_amount,
@@ -831,15 +838,22 @@ def upsert_latest_opct(df: pd.DataFrame):
             q3                  = EXCLUDED.q3,
             op_ct_upper_outlier = EXCLUDED.op_ct_upper_outlier,
             del_out_op_ct_av    = EXCLUDED.del_out_op_ct_av,
-            plotly_json         = EXCLUDED.plotly_json,
-            updated_at          = now();
-    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_LATEST))
+            updated_at          = now()
+    """
+
+    values = [r + (datetime.now(), datetime.now()) for r in rows]
 
     while True:
         try:
             with psycopg2.connect(**DB_CONFIG) as conn:
                 with conn.cursor() as cur:
-                    cur.executemany(stmt.as_string(conn), df_load.to_dict(orient="records"))
+                    execute_values(
+                        cur,
+                        insert_sql,
+                        values,
+                        template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        page_size=len(values),
+                    )
                 conn.commit()
             return
         except Exception as e:
@@ -850,35 +864,42 @@ def upsert_latest_opct(df: pd.DataFrame):
 def upsert_latest_whole(df: pd.DataFrame):
     if df is None or df.empty:
         return
+
     df = _cast_df_for_db(df)
 
     cols = ["station", "remark", "month", "ct_eq", "uph", "final_ct"]
-    df_load = df[cols].copy()
+    rows = _df_to_tuples(df, cols)
+    if not rows:
+        return
 
-    stmt = sql.SQL("""
-        INSERT INTO {}.{} (
+    insert_sql = f"""
+        INSERT INTO {TARGET_SCHEMA}.{TBL_WHOLE_LATEST} (
             station, remark, month,
             ct_eq, uph, final_ct,
             created_at, updated_at
         )
-        VALUES (
-            %(station)s, %(remark)s, %(month)s,
-            %(ct_eq)s, %(uph)s, %(final_ct)s,
-            now(), now()
-        )
+        VALUES %s
         ON CONFLICT (station, remark, month)
         DO UPDATE SET
             ct_eq      = EXCLUDED.ct_eq,
             uph        = EXCLUDED.uph,
             final_ct   = EXCLUDED.final_ct,
-            updated_at = now();
-    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_LATEST))
+            updated_at = now()
+    """
+
+    values = [r + (datetime.now(), datetime.now()) for r in rows]
 
     while True:
         try:
             with psycopg2.connect(**DB_CONFIG) as conn:
                 with conn.cursor() as cur:
-                    cur.executemany(stmt.as_string(conn), df_load.to_dict(orient="records"))
+                    execute_values(
+                        cur,
+                        insert_sql,
+                        values,
+                        template="(%s,%s,%s,%s,%s,%s,%s,%s)",
+                        page_size=len(values),
+                    )
                 conn.commit()
             return
         except Exception as e:
@@ -889,47 +910,52 @@ def upsert_latest_whole(df: pd.DataFrame):
 def upsert_hist_opct_daily(df: pd.DataFrame, snapshot_day: str):
     if df is None or df.empty:
         return
+
     df = _cast_df_for_db(df)
 
     cols = [
         "station", "remark", "month",
         "sample_amount", "op_ct_lower_outlier", "q1", "median", "q3",
-        "op_ct_upper_outlier", "del_out_op_ct_av", "plotly_json"
+        "op_ct_upper_outlier", "del_out_op_ct_av"
     ]
-    df_load = df[cols].copy()
-    df_load.insert(0, "snapshot_day", snapshot_day)
+    rows = _df_to_tuples(df, cols)
+    if not rows:
+        return
 
-    stmt = sql.SQL("""
-        INSERT INTO {}.{} (
+    insert_sql = f"""
+        INSERT INTO {TARGET_SCHEMA}.{TBL_OPCT_HIST} (
             snapshot_day, snapshot_ts,
             station, remark, month,
             sample_amount, op_ct_lower_outlier, q1, median, q3,
-            op_ct_upper_outlier, del_out_op_ct_av, plotly_json
+            op_ct_upper_outlier, del_out_op_ct_av
         )
-        VALUES (
-            %(snapshot_day)s, now(),
-            %(station)s, %(remark)s, %(month)s,
-            %(sample_amount)s, %(op_ct_lower_outlier)s, %(q1)s, %(median)s, %(q3)s,
-            %(op_ct_upper_outlier)s, %(del_out_op_ct_av)s, %(plotly_json)s
-        )
+        VALUES %s
         ON CONFLICT (snapshot_day, station, remark, month)
         DO UPDATE SET
-            snapshot_ts         = now(),
+            snapshot_ts         = EXCLUDED.snapshot_ts,
             sample_amount       = EXCLUDED.sample_amount,
             op_ct_lower_outlier = EXCLUDED.op_ct_lower_outlier,
             q1                  = EXCLUDED.q1,
             median              = EXCLUDED.median,
             q3                  = EXCLUDED.q3,
             op_ct_upper_outlier = EXCLUDED.op_ct_upper_outlier,
-            del_out_op_ct_av    = EXCLUDED.del_out_op_ct_av,
-            plotly_json         = EXCLUDED.plotly_json;
-    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_OPCT_HIST))
+            del_out_op_ct_av    = EXCLUDED.del_out_op_ct_av
+    """
+
+    now_ts = datetime.now()
+    values = [(snapshot_day, now_ts) + r for r in rows]
 
     while True:
         try:
             with psycopg2.connect(**DB_CONFIG) as conn:
                 with conn.cursor() as cur:
-                    cur.executemany(stmt.as_string(conn), df_load.to_dict(orient="records"))
+                    execute_values(
+                        cur,
+                        insert_sql,
+                        values,
+                        template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        page_size=len(values),
+                    )
                 conn.commit()
             return
         except Exception as e:
@@ -940,36 +966,43 @@ def upsert_hist_opct_daily(df: pd.DataFrame, snapshot_day: str):
 def upsert_hist_whole_daily(df: pd.DataFrame, snapshot_day: str):
     if df is None or df.empty:
         return
+
     df = _cast_df_for_db(df)
 
     cols = ["station", "remark", "month", "ct_eq", "uph", "final_ct"]
-    df_load = df[cols].copy()
-    df_load.insert(0, "snapshot_day", snapshot_day)
+    rows = _df_to_tuples(df, cols)
+    if not rows:
+        return
 
-    stmt = sql.SQL("""
-        INSERT INTO {}.{} (
+    insert_sql = f"""
+        INSERT INTO {TARGET_SCHEMA}.{TBL_WHOLE_HIST} (
             snapshot_day, snapshot_ts,
             station, remark, month,
             ct_eq, uph, final_ct
         )
-        VALUES (
-            %(snapshot_day)s, now(),
-            %(station)s, %(remark)s, %(month)s,
-            %(ct_eq)s, %(uph)s, %(final_ct)s
-        )
+        VALUES %s
         ON CONFLICT (snapshot_day, station, remark, month)
         DO UPDATE SET
-            snapshot_ts = now(),
+            snapshot_ts = EXCLUDED.snapshot_ts,
             ct_eq       = EXCLUDED.ct_eq,
             uph         = EXCLUDED.uph,
-            final_ct    = EXCLUDED.final_ct;
-    """).format(sql.Identifier(TARGET_SCHEMA), sql.Identifier(TBL_WHOLE_HIST))
+            final_ct    = EXCLUDED.final_ct
+    """
+
+    now_ts = datetime.now()
+    values = [(snapshot_day, now_ts) + r for r in rows]
 
     while True:
         try:
             with psycopg2.connect(**DB_CONFIG) as conn:
                 with conn.cursor() as cur:
-                    cur.executemany(stmt.as_string(conn), df_load.to_dict(orient="records"))
+                    execute_values(
+                        cur,
+                        insert_sql,
+                        values,
+                        template="(%s,%s,%s,%s,%s,%s,%s,%s)",
+                        page_size=len(values),
+                    )
                 conn.commit()
             return
         except Exception as e:
@@ -978,21 +1011,26 @@ def upsert_hist_whole_daily(df: pd.DataFrame, snapshot_day: str):
 
 
 # =========================
-# 7) 작업 1회 실행(월 전체) - 단일 프로세스
+# 11) 1회 실행
 # =========================
 def run_pipeline_once(label: str, run_month: str):
     snapshot_day = today_yyyymmdd()
     log(f"[RUN] {label} | snapshot_day={snapshot_day} | month={run_month} | START", info="info")
 
-    eng = get_engine_blocking(DB_CONFIG)
+    eng = get_main_engine_blocking(DB_CONFIG)
 
+    log(f"[RUN] {label} | loading source month={run_month}", info="info")
     df_raw = load_month_df(eng, ALL_STATIONS, run_month)
+
     if df_raw is None or df_raw.empty:
         log(f"[RUN] {label} | no source rows (month={run_month}) -> skip save", info="info")
         return
 
+    log(f"[RUN] {label} | source rows={len(df_raw):,}", info="info")
     summary_df = build_summary_df(df_raw)
     whole_df = build_final_df_86(summary_df)
+
+    log(f"[RUN] {label} | summary rows={len(summary_df):,} whole rows={len(whole_df):,}", info="info")
 
     upsert_latest_opct(summary_df)
     upsert_latest_whole(whole_df)
@@ -1003,7 +1041,7 @@ def run_pipeline_once(label: str, run_month: str):
 
 
 # =========================
-# 8) main: ALWAYS-ON (매일 08:22 / 20:22 무한 반복)
+# 12) main
 # =========================
 def main():
     ensure_log_table()
@@ -1011,11 +1049,10 @@ def main():
     start_dt = datetime.now()
     log(f"[START] {start_dt:%Y-%m-%d %H:%M:%S}", info="start")
     log("=== ALWAYS-ON MODE: run at 08:22 and 20:22 EVERY DAY (no exit) ===", info="info")
-    log(f"work_mem={WORK_MEM} | engine pool_size=1 max_overflow=0", info="info")
+    log(f"work_mem={WORK_MEM} | main engine pool_size=1 max_overflow=0 | health separated", info="info")
 
     ensure_tables_and_indexes()
 
-    # 날짜별 실행 완료 체크: {"yyyymmdd": {"08:22:00","20:22:00"}}
     done_map: Dict[str, set] = {}
 
     while True:
@@ -1027,12 +1064,10 @@ def main():
 
         done_set = done_map.setdefault(target_day, set())
 
-        # (안전) 이미 실행한 스케줄이면 스킵하고 다음 계산
         if target_label in done_set:
             time.sleep(1.0)
             continue
 
-        # 오래된 날짜 정리(메모리 누수 방지)
         if len(done_map) > 5:
             for k in sorted(list(done_map.keys()))[:-3]:
                 done_map.pop(k, None)
@@ -1043,7 +1078,6 @@ def main():
 
         run_month = current_yyyymm()
 
-        # ✅ 스케줄 1회는 "성공할 때까지" 재시도
         while True:
             try:
                 run_pipeline_once(label=target_label, run_month=run_month)
@@ -1052,14 +1086,13 @@ def main():
                 break
             except Exception as e:
                 if _is_connection_error(e):
-                    log(f"[RUN][RETRY] {target_label} conn error -> rebuild engine: {type(e).__name__}: {repr(e)}", info="down")
-                    _dispose_engine()
-                    _ = get_engine_blocking(DB_CONFIG)
+                    log(f"[RUN][RETRY] {target_label} conn error -> rebuild main engine: {type(e).__name__}: {repr(e)}", info="down")
+                    _dispose_main_engine()
+                    _ = get_main_engine_blocking(DB_CONFIG)
                 else:
                     log(f"[RUN][RETRY] {target_label} failed: {type(e).__name__}: {repr(e)}", info="error")
                 time.sleep(DB_RETRY_INTERVAL_SEC)
 
-        # (선택) 하루 2회 모두 끝나면 요약만 남기고 계속(내일 08:22까지 대기)
         if done_map.get(target_day) == {"08:22:00", "20:22:00"}:
             log(f"[DAY-END] {target_day} both runs completed. keep alive for next day.", info="end")
 
