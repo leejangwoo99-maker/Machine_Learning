@@ -283,7 +283,7 @@ def _build_engine(cfg=DB_CONFIG, application_name: str = "vision_machine_log_par
         pool_recycle=1800,
         future=True,
         connect_args={
-            "connect_timeout": 5,
+            "connect_timeout": 10,
             "keepalives": PG_KEEPALIVES,
             "keepalives_idle": PG_KEEPALIVES_IDLE,
             "keepalives_interval": PG_KEEPALIVES_INTERVAL,
@@ -806,7 +806,7 @@ def _bulk_insert_execute_values(conn, full_table: str, rows: list[dict]):
         ON CONFLICT (end_day, station, end_time, contents) DO NOTHING
     """
     values = [(r["end_day"], r["station"], r["end_time"], r["contents"]) for r in rows]
-    page_size = int(os.getenv("INSERT_PAGE_SIZE", "2000"))
+    page_size = int(os.getenv("INSERT_PAGE_SIZE", "500"))
 
     psycopg2.extras.execute_values(cur, sql, values, page_size=page_size)  # type: ignore
     return len(values)

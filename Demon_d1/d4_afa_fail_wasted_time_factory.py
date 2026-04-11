@@ -14,6 +14,7 @@ AFA FAIL wasted time (NG -> ON) 실시간 계산/저장
 - 증분 fetch는 station별 마지막 저장 to_ts 기준
 - 저장 테이블에 to_ts TIMESTAMP 컬럼 사용
 - last cursor 조회는 현재 운영 window 내부만 조회
+- traceback는 최대 100행까지만 적재
 """
 
 from __future__ import annotations
@@ -98,6 +99,8 @@ DB_LOG_QUEUE_MAX = int(os.getenv("DB_LOG_QUEUE_MAX", "10000"))
 DB_LOG_BATCH_SIZE = int(os.getenv("DB_LOG_BATCH_SIZE", "300"))
 DB_LOG_FLUSH_INTERVAL_SEC = float(os.getenv("DB_LOG_FLUSH_INTERVAL_SEC", "2.0"))
 DB_LOG_CONTENTS_MAXLEN = int(os.getenv("DB_LOG_CONTENTS_MAXLEN", "2000"))
+
+TRACEBACK_MAX_LINES = int(os.getenv("TRACEBACK_MAX_LINES", "100"))
 
 _ENGINE_MAIN = None
 _ENGINE_HEALTH = None
@@ -213,6 +216,21 @@ def to_naive_kst(dt: datetime) -> datetime:
     return dt.astimezone(KST).replace(tzinfo=None)
 
 
+def _format_traceback_limited(max_lines: int = TRACEBACK_MAX_LINES) -> List[str]:
+    try:
+        tb_lines = traceback.format_exc().rstrip().splitlines()
+        if not tb_lines:
+            return []
+
+        if max_lines > 0 and len(tb_lines) > max_lines:
+            omitted = len(tb_lines) - max_lines
+            tb_lines = [f"... traceback truncated, omitted {omitted} lines ..."] + tb_lines[-max_lines:]
+
+        return tb_lines
+    except Exception:
+        return []
+
+
 # =========================================================
 # 로그
 # =========================================================
@@ -250,8 +268,9 @@ def log(msg: str, info: str | None = None):
 
 def log_exc(prefix: str, e: Exception):
     log(f"{prefix}: {type(e).__name__}: {repr(e)}", info="error")
-    tb = traceback.format_exc()
-    for line in tb.rstrip().splitlines():
+
+    tb_lines = _format_traceback_limited()
+    for line in tb_lines:
         log(f"{prefix} TRACE: {line}", info="error")
 
 
@@ -919,6 +938,7 @@ def main():
     )
     log(f"[INFO] cursor_overlap_sec={CURSOR_OVERLAP_SEC}", info="info")
     log(f"[INFO] health queue max={DB_LOG_QUEUE_MAX} batch={DB_LOG_BATCH_SIZE}", info="info")
+    log(f"[INFO] traceback_max_lines={TRACEBACK_MAX_LINES}", info="info")
 
     engine_main = get_engine_main_blocking()
     engine_health = get_engine_health_blocking()
