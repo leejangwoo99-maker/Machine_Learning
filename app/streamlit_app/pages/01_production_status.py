@@ -1531,6 +1531,12 @@ def _nonop_reset_if_needed(prod_day: str, shift: str):
         st.session_state["nonop_is_saving"] = False
         st.session_state["nonop_editor_snap"] = ""
 
+        # SNAP 01 차트 렌더 완료 추적값 초기화
+        st.session_state["p01_chart_scope"] = ""
+        st.session_state["p01_chart_render_ts"] = 0.0
+        st.session_state["p01_chart_render_rev_done"] = -1
+        st.session_state["p01_chart_nonop_count_done"] = -1
+
 
 def _cursor_from_token(tok: str) -> Dict[str, Any]:
     cur = st.session_state.get("nonop_cursor", None)
@@ -2335,6 +2341,15 @@ def frag_chart(end_day: str, shift: str):
     plt.tight_layout(rect=[0, 0, 1, 0.90])
     st.pyplot(fig, clear_figure=True)
 
+    # SNAP용: 실제 차트 렌더 완료 시점/버전 기록
+    try:
+        st.session_state["p01_chart_scope"] = f"{end_day}:{shift}"
+        st.session_state["p01_chart_render_ts"] = float(time_mod.time())
+        st.session_state["p01_chart_render_rev_done"] = int(st.session_state.get("nonop_render_rev", 0) or 0)
+        st.session_state["p01_chart_nonop_count_done"] = int(len(nonop_all))
+    except Exception:
+        pass
+
     try:
         plt.close(fig)
     except Exception:
@@ -3094,22 +3109,63 @@ def render_modals(end_day: str, shift: str):
 
 
 def _snap_data_ready_state(end_day: str, shift: str) -> Dict[str, Any]:
-    scope_ok = True
-    data_ready = bool(st.session_state.get("p01_snap_data_ready", False))
+    scope = f"{end_day}:{shift}"
 
-    ready = bool(data_ready)
+    planned_ready = bool(st.session_state.get("planned_loaded_once", False))
+    nonop_ready = bool(st.session_state.get("nonop_loaded_once", False))
+    nonop_chart_ready = bool(st.session_state.get("nonop_chart_loaded_once", False))
+
+    nonop_rows = st.session_state.get("nonop_chart_rows", []) or []
+    nonop_buf = st.session_state.get("nonop_all_buf", []) or []
+
+    # 표/차트 데이터 개수
+    buf_count = int(len(nonop_buf))
+    row_count = int(len(nonop_rows))
+
+    # 차트가 실제로 최신 비가동 데이터 기준으로 한번 렌더됐는지 확인
+    chart_scope = str(st.session_state.get("p01_chart_scope", "") or "")
+    chart_render_ts = float(st.session_state.get("p01_chart_render_ts", 0.0) or 0.0)
+    chart_render_rev_done = int(st.session_state.get("p01_chart_render_rev_done", -1) or -1)
+    chart_nonop_count_done = int(st.session_state.get("p01_chart_nonop_count_done", -1) or -1)
+
+    expected_rev = int(st.session_state.get("nonop_render_rev", 0) or 0)
+
+    chart_scope_ok = (chart_scope == scope)
+    chart_rev_ok = (chart_render_rev_done >= expected_rev)
+    chart_count_ok = (chart_nonop_count_done == row_count)
+
+    # 렌더 직후 즉시 캡처 방지용 최소 안정화 시간
+    chart_settled = (chart_render_ts > 0.0) and ((time_mod.time() - chart_render_ts) >= 1.2)
+
+    # 비가동이 0건이면 0건 차트도 정상
+    # 비가동이 1건 이상이면 차트 rows도 동일 건수까지 반영돼야 정상
+    nonop_rows_loaded = ((buf_count == 0 and row_count == 0) or (buf_count > 0 and row_count > 0))
+
+    worker_ready = True
+    master_ready = True
+    scope_ok = True
+
+    ready = bool(
+        planned_ready
+        and nonop_ready
+        and nonop_chart_ready
+        and nonop_rows_loaded
+        and chart_scope_ok
+        and chart_rev_ok
+        and chart_count_ok
+        and chart_settled
+    )
 
     return {
         "ready": ready,
-        "planned_ready": data_ready,
-        "nonop_ready": data_ready,
-        "nonop_chart_ready": data_ready,
-        "worker_ready": True,
-        "master_ready": True,
+        "planned_ready": planned_ready,
+        "nonop_ready": nonop_ready,
+        "nonop_chart_ready": nonop_chart_ready,
+        "worker_ready": worker_ready,
+        "master_ready": master_ready,
         "scope_ok": scope_ok,
-        "scope": f"{end_day}:{shift}",
+        "scope": scope,
     }
-
 
 def _render_snap_ready_marker(end_day: str, shift: str):
     if not _is_snap():
@@ -3282,6 +3338,17 @@ if SNAP:
     st.session_state["nonop_save_started_ts"] = 0.0
     st.session_state["nonop_view_limit"] = NONOP_VIEW_DEFAULT
 
+
+if "p01_chart_scope" not in st.session_state:
+    st.session_state["p01_chart_scope"] = ""
+if "p01_chart_render_ts" not in st.session_state:
+    st.session_state["p01_chart_render_ts"] = 0.0
+if "p01_chart_render_rev_done" not in st.session_state:
+    st.session_state["p01_chart_render_rev_done"] = -1
+if "p01_chart_nonop_count_done" not in st.session_state:
+    st.session_state["p01_chart_nonop_count_done"] = -1
+
+
 if SNAP:
     try:
         if _qparam_has("close_modal"):
@@ -3387,7 +3454,6 @@ with st.expander("PERF LOG (최근)", expanded=False):
         st.caption("로그 없음")
 
 if SNAP:
-    st.session_state["p01_snap_data_ready"] = True
     _render_snap_ready_marker(end_day, shift)
 
 _snap_mark_ready()
