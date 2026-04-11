@@ -85,10 +85,12 @@ APP_NAME = DAEMON_NAME
 ADVISORY_LOCK_KEY = 2026021102
 
 DB_HEARTBEAT_INTERVAL_SEC = 60.0
+IDLE_LOG_INTERVAL_SEC = 60.0
 
 KST = ZoneInfo("Asia/Seoul")
 _shutdown_requested = False
 _last_db_heartbeat_epoch = 0.0
+_last_idle_log_epoch = 0.0
 
 
 # -----------------------------
@@ -372,6 +374,23 @@ def log_db(engine: Engine, info: str, contents: str) -> None:
             conn.execute(sql, payload)
     except Exception as e:
         p("WARN", f"log_db skipped: {repr(e)}")
+
+
+def maybe_log_idle(engine: Optional[Engine], message: str) -> None:
+    global _last_idle_log_epoch
+
+    now_epoch = time.time()
+    if now_epoch - _last_idle_log_epoch < IDLE_LOG_INTERVAL_SEC:
+        return
+
+    _last_idle_log_epoch = now_epoch
+    p("INFO", message)
+
+    try:
+        if engine is not None:
+            log_db(engine, "heartbeat", message)
+    except Exception:
+        pass
 
 
 def heartbeat_upsert(
@@ -842,7 +861,10 @@ def upsert_rows(
 # 메인
 # -----------------------------
 def run_daemon():
+    global _last_idle_log_epoch
+
     p("BOOT", f"{DAEMON_NAME} starting")
+    _last_idle_log_epoch = 0.0
 
     engine: Optional[Engine] = None
     lock_conn = None
@@ -985,9 +1007,19 @@ def run_daemon():
                     f"loop days={target_days} total_src={total_src}, total_out={total_out}, "
                     f"total_delta={total_delta}, total_saved={total_saved} | " + " ; ".join(loop_msgs)
                 )
-                p("INFO", msg)
 
-                log_db(engine, "save", msg)
+                is_idle = (total_delta == 0 and total_saved == 0)
+
+                if is_idle:
+                    maybe_log_idle(
+                        engine,
+                        f"idle heartbeat | days={target_days} total_src={total_src}, total_out={total_out}, "
+                        f"total_delta={total_delta}, total_saved={total_saved}",
+                    )
+                else:
+                    p("INFO", msg)
+                    log_db(engine, "save", msg)
+
                 heartbeat_upsert(engine, "running", today_ymd, last_pk, msg)
 
                 slept = 0
